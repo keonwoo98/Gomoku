@@ -18,6 +18,25 @@ DIRECTIONS = {
     'diagonal_up': BOARD_SIZE - 1,    # 18 (↗)
 }
 
+# Boundary masks to prevent edge wrapping in bitboard operations
+# These masks exclude columns that would wrap during bit shifting
+def _create_column_mask(exclude_cols: list) -> int:
+    """Create a mask that excludes specified columns."""
+    mask = 0
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if col not in exclude_cols:
+                mask |= (1 << (row * BOARD_SIZE + col))
+    return mask
+
+# Pre-computed masks for each direction (exclude N rightmost/leftmost cols)
+# For horizontal shift: exclude rightmost columns to prevent row wrapping
+HORIZONTAL_MASKS = [_create_column_mask(list(range(BOARD_SIZE - i, BOARD_SIZE))) for i in range(6)]
+# For diagonal_down (↘): exclude rightmost columns
+DIAGONAL_DOWN_MASKS = HORIZONTAL_MASKS
+# For diagonal_up (↗): exclude leftmost columns
+DIAGONAL_UP_MASKS = [_create_column_mask(list(range(i))) for i in range(6)]
+
 
 class Board:
     """
@@ -35,6 +54,7 @@ class Board:
         new_board = Board()
         new_board.black = self.black
         new_board.white = self.white
+        new_board.move_history = self.move_history.copy()
         return new_board
 
     @staticmethod
@@ -173,10 +193,20 @@ class Board:
     def check_line(self, color: int, direction: str, count: int) -> bool:
         """
         Check if there's a line of 'count' consecutive stones.
-        Uses bit shifting for fast detection.
+        Uses bit shifting for fast detection with boundary masks.
         """
         stones = self.get_stones(color)
         shift = DIRECTIONS[direction]
+
+        # Apply boundary mask based on direction to prevent edge wrapping
+        if direction == 'horizontal':
+            # Mask out rightmost (count-1) columns
+            stones &= HORIZONTAL_MASKS[min(count - 1, 5)]
+        elif direction == 'diagonal_down':
+            stones &= DIAGONAL_DOWN_MASKS[min(count - 1, 5)]
+        elif direction == 'diagonal_up':
+            stones &= DIAGONAL_UP_MASKS[min(count - 1, 5)]
+        # vertical direction doesn't need masking
 
         result = stones
         for _ in range(count - 1):

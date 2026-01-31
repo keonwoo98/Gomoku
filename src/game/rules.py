@@ -239,19 +239,27 @@ class Rules:
         Check if opponent can break a five-in-row by capture.
         five_positions: list of (row, col) forming the five
         color: the color that made the five
+
+        Optimized: Only check positions adjacent to five stones (max 30 positions)
+        instead of all 361 board positions.
         """
         opp_color = Rules.opposite(color)
+        five_set = set(five_positions)
 
-        # Check all empty positions for potential captures
-        for row in range(BOARD_SIZE):
-            for col in range(BOARD_SIZE):
-                if not board.is_empty(row, col):
-                    continue
+        # Only check empty positions near the five-in-row
+        candidates = set()
+        for row, col in five_positions:
+            for dr, dc in DIRECTIONS_8:
+                for dist in range(1, 4):  # Check up to 3 positions away
+                    nr, nc = row + dr * dist, col + dc * dist
+                    if Board.is_valid_pos(nr, nc) and board.is_empty(nr, nc):
+                        candidates.add((nr, nc))
 
-                captures = Rules.get_captured_positions(board, row, col, opp_color)
-                for cap_pos in captures:
-                    if cap_pos in five_positions:
-                        return True
+        for row, col in candidates:
+            captures = Rules.get_captured_positions(board, row, col, opp_color)
+            for cap_pos in captures:
+                if cap_pos in five_set:
+                    return True
 
         return False
 

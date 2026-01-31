@@ -120,8 +120,12 @@ class GomokuGame:
         """Undo the last move(s)."""
         # Undo both player and AI moves in PVE mode
         if self.state.mode == GameMode.PVE:
-            self.state.undo_move()  # Undo AI move
-            self.state.undo_move()  # Undo player move
+            # Need at least 2 moves to undo both AI and player
+            if self.state.get_move_count() >= 2:
+                self.state.undo_move()  # Undo AI move
+                self.state.undo_move()  # Undo player move
+            elif self.state.get_move_count() == 1:
+                self.state.undo_move()  # Only undo player's first move
         else:
             self.state.undo_move()
         self.suggested_move = None

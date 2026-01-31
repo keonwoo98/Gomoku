@@ -37,6 +37,9 @@ COLOR_PANEL_BG = (50, 54, 62)
 COLOR_BUTTON = (70, 80, 90)
 COLOR_BUTTON_HOVER = (90, 100, 110)
 COLOR_HIGHLIGHT = (255, 200, 100)
+COLOR_CAPTURE_BAR = (100, 180, 255)
+COLOR_CAPTURE_BG = (40, 45, 55)
+COLOR_WIN_HIGHLIGHT = (255, 215, 0)
 
 # Star points (hoshi) positions
 STAR_POINTS = [
@@ -71,16 +74,16 @@ class Renderer:
 
     def _setup_buttons(self):
         """Setup button positions and sizes."""
-        button_width = 120
-        button_height = 35
-        button_x = PANEL_X + 20
-        button_y = 480
+        button_width = 115
+        button_height = 36
+        button_x = PANEL_X + 18
+        button_y = 520
 
         self.buttons = {
             'new_game': pygame.Rect(button_x, button_y, button_width, button_height),
-            'undo': pygame.Rect(button_x + 130, button_y, button_width, button_height),
+            'undo': pygame.Rect(button_x + 125, button_y, button_width, button_height),
             'suggest': pygame.Rect(button_x, button_y + 45, button_width, button_height),
-            'mode': pygame.Rect(button_x + 130, button_y + 45, button_width, button_height),
+            'mode': pygame.Rect(button_x + 125, button_y + 45, button_width, button_height),
         }
 
     def board_to_screen(self, row: int, col: int) -> tuple:
@@ -228,12 +231,12 @@ class Renderer:
         panel_rect = pygame.Rect(PANEL_X, BOARD_MARGIN, PANEL_WIDTH, BOARD_AREA_SIZE)
         pygame.draw.rect(self.screen, COLOR_PANEL_BG, panel_rect, border_radius=10)
 
-        y_offset = BOARD_MARGIN + 20
+        y_offset = BOARD_MARGIN + 15
 
         # Title
         title = self.font_large.render("GOMOKU", True, COLOR_TEXT)
         self.screen.blit(title, (PANEL_X + 20, y_offset))
-        y_offset += 60
+        y_offset += 45
 
         # Game mode
         mode_text = {
@@ -241,120 +244,170 @@ class Renderer:
             GameMode.PVE: "Player vs AI",
             GameMode.EVE: "AI vs AI",
         }.get(state.mode, "Unknown")
-        mode = self.font_small.render(mode_text, True, COLOR_TEXT)
+        mode = self.font_small.render(mode_text, True, (180, 180, 180))
         self.screen.blit(mode, (PANEL_X + 20, y_offset))
-        y_offset += 40
+        y_offset += 30
 
         # Divider
-        pygame.draw.line(self.screen, COLOR_TEXT,
+        pygame.draw.line(self.screen, (80, 85, 95),
                         (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
-        y_offset += 20
+        y_offset += 15
 
-        # Players info
+        # Players info with capture progress bar
         for color in [BLACK, WHITE]:
             player = state.players[color]
             is_current = state.current_turn == color and not state.is_game_over
+            captures = state.captures[color]
 
             # Highlight current player
             if is_current:
-                highlight_rect = pygame.Rect(PANEL_X + 10, y_offset - 5, PANEL_WIDTH - 20, 60)
-                pygame.draw.rect(self.screen, (60, 70, 80), highlight_rect, border_radius=5)
+                highlight_rect = pygame.Rect(PANEL_X + 10, y_offset - 5, PANEL_WIDTH - 20, 70)
+                pygame.draw.rect(self.screen, (55, 65, 80), highlight_rect, border_radius=8)
+                pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, highlight_rect, 2, border_radius=8)
 
             # Stone icon
-            stone_x = PANEL_X + 35
-            stone_y = y_offset + 20
+            stone_x = PANEL_X + 32
+            stone_y = y_offset + 18
             stone_color = COLOR_BLACK_STONE if color == BLACK else COLOR_WHITE_STONE
-            pygame.draw.circle(self.screen, stone_color, (stone_x, stone_y), 12)
+            pygame.draw.circle(self.screen, (30, 30, 30), (stone_x + 2, stone_y + 2), 14)
+            pygame.draw.circle(self.screen, stone_color, (stone_x, stone_y), 14)
+            if color == WHITE:
+                pygame.draw.circle(self.screen, (255, 255, 255), (stone_x - 4, stone_y - 4), 3)
 
             # Player name
             name = self.font_medium.render(player.name, True, COLOR_TEXT)
-            self.screen.blit(name, (PANEL_X + 60, y_offset + 5))
+            self.screen.blit(name, (PANEL_X + 55, y_offset + 5))
 
-            # Captures
-            captures_text = f"Captures: {state.captures[color]}"
-            captures = self.font_small.render(captures_text, True, COLOR_TEXT)
-            self.screen.blit(captures, (PANEL_X + 60, y_offset + 35))
+            # Capture count with icon
+            capture_text = f"Captures: {captures}/10"
+            capture_label = self.font_small.render(capture_text, True, COLOR_TEXT)
+            self.screen.blit(capture_label, (PANEL_X + 55, y_offset + 32))
 
-            y_offset += 70
+            # Capture progress bar (10 captures = win)
+            bar_x = PANEL_X + 55
+            bar_y = y_offset + 52
+            bar_width = PANEL_WIDTH - 80
+            bar_height = 8
 
-        y_offset += 10
+            # Background
+            pygame.draw.rect(self.screen, COLOR_CAPTURE_BG,
+                           (bar_x, bar_y, bar_width, bar_height), border_radius=4)
+            # Progress
+            progress_width = int(bar_width * min(captures, 10) / 10)
+            if progress_width > 0:
+                bar_color = COLOR_WIN_HIGHLIGHT if captures >= 10 else COLOR_CAPTURE_BAR
+                pygame.draw.rect(self.screen, bar_color,
+                               (bar_x, bar_y, progress_width, bar_height), border_radius=4)
+            # Border
+            pygame.draw.rect(self.screen, (100, 105, 115),
+                           (bar_x, bar_y, bar_width, bar_height), 1, border_radius=4)
+
+            y_offset += 75
 
         # Divider
-        pygame.draw.line(self.screen, COLOR_TEXT,
+        pygame.draw.line(self.screen, (80, 85, 95),
                         (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
-        y_offset += 20
+        y_offset += 15
 
         # Current turn or winner
         if state.is_game_over:
             if state.winner == BLACK:
-                status_text = "Black Wins!"
+                status_text = "🏆 Black Wins!"
             elif state.winner == WHITE:
-                status_text = "White Wins!"
+                status_text = "🏆 White Wins!"
             else:
                 status_text = "Draw!"
-            status_color = COLOR_HIGHLIGHT
+            status_color = COLOR_WIN_HIGHLIGHT
         else:
             turn_name = "Black" if state.current_turn == BLACK else "White"
-            status_text = f"{turn_name}'s Turn"
+            status_text = f"► {turn_name}'s Turn"
             status_color = COLOR_TEXT
 
         status = self.font_medium.render(status_text, True, status_color)
         self.screen.blit(status, (PANEL_X + 20, y_offset))
-        y_offset += 40
-
-        # Move count
-        move_text = f"Move: #{state.get_move_count() + 1}"
-        move = self.font_small.render(move_text, True, COLOR_TEXT)
-        self.screen.blit(move, (PANEL_X + 20, y_offset))
-        y_offset += 40
-
-        # AI Timer
-        y_offset += 10
-        timer_label = self.font_medium.render("AI Timer", True, COLOR_TEXT)
-        self.screen.blit(timer_label, (PANEL_X + 20, y_offset))
         y_offset += 30
 
+        # Move count
+        move_text = f"Move #{state.get_move_count() + 1}"
+        move = self.font_small.render(move_text, True, (150, 150, 150))
+        self.screen.blit(move, (PANEL_X + 20, y_offset))
+        y_offset += 25
+
+        # Divider
+        pygame.draw.line(self.screen, (80, 85, 95),
+                        (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
+        y_offset += 12
+
+        # AI Timer section with box
+        timer_box = pygame.Rect(PANEL_X + 15, y_offset, PANEL_WIDTH - 30, 70)
+        pygame.draw.rect(self.screen, (45, 50, 60), timer_box, border_radius=8)
+
+        timer_label = self.font_small.render("AI Thinking Time", True, (150, 150, 150))
+        self.screen.blit(timer_label, (PANEL_X + 25, y_offset + 8))
+
         elapsed = state.get_ai_elapsed_time()
-        timer_color = (255, 100, 100) if elapsed > 0.4 else COLOR_TEXT
+        if elapsed > 0.4:
+            timer_color = (255, 100, 100)
+        elif elapsed > 0.3:
+            timer_color = (255, 200, 100)
+        else:
+            timer_color = (100, 255, 150)
+
         timer_text = f"{elapsed:.3f}s"
         timer = self.font_large.render(timer_text, True, timer_color)
-        self.screen.blit(timer, (PANEL_X + 20, y_offset))
-        y_offset += 60
+        self.screen.blit(timer, (PANEL_X + 25, y_offset + 30))
+
+        # Time limit indicator
+        limit_text = "/ 0.500s limit"
+        limit = self.font_small.render(limit_text, True, (120, 120, 120))
+        self.screen.blit(limit, (PANEL_X + 130, y_offset + 42))
+
+        y_offset += 85
 
         # Buttons
         self._render_buttons()
 
-        # Instructions
-        y_offset = BOARD_MARGIN + BOARD_AREA_SIZE - 80
+        # Instructions at bottom
+        y_offset = BOARD_MARGIN + BOARD_AREA_SIZE - 55
         instructions = [
-            "D: Toggle debug panel",
-            "V: Show valid moves",
+            "D: Debug panel  |  V: Valid moves",
             "ESC: Quit",
         ]
         for instruction in instructions:
-            text = self.font_small.render(instruction, True, (150, 150, 150))
+            text = self.font_small.render(instruction, True, (120, 120, 120))
             self.screen.blit(text, (PANEL_X + 20, y_offset))
-            y_offset += 22
+            y_offset += 20
 
     def _render_buttons(self):
-        """Render buttons."""
+        """Render buttons with improved styling."""
         mouse_pos = pygame.mouse.get_pos()
 
         button_labels = {
-            'new_game': 'New Game',
-            'undo': 'Undo',
-            'suggest': 'Suggest',
-            'mode': 'Mode',
+            'new_game': '⟳ New Game',
+            'undo': '↶ Undo',
+            'suggest': '💡 Suggest',
+            'mode': '⚙ Mode',
         }
 
         for name, rect in self.buttons.items():
             # Check hover
             is_hover = rect.collidepoint(mouse_pos)
-            color = COLOR_BUTTON_HOVER if is_hover else COLOR_BUTTON
+
+            # Gradient-like effect
+            if is_hover:
+                color = (85, 95, 110)
+                border_color = COLOR_HIGHLIGHT
+            else:
+                color = (60, 70, 85)
+                border_color = (100, 105, 115)
+
+            # Shadow
+            shadow_rect = pygame.Rect(rect.x + 2, rect.y + 2, rect.width, rect.height)
+            pygame.draw.rect(self.screen, (30, 35, 45), shadow_rect, border_radius=6)
 
             # Draw button
-            pygame.draw.rect(self.screen, color, rect, border_radius=5)
-            pygame.draw.rect(self.screen, COLOR_TEXT, rect, 1, border_radius=5)
+            pygame.draw.rect(self.screen, color, rect, border_radius=6)
+            pygame.draw.rect(self.screen, border_color, rect, 1, border_radius=6)
 
             # Draw label
             label = self.font_small.render(button_labels[name], True, COLOR_TEXT)
