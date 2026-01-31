@@ -315,14 +315,22 @@ class Rules:
         Check if there's a winner after a move at (row, col).
         captures: {BLACK: count, WHITE: count}
         Returns: BLACK, WHITE, or EMPTY (no winner)
+
+        Checks both:
+        1. Current player winning by capture or five-in-row
+        2. Opponent's existing five-in-row (if not broken by current move)
         """
         opp_color = Rules.opposite(color)
 
-        # Check capture win
+        # Check capture win for current player
         if captures.get(color, 0) >= Rules.WIN_CAPTURES:
             return color
 
-        # Check five-in-row
+        # Check capture win for opponent (should have been detected earlier, but just in case)
+        if captures.get(opp_color, 0) >= Rules.WIN_CAPTURES:
+            return opp_color
+
+        # Check current player's five-in-row at move position
         if Rules.check_five_at(board, row, col, color):
             # Endgame capture check
             five_positions = Rules.get_five_positions(board, row, col, color)
@@ -342,6 +350,12 @@ class Rules:
                                 return opp_color
 
             return color
+
+        # Check opponent's existing five-in-row
+        # (Opponent made five earlier, but current player had a chance to break it by capture)
+        # If opponent still has five-in-row, they win
+        if board.has_five_in_row(opp_color):
+            return opp_color
 
         return EMPTY
 

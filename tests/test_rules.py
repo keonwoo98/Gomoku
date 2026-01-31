@@ -313,6 +313,49 @@ class TestValidMoves:
         assert Rules.is_valid_move(board, 0, 0, WHITE)
 
 
+class TestOpponentFiveDetection:
+    """Test that opponent's existing five-in-row is detected."""
+
+    def test_opponent_five_detected_after_move(self):
+        """Opponent's five-in-row should be detected even if current player moves elsewhere."""
+        board = Board()
+        # White has five in a row
+        for i in range(5):
+            board.place_stone(5, 5 + i, WHITE)
+
+        # Black plays somewhere else
+        board.place_stone(10, 10, BLACK)
+
+        # check_winner should detect White's five
+        captures = {BLACK: 0, WHITE: 0}
+        winner = Rules.check_winner(board, 10, 10, BLACK, captures)
+        assert winner == WHITE
+
+    def test_black_five_detected_after_white_move(self):
+        """Black's five-in-row should be detected when White moves."""
+        board = Board()
+        # Black has five in a row
+        for i in range(5):
+            board.place_stone(3, 3 + i, BLACK)
+
+        # White plays somewhere else
+        board.place_stone(15, 15, WHITE)
+
+        captures = {BLACK: 0, WHITE: 0}
+        winner = Rules.check_winner(board, 15, 15, WHITE, captures)
+        assert winner == BLACK
+
+    def test_no_false_positive_without_five(self):
+        """Should return EMPTY when no five-in-row exists."""
+        board = Board()
+        board.place_stone(9, 9, BLACK)
+        board.place_stone(9, 10, WHITE)
+
+        captures = {BLACK: 0, WHITE: 0}
+        winner = Rules.check_winner(board, 9, 10, WHITE, captures)
+        assert winner == EMPTY
+
+
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 
