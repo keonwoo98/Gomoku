@@ -52,6 +52,7 @@ class Heuristic:
     def evaluate(self, board: Board, color: int, captures: dict) -> int:
         """
         Evaluate the board position from color's perspective.
+        Optimized version - scans only stones, not entire board.
 
         Args:
             board: Current board state
@@ -74,23 +75,104 @@ class Heuristic:
         if board.has_five_in_row(opp_color):
             return self.LOSE_SCORE
 
-        # Pattern-based evaluation
-        my_score = self._evaluate_patterns(board, color, opp_color)
-        opp_score = self._evaluate_patterns(board, opp_color, color)
+        # Fast evaluation: only scan existing stones
+        my_score = self._fast_evaluate(board, color, opp_color)
+        opp_score = self._fast_evaluate(board, opp_color, color)
 
-        # Capture evaluation
-        capture_score = self._evaluate_captures(board, color, opp_color, captures)
+        # Capture bonus
+        my_captures = captures.get(color, 0)
+        opp_captures = captures.get(opp_color, 0)
+        capture_diff = (my_captures - opp_captures) * 500
 
-        # Position evaluation (center control)
-        position_score = self._evaluate_positions(board, color, opp_color)
+        # Extra bonus near capture win
+        if my_captures >= 8:
+            capture_diff += 2000
+        if opp_captures >= 8:
+            capture_diff -= 2500
 
-        # Combine scores
-        total = (my_score * self.ATTACK_WEIGHT -
-                 opp_score * self.DEFENSE_WEIGHT +
-                 capture_score * self.CAPTURE_WEIGHT +
-                 position_score * self.CENTER_WEIGHT)
+        return int(my_score * self.ATTACK_WEIGHT -
+                   opp_score * self.DEFENSE_WEIGHT + capture_diff)
 
-        return int(total)
+    def _fast_evaluate(self, board: Board, color: int, opp_color: int) -> int:
+        """
+        Fast evaluation by iterating only over stones of the given color.
+        Uses bit manipulation to find set bits quickly.
+        """
+        score = 0
+        stones = board.black if color == BLACK else board.white
+        center = BOARD_SIZE // 2
+
+        # Iterate only over stones (not entire board)
+        temp_stones = stones
+        while temp_stones:
+            # Get lowest set bit position
+            bit = (temp_stones & -temp_stones).bit_length() - 1
+            row, col = bit // BOARD_SIZE, bit % BOARD_SIZE
+
+            # Center bonus
+            dist = abs(row - center) + abs(col - center)
+            score += (18 - dist) * 2
+
+            # Check lines through this stone
+            for dr, dc in DIRECTIONS:
+                line_score = self._evaluate_line_fast(board, row, col, dr, dc,
+                                                       color, opp_color)
+                score += line_score
+
+            temp_stones &= temp_stones - 1  # Clear lowest set bit
+
+        return score
+
+    def _evaluate_line_fast(self, board: Board, row: int, col: int,
+                            dr: int, dc: int, color: int, opp_color: int) -> int:
+        """
+        Fast line evaluation - count consecutive and potential.
+        Only looks at 4 positions in each direction (enough for patterns).
+        """
+        consecutive = 1
+        space_after = 0
+        potential = 0
+
+        # Positive direction
+        for i in range(1, 5):
+            r, c = row + i * dr, col + i * dc
+            if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+                break
+            stone = board.get(r, c)
+            if stone == color:
+                consecutive += 1
+            elif stone == EMPTY:
+                space_after += 1
+                potential = consecutive
+                break
+            else:  # Opponent
+                break
+
+        # Negative direction
+        for i in range(1, 5):
+            r, c = row - i * dr, col - i * dc
+            if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+                break
+            stone = board.get(r, c)
+            if stone == color:
+                consecutive += 1
+            elif stone == EMPTY:
+                space_after += 1
+                break
+            else:  # Opponent
+                break
+
+        # Score based on pattern length
+        if consecutive >= 5:
+            return 100000
+        elif consecutive == 4:
+            return 10000 if space_after >= 1 else 1000
+        elif consecutive == 3:
+            return 1000 if space_after >= 2 else 100
+        elif consecutive == 2:
+            return 100 if space_after >= 2 else 10
+
+        return 0
 
     def _evaluate_patterns(self, board: Board, color: int, opp_color: int) -> int:
         """Evaluate pattern-based score for a color."""

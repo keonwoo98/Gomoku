@@ -1,6 +1,12 @@
 """
 AI Engine for Gomoku.
 Implements Alpha-Beta Pruning with Iterative Deepening.
+
+Phase 2 Enhancements:
+- Transposition Table with Zobrist hashing
+- Null Move Pruning
+- Late Move Reduction (LMR)
+- Aspiration Windows
 """
 
 import time
@@ -11,6 +17,7 @@ from ..game.board import Board, BLACK, WHITE, EMPTY
 from ..game.rules import Rules
 from .heuristic import Heuristic
 from .movegen import MoveGenerator
+from .transposition import TranspositionTable, EXACT, LOWER_BOUND, UPPER_BOUND
 
 
 @dataclass
@@ -31,6 +38,12 @@ class AIDebugInfo:
 class AIEngine:
     """
     Gomoku AI using Alpha-Beta Pruning with Iterative Deepening.
+
+    Phase 2 Features:
+    - Transposition Table for position caching
+    - Null Move Pruning for faster cutoffs
+    - Late Move Reduction for deeper searches
+    - Aspiration Windows for tighter bounds
     """
 
     # Score bounds
@@ -42,9 +55,22 @@ class AIEngine:
     DEFAULT_MAX_DEPTH = 20
     MIN_DEPTH = 4  # Minimum depth to search
 
+    # Null Move Pruning settings
+    NMP_MIN_DEPTH = 3  # Only apply NMP at depth >= 3
+    NMP_REDUCTION = 2  # Depth reduction for null move
+
+    # Late Move Reduction settings
+    LMR_MIN_DEPTH = 3  # Only apply LMR at depth >= 3
+    LMR_MIN_MOVES = 4  # Apply after searching this many moves
+
+    # Aspiration Window settings
+    ASP_WINDOW = 50  # Initial window size
+    ASP_MIN_DEPTH = 100  # Disabled for now (was 4)
+
     def __init__(self):
         self.heuristic = Heuristic()
         self.move_gen = MoveGenerator(self.heuristic)
+        self.tt = TranspositionTable(size_mb=16)
 
         # Search state
         self.node_count = 0
@@ -55,12 +81,16 @@ class AIEngine:
         # Statistics
         self.alpha_cutoffs = 0
         self.beta_cutoffs = 0
+        self.null_cutoffs = 0
+        self.lmr_reductions = 0
+        self.lmr_researches = 0
 
         # Debug info
         self.debug_info = AIDebugInfo()
 
         # Best move storage for each depth
         self.best_moves_at_depth = {}
+        self.best_score_at_depth = {}
 
     def get_move(self, board: Board, color: int, captures: dict,
                  time_limit: float = DEFAULT_TIME_LIMIT) -> tuple:
@@ -82,8 +112,14 @@ class AIEngine:
         self.node_count = 0
         self.alpha_cutoffs = 0
         self.beta_cutoffs = 0
+        self.null_cutoffs = 0
+        self.lmr_reductions = 0
+        self.lmr_researches = 0
         self.best_moves_at_depth.clear()
+        self.best_score_at_depth.clear()
         self.move_gen.clear_killers()
+        self.move_gen.age_history()  # Age history scores
+        self.tt.new_search()  # Age TT entries
 
         # Reset debug info
         self.debug_info = AIDebugInfo()
@@ -92,7 +128,12 @@ class AIEngine:
         best_score = -self.INF
         all_root_scores = []
 
-        # Iterative Deepening
+        # Set last opponent move for countermove heuristic
+        if board.move_history:
+            last_move = board.move_history[-1]
+            self.move_gen.last_opponent_move = (last_move[0], last_move[1])
+
+        # Iterative Deepening with Aspiration Windows
         for depth in range(1, self.DEFAULT_MAX_DEPTH + 1):
             # Check time before starting new depth
             elapsed = time.time() - self.start_time
@@ -101,12 +142,21 @@ class AIEngine:
 
             # Get previous best for move ordering
             prev_best = self.best_moves_at_depth.get(depth - 1)
+            prev_score = self.best_score_at_depth.get(depth - 1, 0)
 
-            # Search at current depth
+            # Search at current depth (with aspiration windows for deeper searches)
             try:
-                move, score, pv, root_scores = self._search_root(
-                    board, color, depth, captures, prev_best
-                )
+                if depth >= self.ASP_MIN_DEPTH and prev_best is not None:
+                    # Aspiration window search
+                    move, score, pv, root_scores = self._search_with_aspiration(
+                        board, color, depth, captures, prev_best, prev_score
+                    )
+                else:
+                    # Full window search
+                    move, score, pv, root_scores = self._search_root(
+                        board, color, depth, captures, prev_best,
+                        -self.INF, self.INF
+                    )
             except TimeoutError:
                 break
 
@@ -115,6 +165,7 @@ class AIEngine:
                 best_move = move
                 best_score = score
                 self.best_moves_at_depth[depth] = move
+                self.best_score_at_depth[depth] = score
                 all_root_scores = root_scores
 
                 # Update debug info
@@ -149,24 +200,64 @@ class AIEngine:
 
         return best_move
 
+    def _search_with_aspiration(self, board: Board, color: int, depth: int,
+                                 captures: dict, prev_best: tuple,
+                                 prev_score: int) -> tuple:
+        """Search with aspiration windows for tighter bounds."""
+        window = self.ASP_WINDOW
+        alpha = prev_score - window
+        beta = prev_score + window
+
+        # Search with narrow window
+        move, score, pv, root_scores = self._search_root(
+            board, color, depth, captures, prev_best, alpha, beta
+        )
+
+        # Re-search if score outside window
+        if score is not None:
+            if score <= alpha:
+                # Fail-low: re-search with lower bound
+                move, score, pv, root_scores = self._search_root(
+                    board, color, depth, captures, prev_best,
+                    -self.INF, score + 1
+                )
+            elif score >= beta:
+                # Fail-high: re-search with upper bound
+                move, score, pv, root_scores = self._search_root(
+                    board, color, depth, captures, prev_best,
+                    score - 1, self.INF
+                )
+
+        return (move, score, pv, root_scores)
+
     def _search_root(self, board: Board, color: int, depth: int,
-                     captures: dict, prev_best: Optional[tuple]) -> tuple:
+                     captures: dict, prev_best: Optional[tuple],
+                     alpha: int = None, beta: int = None) -> tuple:
         """
         Search from the root position.
 
         Returns:
             (best_move, best_score, principal_variation, all_root_scores)
         """
-        alpha = -self.INF
-        beta = self.INF
+        if alpha is None:
+            alpha = -self.INF
+        if beta is None:
+            beta = self.INF
+
+        original_alpha = alpha
         best_move = None
         best_score = -self.INF
         best_pv = []
         all_scores = []
 
-        # Get ordered moves
-        moves = self.move_gen.get_moves(board, color, 0, captures, prev_best)
+        # Probe TT for move ordering
+        zobrist = self.tt.compute_hash(board, color)
+        _, _, tt_move = self.tt.probe(zobrist, depth, alpha, beta)
 
+        # Get ordered moves with TT move priority
+        moves = self.move_gen.get_moves(board, color, 0, captures, prev_best, tt_move)
+
+        moves_searched = 0
         for move in moves:
             # Check time
             if self._should_stop():
@@ -181,12 +272,32 @@ class AIEngine:
             new_captures = captures.copy()
             new_captures[color] = new_captures.get(color, 0) + len(captured)
 
-            # Search
+            # Search with LMR at root
             child_pv = []
-            score = -self._alphabeta(
-                board, self._opposite(color), depth - 1,
-                -beta, -alpha, new_captures, child_pv
-            )
+            do_full_search = True
+
+            # Late Move Reduction at root
+            if (moves_searched >= self.LMR_MIN_MOVES and
+                depth >= self.LMR_MIN_DEPTH and
+                len(captured) == 0):  # Not a capture move
+
+                # Reduced depth search
+                self.lmr_reductions += 1
+                score = -self._alphabeta(
+                    board, self._opposite(color), depth - 2,  # Reduced
+                    -alpha - 1, -alpha, new_captures, []
+                )
+
+                # Re-search if score improves alpha
+                do_full_search = (score > alpha)
+                if do_full_search:
+                    self.lmr_researches += 1
+
+            if do_full_search:
+                score = -self._alphabeta(
+                    board, self._opposite(color), depth - 1,
+                    -beta, -alpha, new_captures, child_pv
+                )
 
             # Undo move
             board.undo_move()
@@ -202,16 +313,35 @@ class AIEngine:
             if score > alpha:
                 alpha = score
 
-                # Update history for good moves
+                # Update history and countermove for good moves
                 self.move_gen.update_history(move, depth)
+                if board.move_history:
+                    last = board.move_history[-1]
+                    self.move_gen.record_countermove((last[0], last[1]), move)
+
+            moves_searched += 1
+
+        # Store in TT
+        if best_move is not None:
+            flag = EXACT
+            if best_score <= original_alpha:
+                flag = UPPER_BOUND
+            elif best_score >= beta:
+                flag = LOWER_BOUND
+            self.tt.store(zobrist, depth, best_score, flag, best_move)
 
         return (best_move, best_score, best_pv, all_scores)
 
     def _alphabeta(self, board: Board, color: int, depth: int,
                    alpha: int, beta: int, captures: dict,
-                   pv: list) -> int:
+                   pv: list, allow_null: bool = True) -> int:
         """
         Alpha-Beta search with negamax formulation.
+
+        Enhanced with:
+        - Transposition Table lookup/store
+        - Null Move Pruning
+        - Late Move Reduction
 
         Args:
             board: Current board state
@@ -221,19 +351,27 @@ class AIEngine:
             beta: Beta bound
             captures: Capture counts
             pv: Principal variation (output)
+            allow_null: Whether null move pruning is allowed
 
         Returns:
             Score for the position
         """
         self.node_count += 1
+        original_alpha = alpha
+        opp_color = self._opposite(color)
 
         # Check time periodically
         if self.node_count % 10000 == 0 and self._should_stop():
             raise TimeoutError()
 
-        # Terminal node checks
-        opp_color = self._opposite(color)
+        # ==================== TRANSPOSITION TABLE PROBE ====================
+        zobrist = self.tt.compute_hash(board, color)
+        tt_hit, tt_score, tt_move = self.tt.probe(zobrist, depth, alpha, beta)
 
+        if tt_hit:
+            return tt_score
+
+        # ==================== TERMINAL NODE CHECKS ====================
         # Check for wins
         if captures.get(color, 0) >= 10:
             return self.WIN_SCORE - (20 - depth)  # Prefer faster wins
@@ -245,20 +383,40 @@ class AIEngine:
         if board.has_five_in_row(opp_color):
             return -self.WIN_SCORE + (20 - depth)
 
-        # Depth limit reached
+        # Depth limit reached - evaluate
         if depth <= 0:
-            return self.heuristic.evaluate(board, color, captures)
+            score = self.heuristic.evaluate(board, color, captures)
+            self.tt.store(zobrist, 0, score, EXACT, None)
+            return score
 
-        # Get moves
+        # ==================== NULL MOVE PRUNING ====================
+        # Skip if: too shallow, or already did null move, or very few stones
+        if (allow_null and
+            depth >= self.NMP_MIN_DEPTH and
+            board.count_stones(color) + board.count_stones(opp_color) > 4):
+
+            # Null move: pass turn to opponent
+            null_score = -self._alphabeta(
+                board, opp_color, depth - 1 - self.NMP_REDUCTION,
+                -beta, -beta + 1, captures, [], allow_null=False
+            )
+
+            if null_score >= beta:
+                self.null_cutoffs += 1
+                return beta  # Null move cutoff
+
+        # ==================== MOVE GENERATION ====================
         prev_best = self.best_moves_at_depth.get(depth)
-        moves = self.move_gen.get_moves(board, color, depth, captures, prev_best)
+        moves = self.move_gen.get_moves(board, color, depth, captures, prev_best, tt_move)
 
         if not moves:
             # No valid moves (rare in Gomoku)
             return 0
 
         best_score = -self.INF
+        best_move = None
         best_child_pv = []
+        moves_searched = 0
 
         for move in moves:
             row, col = move
@@ -270,28 +428,70 @@ class AIEngine:
             new_captures = captures.copy()
             new_captures[color] = new_captures.get(color, 0) + len(captured)
 
-            # Recurse
+            # ==================== LATE MOVE REDUCTION ====================
             child_pv = []
-            score = -self._alphabeta(
-                board, opp_color, depth - 1,
-                -beta, -alpha, new_captures, child_pv
-            )
+            do_full_search = True
+            is_capture = len(captured) > 0
+            is_killer = depth in self.move_gen.killer_moves and move in self.move_gen.killer_moves[depth]
+
+            # LMR: reduce depth for late, quiet moves
+            if (moves_searched >= self.LMR_MIN_MOVES and
+                depth >= self.LMR_MIN_DEPTH and
+                not is_capture and
+                not is_killer):
+
+                # Calculate reduction
+                reduction = 1
+                if depth >= 6 and moves_searched >= 8:
+                    reduction = 2
+
+                # Search with reduced depth
+                self.lmr_reductions += 1
+                score = -self._alphabeta(
+                    board, opp_color, depth - 1 - reduction,
+                    -alpha - 1, -alpha, new_captures, []
+                )
+
+                # Re-search if score improves alpha
+                do_full_search = (score > alpha)
+                if do_full_search:
+                    self.lmr_researches += 1
+
+            if do_full_search:
+                # Full depth search
+                score = -self._alphabeta(
+                    board, opp_color, depth - 1,
+                    -beta, -alpha, new_captures, child_pv
+                )
 
             # Undo move
             board.undo_move()
 
             if score > best_score:
                 best_score = score
+                best_move = move
                 best_child_pv = [move] + child_pv
 
             if score > alpha:
                 alpha = score
+                self.move_gen.update_history(move, depth)
 
             if alpha >= beta:
-                # Record killer move
+                # Beta cutoff
                 self.move_gen.record_killer(move, depth)
                 self.beta_cutoffs += 1
                 break
+
+            moves_searched += 1
+
+        # ==================== TRANSPOSITION TABLE STORE ====================
+        flag = EXACT
+        if best_score <= original_alpha:
+            flag = UPPER_BOUND
+        elif best_score >= beta:
+            flag = LOWER_BOUND
+
+        self.tt.store(zobrist, depth, best_score, flag, best_move)
 
         pv.clear()
         pv.extend(best_child_pv)
@@ -315,6 +515,7 @@ class AIEngine:
 
     def get_debug_info(self) -> dict:
         """Get debug information as dictionary."""
+        tt_stats = self.tt.get_stats()
         return {
             'thinking_time': self.debug_info.thinking_time,
             'search_depth': self.debug_info.search_depth,
@@ -326,6 +527,11 @@ class AIEngine:
             'top_moves': self.debug_info.top_moves,
             'alpha_cutoffs': self.debug_info.alpha_cutoffs,
             'beta_cutoffs': self.debug_info.beta_cutoffs,
+            'null_cutoffs': self.null_cutoffs,
+            'lmr_reductions': self.lmr_reductions,
+            'lmr_researches': self.lmr_researches,
+            'tt_hit_rate': tt_stats['hit_rate'],
+            'tt_filled': tt_stats['filled'],
         }
 
     def suggest_move(self, board: Board, color: int, captures: dict,
