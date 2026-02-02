@@ -4,6 +4,7 @@ Handles all visual rendering of the game.
 """
 
 import pygame
+import time
 from typing import Optional
 
 from ..game.board import BOARD_SIZE, BLACK, WHITE, EMPTY
@@ -40,6 +41,8 @@ COLOR_HIGHLIGHT = (255, 200, 100)
 COLOR_CAPTURE_BAR = (100, 180, 255)
 COLOR_CAPTURE_BG = (40, 45, 55)
 COLOR_WIN_HIGHLIGHT = (255, 215, 0)
+COLOR_CAPTURE_FLASH = (255, 100, 100)
+COLOR_WIN_LINE = (50, 255, 50)
 
 # Star points (hoshi) positions
 STAR_POINTS = [
@@ -61,6 +64,7 @@ class Renderer:
 
         # Fonts
         self.font_large = pygame.font.Font(None, 48)
+        self.font_xlarge = pygame.font.Font(None, 72)
         self.font_medium = pygame.font.Font(None, 32)
         self.font_small = pygame.font.Font(None, 24)
 
@@ -71,6 +75,16 @@ class Renderer:
         # Buttons
         self.buttons = {}
         self._setup_buttons()
+
+        # Animation state
+        self.capture_flash_time = 0
+        self.capture_flash_positions = []
+        self.capture_flash_color = BLACK
+        self.last_capture_count = {BLACK: 0, WHITE: 0}
+
+        # Win animation
+        self.win_line_positions = []
+        self.win_animation_start = 0
 
     def _setup_buttons(self):
         """Setup button positions and sizes."""
@@ -108,9 +122,32 @@ class Renderer:
 
         return None
 
+    def trigger_capture_flash(self, positions: list, color: int):
+        """Trigger capture flash animation."""
+        if positions:
+            self.capture_flash_positions = positions
+            self.capture_flash_color = color
+            self.capture_flash_time = time.time()
+
+    def set_win_line(self, positions: list):
+        """Set the winning line positions for animation."""
+        self.win_line_positions = positions
+        self.win_animation_start = time.time()
+
+    def reset_animations(self):
+        """Reset all animation states."""
+        self.capture_flash_time = 0
+        self.capture_flash_positions = []
+        self.win_line_positions = []
+        self.win_animation_start = 0
+        self.last_capture_count = {BLACK: 0, WHITE: 0}
+
     def render(self, state: GameState, suggested_move: Optional[tuple] = None,
                debug_info: Optional[dict] = None, show_debug: bool = False):
         """Render the complete game state."""
+        # Check for new captures
+        self._check_capture_animation(state)
+
         # Background
         self.screen.fill(COLOR_BG)
 
@@ -124,7 +161,21 @@ class Renderer:
         if show_debug and debug_info:
             self._render_debug_panel(debug_info)
 
+        # Game over overlay
+        if state.is_game_over:
+            self._render_game_over_overlay(state)
+
         pygame.display.flip()
+
+    def _check_capture_animation(self, state: GameState):
+        """Check if captures occurred and trigger animation."""
+        for color in [BLACK, WHITE]:
+            current = state.captures.get(color, 0)
+            if current > self.last_capture_count.get(color, 0):
+                # Captures increased - but we need positions from state
+                # This will be called from main.py with actual positions
+                pass
+            self.last_capture_count[color] = current
 
     def _render_board(self, state: GameState, suggested_move: Optional[tuple] = None):
         """Render the game board."""
@@ -177,6 +228,47 @@ class Renderer:
                 s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
                 pygame.draw.circle(s, COLOR_VALID_MOVE, (CELL_SIZE // 2, CELL_SIZE // 2), 8)
                 self.screen.blit(s, (x - CELL_SIZE // 2, y - CELL_SIZE // 2))
+
+        # Capture flash animation (show where captures happened)
+        if self.capture_flash_positions and time.time() - self.capture_flash_time < 1.0:
+            elapsed = time.time() - self.capture_flash_time
+            alpha = int(255 * (1 - elapsed))
+            pulse = abs(int(20 * (1 - elapsed) * (1 + 0.5 * (elapsed * 10 % 2))))
+
+            for row, col in self.capture_flash_positions:
+                x, y = self.board_to_screen(row, col)
+                # Draw expanding ring
+                radius = STONE_RADIUS + int(15 * elapsed)
+                s = pygame.Surface((radius * 2 + 20, radius * 2 + 20), pygame.SRCALPHA)
+                pygame.draw.circle(s, (*COLOR_CAPTURE_FLASH[:3], alpha),
+                                 (radius + 10, radius + 10), radius, 4)
+                self.screen.blit(s, (x - radius - 10, y - radius - 10))
+
+                # Draw X mark
+                size = 10 + pulse
+                pygame.draw.line(self.screen, (*COLOR_CAPTURE_FLASH[:3], alpha),
+                               (x - size, y - size), (x + size, y + size), 3)
+                pygame.draw.line(self.screen, (*COLOR_CAPTURE_FLASH[:3], alpha),
+                               (x + size, y - size), (x - size, y + size), 3)
+
+        # Winning line highlight
+        if self.win_line_positions and state.is_game_over:
+            elapsed = time.time() - self.win_animation_start
+            pulse = 0.5 + 0.5 * abs((elapsed * 3) % 2 - 1)
+
+            # Draw connecting line
+            if len(self.win_line_positions) >= 2:
+                points = [self.board_to_screen(r, c) for r, c in self.win_line_positions]
+                # Sort points to draw line properly
+                points.sort()
+                pygame.draw.line(self.screen, COLOR_WIN_LINE,
+                               points[0], points[-1], 5)
+
+            # Highlight winning stones
+            for row, col in self.win_line_positions:
+                x, y = self.board_to_screen(row, col)
+                radius = int(STONE_RADIUS + 5 * pulse)
+                pygame.draw.circle(self.screen, COLOR_WIN_HIGHLIGHT, (x, y), radius, 4)
 
         # Stones
         for row in range(BOARD_SIZE):
@@ -257,13 +349,19 @@ class Renderer:
         for color in [BLACK, WHITE]:
             player = state.players[color]
             is_current = state.current_turn == color and not state.is_game_over
+            is_winner = state.is_game_over and state.winner == color
             captures = state.captures[color]
 
-            # Highlight current player
-            if is_current:
+            # Highlight current player or winner
+            if is_current or is_winner:
                 highlight_rect = pygame.Rect(PANEL_X + 10, y_offset - 5, PANEL_WIDTH - 20, 70)
-                pygame.draw.rect(self.screen, (55, 65, 80), highlight_rect, border_radius=8)
-                pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, highlight_rect, 2, border_radius=8)
+                if is_winner:
+                    # Winner gets gold highlight
+                    pygame.draw.rect(self.screen, (60, 55, 30), highlight_rect, border_radius=8)
+                    pygame.draw.rect(self.screen, COLOR_WIN_HIGHLIGHT, highlight_rect, 3, border_radius=8)
+                else:
+                    pygame.draw.rect(self.screen, (55, 65, 80), highlight_rect, border_radius=8)
+                    pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, highlight_rect, 2, border_radius=8)
 
             # Stone icon
             stone_x = PANEL_X + 32
@@ -274,13 +372,20 @@ class Renderer:
             if color == WHITE:
                 pygame.draw.circle(self.screen, (255, 255, 255), (stone_x - 4, stone_y - 4), 3)
 
+            # Winner crown icon
+            if is_winner:
+                crown_text = self.font_medium.render("👑", True, COLOR_WIN_HIGHLIGHT)
+                self.screen.blit(crown_text, (PANEL_X + PANEL_WIDTH - 50, y_offset + 5))
+
             # Player name
-            name = self.font_medium.render(player.name, True, COLOR_TEXT)
+            name_color = COLOR_WIN_HIGHLIGHT if is_winner else COLOR_TEXT
+            name = self.font_medium.render(player.name, True, name_color)
             self.screen.blit(name, (PANEL_X + 55, y_offset + 5))
 
             # Capture count with icon
+            capture_color = COLOR_WIN_HIGHLIGHT if captures >= 10 else COLOR_TEXT
             capture_text = f"Captures: {captures}/10"
-            capture_label = self.font_small.render(capture_text, True, COLOR_TEXT)
+            capture_label = self.font_small.render(capture_text, True, capture_color)
             self.screen.blit(capture_label, (PANEL_X + 55, y_offset + 32))
 
             # Capture progress bar (10 captures = win)
@@ -312,20 +417,33 @@ class Renderer:
         # Current turn or winner
         if state.is_game_over:
             if state.winner == BLACK:
-                status_text = "🏆 Black Wins!"
+                status_text = "Black Wins!"
             elif state.winner == WHITE:
-                status_text = "🏆 White Wins!"
+                status_text = "White Wins!"
             else:
                 status_text = "Draw!"
             status_color = COLOR_WIN_HIGHLIGHT
+
+            # Win reason
+            if state.captures.get(state.winner, 0) >= 10:
+                reason = "(by Capture)"
+            else:
+                reason = "(5 in a row)"
+            reason_text = self.font_small.render(reason, True, (180, 180, 180))
         else:
             turn_name = "Black" if state.current_turn == BLACK else "White"
-            status_text = f"► {turn_name}'s Turn"
+            status_text = f"{turn_name}'s Turn"
             status_color = COLOR_TEXT
 
         status = self.font_medium.render(status_text, True, status_color)
         self.screen.blit(status, (PANEL_X + 20, y_offset))
-        y_offset += 30
+        y_offset += 28
+
+        if state.is_game_over and state.winner != EMPTY:
+            self.screen.blit(reason_text, (PANEL_X + 20, y_offset))
+            y_offset += 22
+        else:
+            y_offset += 2
 
         # Move count
         move_text = f"Move #{state.get_move_count() + 1}"
@@ -383,10 +501,10 @@ class Renderer:
         mouse_pos = pygame.mouse.get_pos()
 
         button_labels = {
-            'new_game': '⟳ New Game',
-            'undo': '↶ Undo',
-            'suggest': '💡 Suggest',
-            'mode': '⚙ Mode',
+            'new_game': 'New Game',
+            'undo': 'Undo',
+            'suggest': 'Suggest',
+            'mode': 'Mode',
         }
 
         for name, rect in self.buttons.items():
@@ -414,6 +532,67 @@ class Renderer:
             label_x = rect.centerx - label.get_width() // 2
             label_y = rect.centery - label.get_height() // 2
             self.screen.blit(label, (label_x, label_y))
+
+    def _render_game_over_overlay(self, state: GameState):
+        """Render a prominent game over overlay."""
+        # Semi-transparent dark overlay
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 150))
+        self.screen.blit(overlay, (0, 0))
+
+        # Central box
+        box_width = 400
+        box_height = 200
+        box_x = (BOARD_MARGIN + BOARD_AREA_SIZE // 2) - box_width // 2
+        box_y = WINDOW_HEIGHT // 2 - box_height // 2
+
+        # Animated border
+        elapsed = time.time() - self.win_animation_start
+        pulse = 0.8 + 0.2 * abs((elapsed * 2) % 2 - 1)
+
+        # Box background
+        box_rect = pygame.Rect(box_x, box_y, box_width, box_height)
+        pygame.draw.rect(self.screen, (40, 45, 55), box_rect, border_radius=15)
+
+        # Gold border for winner
+        border_width = int(4 * pulse)
+        pygame.draw.rect(self.screen, COLOR_WIN_HIGHLIGHT, box_rect, border_width, border_radius=15)
+
+        # Winner text
+        if state.winner == BLACK:
+            winner_text = "BLACK WINS!"
+            winner_color = COLOR_BLACK_STONE
+        elif state.winner == WHITE:
+            winner_text = "WHITE WINS!"
+            winner_color = COLOR_WHITE_STONE
+        else:
+            winner_text = "DRAW!"
+            winner_color = COLOR_TEXT
+
+        # Trophy/crown
+        trophy = self.font_xlarge.render("🏆", True, COLOR_WIN_HIGHLIGHT)
+        trophy_x = box_x + box_width // 2 - trophy.get_width() // 2
+        self.screen.blit(trophy, (trophy_x, box_y + 20))
+
+        # Winner announcement
+        winner = self.font_xlarge.render(winner_text, True, COLOR_WIN_HIGHLIGHT)
+        winner_x = box_x + box_width // 2 - winner.get_width() // 2
+        self.screen.blit(winner, (winner_x, box_y + 80))
+
+        # Win reason
+        if state.winner != EMPTY:
+            if state.captures.get(state.winner, 0) >= 10:
+                reason = f"Victory by Capture ({state.captures[state.winner]} stones)"
+            else:
+                reason = "Victory by 5 in a row!"
+            reason_text = self.font_medium.render(reason, True, (180, 180, 180))
+            reason_x = box_x + box_width // 2 - reason_text.get_width() // 2
+            self.screen.blit(reason_text, (reason_x, box_y + 145))
+
+        # Instructions
+        instruction = self.font_small.render("Press R for New Game", True, (150, 150, 150))
+        instr_x = box_x + box_width // 2 - instruction.get_width() // 2
+        self.screen.blit(instruction, (instr_x, box_y + 175))
 
     def _render_debug_panel(self, debug_info: dict):
         """Render the debug panel with AI information."""

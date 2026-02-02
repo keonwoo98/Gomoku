@@ -9,6 +9,7 @@ import pygame
 
 from src.game.state import GameState, GameMode
 from src.game.board import BLACK, WHITE
+from src.game.rules import Rules
 from src.ai.engine import AIEngine
 from src.ui.renderer import Renderer
 from src.ui.input import InputHandler, InputAction
@@ -69,8 +70,7 @@ class GomokuGame:
             elif event.action == InputAction.PLACE_STONE:
                 if self.state.is_human_turn() and event.position:
                     row, col = event.position
-                    if self.state.make_move(row, col):
-                        self.suggested_move = None
+                    self._make_move(row, col)
 
             elif event.action == InputAction.NEW_GAME:
                 self._new_game()
@@ -90,12 +90,59 @@ class GomokuGame:
             elif event.action == InputAction.TOGGLE_VALID_MOVES:
                 self.renderer.show_valid_moves = not self.renderer.show_valid_moves
 
+    def _make_move(self, row: int, col: int, thinking_time: float = 0.0):
+        """Make a move and handle UI animations."""
+        color = self.state.current_turn
+
+        # Get capture positions BEFORE making the move
+        captured_positions = Rules.get_captured_positions(
+            self.state.board, row, col, color
+        )
+
+        # Make the move
+        if self.state.make_move(row, col, thinking_time):
+            self.suggested_move = None
+
+            # Trigger capture animation if captures occurred
+            if captured_positions:
+                self.renderer.trigger_capture_flash(captured_positions, color)
+
+            # Check for win and set win line
+            if self.state.is_game_over and self.state.winner != 0:
+                self._set_win_animation()
+
+    def _set_win_animation(self):
+        """Set the winning line animation."""
+        winner = self.state.winner
+
+        # Check if win by 5-in-row (not capture)
+        if self.state.captures.get(winner, 0) < 10:
+            # Find the winning line
+            if self.state.last_move:
+                row, col = self.state.last_move
+                win_positions = Rules.get_five_positions(
+                    self.state.board, row, col, winner
+                )
+                if win_positions:
+                    self.renderer.set_win_line(win_positions)
+                else:
+                    # Search the entire board for five-in-row
+                    for r in range(19):
+                        for c in range(19):
+                            if self.state.board.get(r, c) == winner:
+                                positions = Rules.get_five_positions(
+                                    self.state.board, r, c, winner
+                                )
+                                if positions:
+                                    self.renderer.set_win_line(positions)
+                                    return
+        else:
+            # Win by capture - start animation without line
+            self.renderer.win_animation_start = __import__('time').time()
+
     def _run_ai_turn(self):
         """Execute AI move."""
         self.state.start_ai_timer()
-
-        # Keep UI responsive during AI thinking
-        # (In a more advanced version, this would be in a separate thread)
 
         # Get AI move
         move = self.ai_engine.get_move(
@@ -108,13 +155,14 @@ class GomokuGame:
         self.state.stop_ai_timer()
 
         if move:
-            self.state.make_move(move[0], move[1], self.state.last_ai_time)
+            self._make_move(move[0], move[1], self.state.last_ai_time)
 
     def _new_game(self):
         """Start a new game."""
         self.state.reset()
         self.suggested_move = None
         self.ai_engine.move_gen.clear()
+        self.renderer.reset_animations()
 
     def _undo(self):
         """Undo the last move(s)."""
@@ -129,6 +177,7 @@ class GomokuGame:
         else:
             self.state.undo_move()
         self.suggested_move = None
+        self.renderer.reset_animations()
 
     def _suggest_move(self):
         """Get AI suggestion for current player."""
@@ -154,6 +203,7 @@ class GomokuGame:
         new_mode = self.modes[self.current_mode_idx]
         self.state.reset(new_mode)
         self.suggested_move = None
+        self.renderer.reset_animations()
 
 
 def main():
