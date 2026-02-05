@@ -247,28 +247,34 @@ fn lcg(seed: &mut u64) -> u64 {
 ## 디렉토리 구조
 
 ```
-engine/
+Gomoku/
+├── Cargo.toml           # 패키지 설정
+├── Makefile             # 빌드 스크립트
 ├── src/
 │   ├── lib.rs           # 라이브러리 진입점
-│   ├── main.rs          # CLI 테스트
+│   ├── main.rs          # CLI 바이너리
 │   ├── engine.rs        # AI 엔진 통합
 │   ├── board/
 │   │   ├── bitboard.rs  # 6 x u64 비트보드
 │   │   ├── board.rs     # Board 구조체
-│   │   └── pos.rs       # 위치 타입
+│   │   └── mod.rs       # 모듈 정의
 │   ├── rules/
 │   │   ├── capture.rs   # X-O-O-X 캡처
 │   │   ├── win.rs       # 승리 조건
-│   │   └── forbidden.rs # 쌍삼 금지
+│   │   ├── forbidden.rs # 쌍삼 금지
+│   │   └── mod.rs
 │   ├── eval/
 │   │   ├── patterns.rs  # 점수 상수
-│   │   └── heuristic.rs # 평가 함수
+│   │   ├── heuristic.rs # 평가 함수
+│   │   └── mod.rs
 │   └── search/
 │       ├── alphabeta.rs # Alpha-Beta + ID
 │       ├── threat.rs    # VCF/VCT
 │       ├── tt.rs        # Transposition Table
-│       └── zobrist.rs   # Zobrist 해싱
-└── Cargo.toml
+│       ├── zobrist.rs   # Zobrist 해싱
+│       └── mod.rs
+└── docs/
+    └── ARCHITECTURE.md  # 설계 결정
 ```
 
 ---

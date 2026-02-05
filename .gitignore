@@ -1,5 +1,6 @@
-# Rust build artifacts
-engine/target/
+# Rust
+target/
+Cargo.lock
 
 # IDE
 .vscode/
@@ -11,6 +12,6 @@ engine/target/
 .DS_Store
 Thumbs.db
 
-# Project specific
-Gomoku.pdf
+# Project
 Gomoku
+Gomoku.pdf

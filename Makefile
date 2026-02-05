@@ -3,15 +3,21 @@ NAME = Gomoku
 all: $(NAME)
 
 $(NAME):
-	@cd engine && cargo build --release
-	@cp engine/target/release/gomoku $(NAME)
+	@cargo build --release
+	@cp target/release/gomoku $(NAME)
 
 clean:
-	@cd engine && cargo clean
+	@cargo clean
 
 fclean: clean
 	@rm -f $(NAME)
 
 re: fclean all
 
-.PHONY: all clean fclean re
+test:
+	@cargo test --lib
+
+test-release:
+	@cargo test --lib --release
+
+.PHONY: all clean fclean re test test-release
