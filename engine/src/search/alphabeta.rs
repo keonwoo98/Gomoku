@@ -370,11 +370,15 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
+        // Add more stones to constrain search space (faster in debug mode)
         board.place_stone(Pos::new(9, 9), Stone::Black);
-        board.place_stone(Pos::new(10, 10), Stone::White);
+        board.place_stone(Pos::new(9, 10), Stone::White);
+        board.place_stone(Pos::new(9, 8), Stone::Black);
+        board.place_stone(Pos::new(10, 9), Stone::White);
+        board.place_stone(Pos::new(8, 9), Stone::Black);
 
-        // Use depth 4 for faster test in debug mode
-        let result = searcher.search(&board, Stone::Black, 4);
+        // Use depth 2 for fast test in debug mode
+        let result = searcher.search(&board, Stone::White, 2);
         assert!(result.depth >= 1);
         assert!(result.nodes > 0);
     }
