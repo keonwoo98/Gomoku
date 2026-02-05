@@ -128,8 +128,8 @@ impl MoveResult {
         }
     }
 
-    /// Create a result indicating no move found
-    #[inline]
+    /// Create a result indicating no move found (used in tests)
+    #[cfg(test)]
     fn no_move(time_ms: u64) -> Self {
         Self {
             best_move: None,

@@ -13,16 +13,18 @@ pub struct Board {
     /// Number of pairs captured by each side (0-5, 5 = win)
     pub black_captures: u8,
     pub white_captures: u8,
-    /// Move history for undo
+    /// Move history for undo (reserved for future use)
+    #[allow(dead_code)]
     history: Vec<MoveRecord>,
 }
 
-/// Record of a move for undo functionality
+/// Record of a move for undo functionality (reserved for future use)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct MoveRecord {
     pos: Pos,
     stone: Stone,
-    captured: Vec<Pos>, // Positions of captured stones
+    captured: Vec<Pos>,
 }
 
 impl Board {
