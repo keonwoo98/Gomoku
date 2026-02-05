@@ -325,34 +325,11 @@ impl AIEngine {
             return MoveResult::immediate_win(win_move, start.elapsed().as_millis() as u64);
         }
 
-        // 2. Search VCF (Victory by Continuous Fours)
-        let vcf_result = self.threat_searcher.search_vcf(board, color);
-        if vcf_result.found && !vcf_result.winning_sequence.is_empty() {
-            return MoveResult::vcf_win(
-                vcf_result.winning_sequence[0],
-                start.elapsed().as_millis() as u64,
-                self.threat_searcher.nodes(),
-            );
-        }
-
-        // 3. Search VCT (Victory by Continuous Threats)
-        // Skip VCT on sparse boards - VCT requires existing structure and is expensive
-        // With fewer than 8 stones, meaningful VCT patterns are unlikely
-        if board.stone_count() >= 8 {
-            let vct_result = self.threat_searcher.search_vct(board, color);
-            if vct_result.found && !vct_result.winning_sequence.is_empty() {
-                return MoveResult::vct_win(
-                    vct_result.winning_sequence[0],
-                    start.elapsed().as_millis() as u64,
-                    self.threat_searcher.nodes(),
-                );
-            }
-        }
-
-        // 4. Check opponent's threats - must defend!
+        // 2. CRITICAL: Check opponent's immediate threats FIRST
+        // If opponent can win next move, we MUST block regardless of our own threats
         let opponent = color.opponent();
 
-        // 4a. Check opponent's immediate win (5-in-a-row possible)
+        // 2a. Check opponent's immediate win (5-in-a-row possible)
         if let Some(opp_win) = self.find_immediate_win(board, opponent) {
             // Block it if we can
             if is_valid_move(board, opp_win, color) {
@@ -365,7 +342,7 @@ impl AIEngine {
             }
         }
 
-        // 4b. Check opponent's four-in-a-row threats (must block or lose)
+        // 2b. Check opponent's four-in-a-row threats (must block or lose next turn)
         if let Some(block_pos) = self.find_four_threat(board, opponent, color) {
             return MoveResult::defense(
                 block_pos,
@@ -375,13 +352,36 @@ impl AIEngine {
             );
         }
 
-        // 4c. Check opponent's VCF
+        // 3. Search VCF (Victory by Continuous Fours) - our winning threats
+        let vcf_result = self.threat_searcher.search_vcf(board, color);
+        if vcf_result.found && !vcf_result.winning_sequence.is_empty() {
+            return MoveResult::vcf_win(
+                vcf_result.winning_sequence[0],
+                start.elapsed().as_millis() as u64,
+                self.threat_searcher.nodes(),
+            );
+        }
+
+        // 4. Check opponent's VCF - must defend before our slower VCT
         let opp_vcf = self.threat_searcher.search_vcf(board, opponent);
         if opp_vcf.found {
             if let Some(defense) = self.find_best_defense(board, color, &opp_vcf) {
                 return MoveResult::defense(
                     defense,
                     -100_000,
+                    start.elapsed().as_millis() as u64,
+                    self.threat_searcher.nodes(),
+                );
+            }
+        }
+
+        // 5. Search VCT (Victory by Continuous Threats)
+        // Only after all immediate threats are handled
+        if board.stone_count() >= 8 {
+            let vct_result = self.threat_searcher.search_vct(board, color);
+            if vct_result.found && !vct_result.winning_sequence.is_empty() {
+                return MoveResult::vct_win(
+                    vct_result.winning_sequence[0],
                     start.elapsed().as_millis() as u64,
                     self.threat_searcher.nodes(),
                 );
