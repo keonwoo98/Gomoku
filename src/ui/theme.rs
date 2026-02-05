@@ -2,46 +2,68 @@
 
 use egui::Color32;
 
-// Board colors
-pub const BOARD_BG: Color32 = Color32::from_rgb(220, 179, 92);
-pub const GRID_LINE: Color32 = Color32::from_rgb(40, 30, 20);
-pub const STAR_POINT: Color32 = Color32::from_rgb(40, 30, 20);
+// Board colors - warm wood tones
+pub const BOARD_BG: Color32 = Color32::from_rgb(222, 184, 135); // Burlywood
+#[allow(dead_code)]
+pub const BOARD_BORDER: Color32 = Color32::from_rgb(139, 90, 43);  // Saddle brown
+pub const GRID_LINE: Color32 = Color32::from_rgb(60, 40, 20);
+pub const STAR_POINT: Color32 = Color32::from_rgb(50, 35, 20);
 
-// Stone colors
-pub const BLACK_STONE: Color32 = Color32::from_rgb(20, 20, 20);
-pub const BLACK_STONE_HIGHLIGHT: Color32 = Color32::from_rgb(60, 60, 60);
-pub const WHITE_STONE: Color32 = Color32::from_rgb(245, 245, 245);
-pub const WHITE_STONE_SHADOW: Color32 = Color32::from_rgb(180, 180, 180);
+// Stone colors with better contrast
+pub const BLACK_STONE: Color32 = Color32::from_rgb(25, 25, 30);
+pub const BLACK_STONE_HIGHLIGHT: Color32 = Color32::from_rgb(70, 70, 80);
+pub const WHITE_STONE: Color32 = Color32::from_rgb(250, 250, 252);
+pub const WHITE_STONE_SHADOW: Color32 = Color32::from_rgb(190, 190, 195);
 
 // Markers
-pub const LAST_MOVE_MARKER: Color32 = Color32::from_rgb(220, 50, 50);
-pub const WIN_HIGHLIGHT: Color32 = Color32::from_rgb(50, 205, 50);
+pub const LAST_MOVE_MARKER: Color32 = Color32::from_rgb(230, 60, 60);
+pub const WIN_HIGHLIGHT: Color32 = Color32::from_rgb(50, 220, 50);
+
+// Capture effect colors (used in board_view animation)
+#[allow(dead_code)]
+pub const CAPTURE_FLASH: Color32 = Color32::from_rgb(255, 100, 100);
+#[allow(dead_code)]
+pub const CAPTURE_RING: Color32 = Color32::from_rgb(255, 50, 50);
 
 // Functions for colors that can't be const
 pub fn hover_valid() -> Color32 {
-    Color32::from_rgba_unmultiplied(100, 100, 100, 120)
+    Color32::from_rgba_unmultiplied(80, 80, 80, 100)
 }
 
 pub fn hover_invalid() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 0, 0, 80)
+    Color32::from_rgba_unmultiplied(255, 50, 50, 100)
 }
 
-// UI colors (reserved for future use)
+// Panel colors - dark modern theme
+pub const PANEL_BG: Color32 = Color32::from_rgb(32, 34, 37);
+pub const PANEL_HEADER: Color32 = Color32::from_rgb(42, 44, 48);
+pub const PANEL_BORDER: Color32 = Color32::from_rgb(60, 62, 66);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 240, 245);
+pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 165, 175);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(120, 125, 135);
+
+// Button colors
 #[allow(dead_code)]
-pub const PANEL_BG: Color32 = Color32::from_rgb(45, 45, 48);
+pub const BUTTON_BG: Color32 = Color32::from_rgb(55, 57, 62);
 #[allow(dead_code)]
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 230, 230);
+pub const BUTTON_HOVER: Color32 = Color32::from_rgb(70, 72, 78);
 #[allow(dead_code)]
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 160, 160);
-#[allow(dead_code)]
-pub const BUTTON_BG: Color32 = Color32::from_rgb(70, 70, 75);
-#[allow(dead_code)]
-pub const BUTTON_HOVER: Color32 = Color32::from_rgb(90, 90, 95);
+pub const BUTTON_ACTIVE: Color32 = Color32::from_rgb(85, 87, 95);
+
+// Status colors
+pub const STATUS_BLACK: Color32 = Color32::from_rgb(60, 60, 65);
+pub const STATUS_WHITE: Color32 = Color32::from_rgb(220, 220, 225);
 
 // Timer colors
-pub const TIMER_NORMAL: Color32 = Color32::from_rgb(100, 200, 100);
-pub const TIMER_WARNING: Color32 = Color32::from_rgb(255, 200, 50);
-pub const TIMER_CRITICAL: Color32 = Color32::from_rgb(255, 80, 80);
+pub const TIMER_NORMAL: Color32 = Color32::from_rgb(80, 200, 120);
+pub const TIMER_WARNING: Color32 = Color32::from_rgb(255, 180, 50);
+pub const TIMER_CRITICAL: Color32 = Color32::from_rgb(255, 70, 70);
+
+// Score/capture colors
+#[allow(dead_code)]
+pub const CAPTURE_BLACK_BG: Color32 = Color32::from_rgb(50, 50, 55);
+#[allow(dead_code)]
+pub const CAPTURE_WHITE_BG: Color32 = Color32::from_rgb(200, 200, 205);
 
 // Sizes
 pub const BOARD_MARGIN: f32 = 40.0;

@@ -1,7 +1,7 @@
 //! Main application for the Gomoku GUI
 
 use eframe::egui;
-use egui::{CentralPanel, Context, SidePanel, TopBottomPanel};
+use egui::{CentralPanel, Context, RichText, SidePanel, TopBottomPanel};
 
 use crate::Stone;
 use super::board_view::BoardView;
@@ -79,75 +79,196 @@ impl GomokuApp {
     /// Render the side panel with game info and debug
     fn render_side_panel(&mut self, ctx: &Context) {
         SidePanel::right("info_panel")
-            .min_width(200.0)
-            .max_width(300.0)
+            .min_width(220.0)
+            .max_width(280.0)
             .show(ctx, |ui| {
-                ui.heading("Game Info");
-                ui.separator();
+                ui.style_mut().visuals.widgets.noninteractive.bg_fill = PANEL_BG;
 
-                // Current turn
-                let turn_text = if self.state.current_turn == Stone::Black {
-                    "⚫ Black's Turn"
-                } else {
-                    "⚪ White's Turn"
-                };
-                ui.label(turn_text);
-
-                // Timer
+                // Game title
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("GOMOKU").size(20.0).strong().color(TEXT_PRIMARY));
+                });
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(8.0);
+
+                // Current turn indicator - big and clear
+                self.render_turn_indicator(ui);
+                ui.add_space(12.0);
+
+                // Timer section
+                ui.separator();
+                ui.add_space(8.0);
                 self.render_timer(ui);
+                ui.add_space(8.0);
 
-                // Captures
+                // Captures section - visual progress bars
                 ui.separator();
-                ui.label("Captures:");
-                ui.horizontal(|ui| {
-                    ui.label(format!("⚫ Black: {}/5", self.state.board.black_captures));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(format!("⚪ White: {}/5", self.state.board.white_captures));
-                });
+                ui.add_space(8.0);
+                self.render_captures(ui);
+                ui.add_space(8.0);
 
-                // Move history
+                // Action buttons
                 ui.separator();
-                ui.label(format!("Moves: {}", self.state.move_history.len()));
+                ui.add_space(8.0);
+                self.render_action_buttons(ui);
+                ui.add_space(8.0);
 
-                // PvP hint button
-                if let GameMode::PvP { .. } = self.state.mode {
-                    ui.separator();
-                    if ui.button("💡 Get Hint (H)").clicked() {
-                        self.state.request_suggestion();
-                    }
-                }
-
-                // Undo button
-                ui.separator();
-                if ui.button("↩ Undo (U)").clicked() {
-                    self.state.undo();
-                }
-
-                // Debug panel
+                // Debug panel (collapsible)
                 if self.show_debug {
                     ui.separator();
+                    ui.add_space(4.0);
                     self.render_debug_panel(ui);
                 }
 
-                // Game over message
-                if let Some(result) = &self.state.game_over {
+                // Game over overlay
+                if let Some(result) = &self.state.game_over.clone() {
                     ui.separator();
-                    self.render_game_over(ui, result);
+                    ui.add_space(8.0);
+                    self.render_game_over(ui, &result);
                 }
 
-                // Error message
+                // Status message
                 if let Some(msg) = &self.state.message {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::YELLOW, msg);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.colored_label(TIMER_WARNING, msg);
+                    });
                 }
             });
     }
 
+    /// Render turn indicator
+    fn render_turn_indicator(&self, ui: &mut egui::Ui) {
+        let (stone_char, color_name) = if self.state.current_turn == Stone::Black {
+            ("●", "BLACK")
+        } else {
+            ("○", "WHITE")
+        };
+
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+
+            // Stone symbol
+            let text_color = if self.state.current_turn == Stone::Black {
+                TEXT_PRIMARY
+            } else {
+                STATUS_BLACK
+            };
+            ui.label(RichText::new(stone_char).size(32.0).color(text_color));
+
+            ui.add_space(8.0);
+
+            ui.vertical(|ui| {
+                ui.label(RichText::new(color_name).size(16.0).strong().color(TEXT_PRIMARY));
+                let status = if self.state.is_ai_thinking() {
+                    "AI thinking..."
+                } else if self.state.game_over.is_some() {
+                    "Game Over"
+                } else {
+                    "to move"
+                };
+                ui.label(RichText::new(status).size(12.0).color(TEXT_SECONDARY));
+            });
+        });
+    }
+
+    /// Render captures with visual progress
+    fn render_captures(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new("CAPTURES").size(11.0).color(TEXT_MUTED));
+        });
+        ui.add_space(4.0);
+
+        // Black captures
+        self.render_capture_bar(ui, "●", self.state.board.black_captures, STATUS_BLACK, TEXT_PRIMARY);
+        ui.add_space(4.0);
+
+        // White captures
+        self.render_capture_bar(ui, "○", self.state.board.white_captures, STATUS_WHITE, STATUS_BLACK);
+    }
+
+    /// Render a single capture progress bar
+    fn render_capture_bar(&self, ui: &mut egui::Ui, symbol: &str, captures: u8, bg: egui::Color32, text_color: egui::Color32) {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(symbol).size(16.0).color(text_color));
+            ui.add_space(4.0);
+
+            // Progress bar
+            let progress = captures as f32 / 5.0;
+            let bar_width = 120.0;
+            let bar_height = 16.0;
+
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(bar_width, bar_height), egui::Sense::hover());
+
+            // Background
+            ui.painter().rect_filled(rect, 4.0, PANEL_HEADER);
+
+            // Filled portion
+            if captures > 0 {
+                let filled_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::Vec2::new(bar_width * progress, bar_height),
+                );
+                let fill_color = if captures >= 4 {
+                    TIMER_WARNING // Near win
+                } else {
+                    bg
+                };
+                ui.painter().rect_filled(filled_rect, 4.0, fill_color);
+            }
+
+            // Border
+            ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, PANEL_BORDER), egui::StrokeKind::Outside);
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("{}/5", captures)).size(14.0).color(TEXT_PRIMARY));
+        });
+    }
+
+    /// Render action buttons
+    fn render_action_buttons(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new("ACTIONS").size(11.0).color(TEXT_MUTED));
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+
+            if ui.button(RichText::new("↩ Undo").size(13.0)).clicked() {
+                self.state.undo();
+            }
+
+            // PvP hint button
+            if let GameMode::PvP { .. } = self.state.mode {
+                if ui.button(RichText::new("💡 Hint").size(13.0)).clicked() {
+                    self.state.request_suggestion();
+                }
+            }
+        });
+
+        // Move count
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("Move #{}", self.state.move_history.len())).size(12.0).color(TEXT_SECONDARY));
+        });
+    }
+
     /// Render the timer display
     fn render_timer(&mut self, ui: &mut egui::Ui) {
-        ui.label("Timer:");
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new("TIMER").size(11.0).color(TEXT_MUTED));
+        });
+        ui.add_space(4.0);
 
         if self.state.is_ai_thinking() {
             if let Some(elapsed) = self.state.ai_thinking_elapsed() {
@@ -159,58 +280,93 @@ impl GomokuApp {
                 } else {
                     TIMER_CRITICAL
                 };
-                ui.colored_label(color, format!("🤔 AI thinking... {:.2}s", secs));
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("🤔").size(18.0));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("{:.2}s", secs)).size(24.0).strong().color(color));
+                });
             }
         } else {
             let elapsed = self.state.move_timer.elapsed();
-            ui.label(format!("⏱ Current: {:.1}s", elapsed.as_secs_f32()));
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("⏱").size(16.0));
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("{:.1}s", elapsed.as_secs_f32())).size(18.0).color(TEXT_PRIMARY));
+            });
         }
 
         if let Some(ai_time) = self.state.move_timer.ai_thinking_time {
-            ui.label(format!("🤖 Last AI: {:.3}s", ai_time.as_secs_f32()));
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("Last AI: {:.3}s", ai_time.as_secs_f32())).size(11.0).color(TEXT_SECONDARY));
+            });
         }
     }
 
     /// Render the debug panel
     fn render_debug_panel(&self, ui: &mut egui::Ui) {
-        ui.heading("AI Debug");
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new("AI DEBUG").size(11.0).color(TEXT_MUTED));
+        });
+        ui.add_space(4.0);
 
         if let Some(result) = &self.state.last_ai_result {
-            ui.label(format!("Search: {:?}", result.search_type));
-            ui.label(format!("Score: {}", result.score));
-            ui.label(format!("Nodes: {}", result.nodes));
-            ui.label(format!("Time: {}ms", result.time_ms));
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("Search: {:?}", result.search_type)).size(11.0).color(TEXT_SECONDARY));
+                    ui.label(RichText::new(format!("Score: {}", result.score)).size(11.0).color(TEXT_SECONDARY));
+                    ui.label(RichText::new(format!("Nodes: {}", result.nodes)).size(11.0).color(TEXT_SECONDARY));
+                    ui.label(RichText::new(format!("Time: {}ms", result.time_ms)).size(11.0).color(TEXT_SECONDARY));
 
-            if let Some(pos) = result.best_move {
-                let col = (b'A' + pos.col) as char;
-                let row = 19 - pos.row;
-                ui.label(format!("Move: {}{}", col, row));
-            }
+                    if let Some(pos) = result.best_move {
+                        let col = (b'A' + pos.col) as char;
+                        let row = 19 - pos.row;
+                        ui.label(RichText::new(format!("Move: {}{}", col, row)).size(11.0).color(TIMER_NORMAL));
+                    }
+                });
+            });
         } else {
-            ui.label("No AI data yet");
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("No AI data yet").size(11.0).color(TEXT_SECONDARY));
+            });
         }
     }
 
     /// Render game over message
     fn render_game_over(&self, ui: &mut egui::Ui, result: &GameResult) {
-        let winner = if result.winner == Stone::Black { "Black" } else { "White" };
+        let (winner, symbol) = if result.winner == Stone::Black {
+            ("BLACK", "●")
+        } else {
+            ("WHITE", "○")
+        };
         let win_type = match result.win_type {
             WinType::FiveInRow => "5-in-a-row",
-            WinType::Capture => "Capture (10 stones)",
+            WinType::Capture => "10 captures",
         };
 
-        ui.heading("🎉 Game Over!");
-        ui.label(format!("{} wins by {}!", winner, win_type));
-
-        ui.separator();
-        if ui.button("🔄 New Game").clicked() {
-            // Will be handled in update
-        }
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("🎉 GAME OVER").size(16.0).strong().color(WIN_HIGHLIGHT));
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("{} {} WINS!", symbol, winner)).size(14.0).strong().color(TEXT_PRIMARY));
+            ui.label(RichText::new(format!("by {}", win_type)).size(12.0).color(TEXT_SECONDARY));
+            ui.add_space(8.0);
+            if ui.button(RichText::new("🔄 New Game").size(14.0)).clicked() {
+                // Will be handled in update
+            }
+        });
     }
 
     /// Render the main board
     fn render_board(&mut self, ctx: &Context) {
         CentralPanel::default().show(ctx, |ui| {
+            // Set board area background
+            ui.style_mut().visuals.panel_fill = egui::Color32::from_rgb(40, 42, 46);
+
             let winning_line = self.state.game_over
                 .as_ref()
                 .and_then(|r| r.winning_line);
@@ -223,6 +379,7 @@ impl GomokuApp {
                 self.state.suggested_move,
                 winning_line,
                 self.state.game_over.is_some(),
+                self.state.capture_animation.as_ref(),
             );
 
             // Handle click
@@ -270,6 +427,13 @@ impl eframe::App for GomokuApp {
         // Check AI result
         self.state.check_ai_result();
 
+        // Clean up completed capture animations
+        if let Some(animation) = &self.state.capture_animation {
+            if animation.is_complete() {
+                self.state.capture_animation = None;
+            }
+        }
+
         // Start AI thinking if needed
         if self.state.is_ai_turn() && !self.state.is_ai_thinking() && self.state.game_over.is_none() {
             self.state.start_ai_thinking();
@@ -280,8 +444,8 @@ impl eframe::App for GomokuApp {
         self.render_side_panel(ctx);
         self.render_board(ctx);
 
-        // Request repaint if AI is thinking (for timer update)
-        if self.state.is_ai_thinking() {
+        // Request repaint if animation is playing or AI is thinking
+        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() {
             ctx.request_repaint();
         }
     }

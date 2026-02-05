@@ -33,6 +33,34 @@ pub enum AiState {
     },
 }
 
+/// Capture animation state
+#[derive(Clone)]
+pub struct CaptureAnimation {
+    pub positions: Vec<Pos>,
+    pub start_time: Instant,
+    pub captured_color: Stone,
+}
+
+impl CaptureAnimation {
+    pub fn new(positions: Vec<Pos>, color: Stone) -> Self {
+        Self {
+            positions,
+            start_time: Instant::now(),
+            captured_color: color,
+        }
+    }
+
+    /// Returns animation progress (0.0 to 1.0)
+    pub fn progress(&self) -> f32 {
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        (elapsed / 0.6).min(1.0) // 0.6 second animation
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.progress() >= 1.0
+    }
+}
+
 /// Main game state
 pub struct GameState {
     pub board: Board,
@@ -46,6 +74,7 @@ pub struct GameState {
     pub move_timer: MoveTimer,
     pub suggested_move: Option<Pos>,
     pub message: Option<String>,
+    pub capture_animation: Option<CaptureAnimation>,
 
     // AI engine configuration
     ai_depth: i8,
@@ -118,6 +147,7 @@ impl GameState {
             move_timer: MoveTimer::default(),
             suggested_move: None,
             message: None,
+            capture_animation: None,
             ai_depth: 6,
             ai_time_limit_ms: 500,
         }
@@ -134,6 +164,7 @@ impl GameState {
         self.move_timer = MoveTimer::default();
         self.suggested_move = None;
         self.message = None;
+        self.capture_animation = None;
     }
 
     /// Check if it's the human's turn
@@ -189,6 +220,14 @@ impl GameState {
         self.board.place_stone(pos, color);
         let captured_positions = crate::rules::execute_captures(&mut self.board, pos, color);
         let capture_count = captured_positions.len() / 2; // Each capture is a pair
+
+        // Start capture animation if any captures occurred
+        if !captured_positions.is_empty() {
+            self.capture_animation = Some(CaptureAnimation::new(
+                captured_positions,
+                color.opponent(), // Captured stones are opponent's color
+            ));
+        }
 
         // Record move
         self.move_history.push((pos, color));
@@ -385,6 +424,7 @@ impl GameState {
         self.game_over = None;
         self.last_move = None;
         self.suggested_move = None;
+        self.capture_animation = None;
 
         for (pos, color) in moves {
             self.board.place_stone(pos, color);

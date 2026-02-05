@@ -3,6 +3,7 @@
 use crate::{Pos, Stone, BOARD_SIZE};
 use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 
+use super::game_state::CaptureAnimation;
 use super::theme::*;
 
 /// Board view handles rendering and input for the game board
@@ -33,6 +34,7 @@ impl BoardView {
         suggested_move: Option<Pos>,
         winning_line: Option<[Pos; 5]>,
         game_over: bool,
+        capture_animation: Option<&CaptureAnimation>,
     ) -> Option<Pos> {
         let available_size = ui.available_size();
 
@@ -70,6 +72,11 @@ impl BoardView {
         // Draw winning line highlight
         if let Some(line) = winning_line {
             self.draw_winning_line(&painter, &line);
+        }
+
+        // Draw capture animation
+        if let Some(animation) = capture_animation {
+            self.draw_capture_animation(&painter, animation);
         }
 
         // Draw suggested move
@@ -314,5 +321,84 @@ impl BoardView {
         let x = self.board_rect.min.x + BOARD_MARGIN + pos.col as f32 * self.cell_size;
         let y = self.board_rect.min.y + BOARD_MARGIN + pos.row as f32 * self.cell_size;
         Pos2::new(x, y)
+    }
+
+    /// Draw capture animation effect
+    fn draw_capture_animation(&self, painter: &Painter, animation: &CaptureAnimation) {
+        let progress = animation.progress();
+
+        for pos in &animation.positions {
+            let center = self.board_to_screen(*pos);
+            let base_radius = self.cell_size * STONE_RADIUS_RATIO;
+
+            // Phase 1 (0-0.3): Flash and expand
+            // Phase 2 (0.3-0.6): Shrink with ring
+            // Phase 3 (0.6-1.0): Fade out
+
+            if progress < 0.3 {
+                // Flash phase - stone expands and flashes red
+                let phase_progress = progress / 0.3;
+                let scale = 1.0 + phase_progress * 0.3;
+                let radius = base_radius * scale;
+
+                // Flash color (red tint)
+                let flash_alpha = ((1.0 - phase_progress) * 200.0) as u8;
+                let flash_color = Color32::from_rgba_unmultiplied(255, 100, 100, flash_alpha);
+                painter.circle_filled(center, radius + 4.0, flash_color);
+
+                // Stone still visible
+                let stone_color = match animation.captured_color {
+                    Stone::Black => BLACK_STONE,
+                    Stone::White => WHITE_STONE,
+                    Stone::Empty => return,
+                };
+                painter.circle_filled(center, radius, stone_color);
+
+            } else if progress < 0.6 {
+                // Shrink phase
+                let phase_progress = (progress - 0.3) / 0.3;
+                let scale = 1.3 - phase_progress * 0.8; // 1.3 -> 0.5
+                let radius = base_radius * scale;
+
+                // Expanding ring
+                let ring_radius = base_radius * (1.0 + phase_progress * 1.5);
+                let ring_alpha = ((1.0 - phase_progress) * 180.0) as u8;
+                painter.circle_stroke(
+                    center,
+                    ring_radius,
+                    Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 80, 80, ring_alpha)),
+                );
+
+                // Shrinking stone
+                let stone_alpha = ((1.0 - phase_progress * 0.5) * 255.0) as u8;
+                let stone_color = match animation.captured_color {
+                    Stone::Black => Color32::from_rgba_unmultiplied(25, 25, 30, stone_alpha),
+                    Stone::White => Color32::from_rgba_unmultiplied(250, 250, 252, stone_alpha),
+                    Stone::Empty => return,
+                };
+                painter.circle_filled(center, radius, stone_color);
+
+            } else {
+                // Fade out phase
+                let phase_progress = (progress - 0.6) / 0.4;
+                let alpha = ((1.0 - phase_progress) * 150.0) as u8;
+
+                // Fading particles (small circles around the position)
+                let particle_count = 6;
+                let particle_radius = base_radius * 0.15;
+                let spread = base_radius * (0.5 + phase_progress * 1.5);
+
+                for i in 0..particle_count {
+                    let angle = (i as f32 / particle_count as f32) * std::f32::consts::TAU;
+                    let offset = Vec2::new(angle.cos() * spread, angle.sin() * spread);
+                    let particle_color = match animation.captured_color {
+                        Stone::Black => Color32::from_rgba_unmultiplied(60, 60, 70, alpha),
+                        Stone::White => Color32::from_rgba_unmultiplied(220, 220, 225, alpha),
+                        Stone::Empty => return,
+                    };
+                    painter.circle_filled(center + offset, particle_radius * (1.0 - phase_progress), particle_color);
+                }
+            }
+        }
     }
 }
