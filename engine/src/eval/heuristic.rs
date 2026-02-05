@@ -21,6 +21,12 @@ const DIRECTIONS: [(i32, i32); 4] = [
     (1, -1), // Diagonal SW
 ];
 
+/// Maximum Manhattan distance from center on 19x19 board
+const MAX_CENTER_DIST: i32 = 18;
+
+/// Weight per distance unit from center
+const POSITION_WEIGHT: i32 = 3;
+
 /// Evaluate the board from the perspective of the given color.
 ///
 /// Returns a score where:
@@ -68,7 +74,9 @@ pub fn evaluate(board: &Board, color: Stone) -> i32 {
 /// Evaluate pattern-based score for a color.
 ///
 /// Scans all stones of the given color and evaluates line patterns
-/// in all four directions.
+/// in all four directions. Each line segment is counted exactly once
+/// by only evaluating from the "start" position (no same-color stone
+/// in the negative direction).
 fn evaluate_patterns(board: &Board, color: Stone) -> i32 {
     let Some(stones) = board.stones(color) else {
         return 0;
@@ -82,20 +90,44 @@ fn evaluate_patterns(board: &Board, color: Stone) -> i32 {
         }
     }
 
-    // Divide by 2 to avoid double counting
-    // Each line segment is counted from both endpoint stones
-    score / 2
+    score
 }
 
 /// Evaluate a single line pattern from a position in a given direction.
 ///
+/// Only counts the pattern if this position is the "start" of the line
+/// (no same-color stone in the negative direction). This ensures each
+/// line segment is counted exactly once, avoiding double-counting.
+///
 /// Counts consecutive stones and open ends to determine the pattern type.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn evaluate_line(board: &Board, pos: Pos, dr: i32, dc: i32, color: Stone) -> i32 {
+    // Check if there's a same-color stone in the negative direction
+    // If so, this position is NOT the start of the line - skip to avoid double counting
+    let prev_r = i32::from(pos.row) - dr;
+    let prev_c = i32::from(pos.col) - dc;
+    if Pos::is_valid(prev_r, prev_c) {
+        let prev_pos = Pos::new(prev_r as u8, prev_c as u8);
+        if board.get(prev_pos) == color {
+            return 0; // Not the start of this line segment
+        }
+    }
+
+    // Count in positive direction only (since we're starting from the beginning)
     let mut count = 1; // Start with the stone at pos
     let mut open_ends = 0;
 
-    // Scan in positive direction
+    // Check if there's an open end before our starting position
+    if Pos::is_valid(prev_r, prev_c) {
+        let prev_pos = Pos::new(prev_r as u8, prev_c as u8);
+        if board.get(prev_pos) == Stone::Empty {
+            open_ends += 1;
+        }
+        // If blocked by opponent or edge, open_ends stays 0 for this side
+    }
+    // Edge of board - not open (open_ends stays 0)
+
+    // Extend in positive direction
     let mut r = i32::from(pos.row) + dr;
     let mut c = i32::from(pos.col) + dc;
     while Pos::is_valid(r, c) {
@@ -111,24 +143,6 @@ fn evaluate_line(board: &Board, pos: Pos, dr: i32, dc: i32, color: Stone) -> i32
         }
         r += dr;
         c += dc;
-    }
-
-    // Scan in negative direction
-    r = i32::from(pos.row) - dr;
-    c = i32::from(pos.col) - dc;
-    while Pos::is_valid(r, c) {
-        // Safety: r and c are validated by is_valid to be in [0, BOARD_SIZE)
-        let p = Pos::new(r as u8, c as u8);
-        match board.get(p) {
-            s if s == color => count += 1,
-            Stone::Empty => {
-                open_ends += 1;
-                break;
-            }
-            _ => break, // Opponent stone blocks
-        }
-        r -= dr;
-        c -= dc;
     }
 
     // Score based on pattern type
@@ -161,8 +175,9 @@ fn evaluate_positions(board: &Board, color: Stone) -> i32 {
     for pos in stones.iter_ones() {
         // Manhattan distance from center
         let dist = (i32::from(pos.row) - center).abs() + (i32::from(pos.col) - center).abs();
-        // Max distance is 18 (corner to center), so max bonus is 18 * 3 = 54 per stone
-        score += (18 - dist) * 3;
+        // Max distance is MAX_CENTER_DIST (corner to center)
+        // Max bonus is MAX_CENTER_DIST * POSITION_WEIGHT per stone
+        score += (MAX_CENTER_DIST - dist) * POSITION_WEIGHT;
     }
 
     score
