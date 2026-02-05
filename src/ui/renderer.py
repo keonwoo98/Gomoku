@@ -8,11 +8,11 @@ import time
 from typing import Optional
 
 from ..game.board import BOARD_SIZE, BLACK, WHITE, EMPTY
-from ..game.state import GameState, GameMode
+from ..game.state import GameState, GameMode, StartingRule, GamePhase, AIDifficulty
 
 # Window settings
 WINDOW_WIDTH = 1000
-WINDOW_HEIGHT = 720
+WINDOW_HEIGHT = 720  # Compact - matches board height
 
 # Board settings
 BOARD_MARGIN = 40
@@ -86,19 +86,19 @@ class Renderer:
         self.win_line_positions = []
         self.win_animation_start = 0
 
-    def _setup_buttons(self):
-        """Setup button positions and sizes."""
-        button_width = 115
-        button_height = 36
-        button_x = PANEL_X + 18
-        button_y = 520
+        # Overlay state
+        self.show_help_overlay = False
+        self.show_rules_overlay = False
 
-        self.buttons = {
-            'new_game': pygame.Rect(button_x, button_y, button_width, button_height),
-            'undo': pygame.Rect(button_x + 125, button_y, button_width, button_height),
-            'suggest': pygame.Rect(button_x, button_y + 45, button_width, button_height),
-            'mode': pygame.Rect(button_x + 125, button_y + 45, button_width, button_height),
-        }
+        # Error message state
+        self.error_message = ""
+        self.error_message_time = 0
+
+    def _setup_buttons(self):
+        """Setup button positions and sizes (will be positioned dynamically)."""
+        self.button_width = 120
+        self.button_height = 38
+        self.buttons = {}
 
     def board_to_screen(self, row: int, col: int) -> tuple:
         """Convert board coordinates to screen coordinates."""
@@ -134,6 +134,11 @@ class Renderer:
         self.win_line_positions = positions
         self.win_animation_start = time.time()
 
+    def show_error(self, message: str):
+        """Show an error message temporarily."""
+        self.error_message = message
+        self.error_message_time = time.time()
+
     def reset_animations(self):
         """Reset all animation states."""
         self.capture_flash_time = 0
@@ -143,7 +148,8 @@ class Renderer:
         self.last_capture_count = {BLACK: 0, WHITE: 0}
 
     def render(self, state: GameState, suggested_move: Optional[tuple] = None,
-               debug_info: Optional[dict] = None, show_debug: bool = False):
+               debug_info: Optional[dict] = None, show_debug: bool = False,
+               difficulty: AIDifficulty = None):
         """Render the complete game state."""
         # Check for new captures
         self._check_capture_animation(state)
@@ -155,15 +161,38 @@ class Renderer:
         self._render_board(state, suggested_move)
 
         # Side panel
-        self._render_panel(state)
+        self._render_panel(state, difficulty)
 
         # Debug panel (if enabled)
         if show_debug and debug_info:
             self._render_debug_panel(debug_info)
 
-        # Game over overlay
-        if state.is_game_over:
-            self._render_game_over_overlay(state)
+        # Game over result shown in panel instead of overlay
+
+        # Help overlay
+        if self.show_help_overlay:
+            self._render_help_overlay()
+
+        # Rules overlay
+        if self.show_rules_overlay:
+            self._render_rules_overlay(state)
+
+        # Error message (temporary, fades after 2 seconds)
+        if self.error_message and time.time() - self.error_message_time < 2.0:
+            elapsed = time.time() - self.error_message_time
+            alpha = int(255 * (1 - elapsed / 2.0))
+
+            # Red error box at bottom of board
+            error_box = pygame.Surface((400, 40), pygame.SRCALPHA)
+            error_box.fill((180, 50, 50, min(200, alpha)))
+            box_x = BOARD_MARGIN + (BOARD_AREA_SIZE - 400) // 2
+            box_y = BOARD_MARGIN + BOARD_AREA_SIZE - 50
+            self.screen.blit(error_box, (box_x, box_y))
+
+            # Error text
+            error_text = self.font_medium.render(self.error_message, True, (255, 255, 255))
+            text_x = box_x + (400 - error_text.get_width()) // 2
+            self.screen.blit(error_text, (text_x, box_y + 8))
 
         pygame.display.flip()
 
@@ -205,6 +234,36 @@ class Renderer:
         for row, col in STAR_POINTS:
             x, y = self.board_to_screen(row, col)
             pygame.draw.circle(self.screen, COLOR_LINE, (x, y), 4)
+
+        # Pro rule visual hints
+        if state.starting_rule == StartingRule.PRO and not state.is_game_over:
+            center = state.get_center()
+            cx, cy = self.board_to_screen(center[0], center[1])
+            move_count = state.get_move_count()
+
+            if move_count == 0:
+                # First move must be center - highlight it
+                pygame.draw.circle(self.screen, COLOR_HIGHLIGHT, (cx, cy), STONE_RADIUS + 2, 3)
+                # Draw "1st" text
+                hint = self.font_small.render("1st", True, COLOR_HIGHLIGHT)
+                self.screen.blit(hint, (cx - hint.get_width() // 2, cy - STONE_RADIUS - 18))
+
+            elif move_count == 2:
+                # Black's 2nd move must be 3+ from center - show forbidden zone
+                # Draw semi-transparent red zone
+                s = pygame.Surface((BOARD_AREA_SIZE, BOARD_AREA_SIZE), pygame.SRCALPHA)
+                for dr in range(-2, 3):
+                    for dc in range(-2, 3):
+                        r, c = center[0] + dr, center[1] + dc
+                        if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+                            if state.board.is_empty(r, c):
+                                sx, sy = self.board_to_screen(r, c)
+                                pygame.draw.circle(self.screen, (255, 100, 100, 100),
+                                                 (sx, sy), STONE_RADIUS - 2)
+                                pygame.draw.line(self.screen, (255, 80, 80),
+                                               (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
+                                pygame.draw.line(self.screen, (255, 80, 80),
+                                               (sx + 6, sy - 6), (sx - 6, sy + 6), 2)
 
         # Coordinate labels
         for i in range(BOARD_SIZE):
@@ -317,188 +376,209 @@ class Renderer:
             highlight_pos = (x - STONE_RADIUS // 3, y - STONE_RADIUS // 3)
             pygame.draw.circle(self.screen, (255, 255, 255), highlight_pos, 3)
 
-    def _render_panel(self, state: GameState):
-        """Render the side panel with game info."""
-        # Panel background
+    def _render_panel(self, state: GameState, difficulty: AIDifficulty = None):
+        """Render the side panel with game info (minimal design)."""
+        # Panel background (matches board height)
         panel_rect = pygame.Rect(PANEL_X, BOARD_MARGIN, PANEL_WIDTH, BOARD_AREA_SIZE)
         pygame.draw.rect(self.screen, COLOR_PANEL_BG, panel_rect, border_radius=10)
 
-        y_offset = BOARD_MARGIN + 15
+        y_offset = BOARD_MARGIN + 20
 
         # Title
         title = self.font_large.render("GOMOKU", True, COLOR_TEXT)
         self.screen.blit(title, (PANEL_X + 20, y_offset))
-        y_offset += 45
+        y_offset += 50
 
-        # Game mode
-        mode_text = {
-            GameMode.PVP: "Player vs Player",
-            GameMode.PVE: "Player vs AI",
-            GameMode.EVE: "AI vs AI",
-        }.get(state.mode, "Unknown")
-        mode = self.font_small.render(mode_text, True, (180, 180, 180))
-        self.screen.blit(mode, (PANEL_X + 20, y_offset))
+        # Compact info line: Mode • Difficulty • Rule
+        mode_short = {
+            GameMode.PVP: "PvP",
+            GameMode.PVE: "PvE",
+            GameMode.EVE: "EvE",
+        }.get(state.mode, "?")
+
+        rule_short = {
+            StartingRule.STANDARD: "Standard",
+            StartingRule.PRO: "Pro",
+            StartingRule.SWAP: "Swap",
+            StartingRule.SWAP2: "Swap2",
+        }.get(state.starting_rule, "?")
+
+        if state.mode in [GameMode.PVE, GameMode.EVE] and difficulty:
+            diff_short = difficulty.label.capitalize()
+            info_text = f"{mode_short}  •  {diff_short}  •  {rule_short}"
+        else:
+            info_text = f"{mode_short}  •  {rule_short}"
+
+        info_label = self.font_small.render(info_text, True, (150, 150, 150))
+        self.screen.blit(info_label, (PANEL_X + 20, y_offset))
         y_offset += 30
 
-        # Divider
-        pygame.draw.line(self.screen, (80, 85, 95),
-                        (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
-        y_offset += 15
+        # Phase message (only when needed)
+        phase_msg = state.get_phase_message()
+        if phase_msg:
+            msg_box = pygame.Rect(PANEL_X + 15, y_offset, PANEL_WIDTH - 30, 32)
+            pygame.draw.rect(self.screen, (60, 55, 40), msg_box, border_radius=6)
+            pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, msg_box, 2, border_radius=6)
 
-        # Players info with capture progress bar
+            phase_text = self.font_small.render(phase_msg, True, COLOR_HIGHLIGHT)
+            self.screen.blit(phase_text, (PANEL_X + 22, y_offset + 7))
+            y_offset += 45
+        else:
+            y_offset += 10
+
+        # Divider
+        pygame.draw.line(self.screen, (70, 75, 85),
+                        (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
+        y_offset += 20
+
+        # Players info (compact)
         for color in [BLACK, WHITE]:
             player = state.players[color]
             is_current = state.current_turn == color and not state.is_game_over
             is_winner = state.is_game_over and state.winner == color
             captures = state.captures[color]
 
-            # Highlight current player or winner
+            # Highlight box for current/winner
+            box_height = 70
             if is_current or is_winner:
-                highlight_rect = pygame.Rect(PANEL_X + 10, y_offset - 5, PANEL_WIDTH - 20, 70)
+                highlight_rect = pygame.Rect(PANEL_X + 12, y_offset - 5, PANEL_WIDTH - 24, box_height)
                 if is_winner:
-                    # Winner gets gold highlight
-                    pygame.draw.rect(self.screen, (60, 55, 30), highlight_rect, border_radius=8)
-                    pygame.draw.rect(self.screen, COLOR_WIN_HIGHLIGHT, highlight_rect, 3, border_radius=8)
+                    pygame.draw.rect(self.screen, (55, 50, 30), highlight_rect, border_radius=8)
+                    pygame.draw.rect(self.screen, COLOR_WIN_HIGHLIGHT, highlight_rect, 2, border_radius=8)
                 else:
-                    pygame.draw.rect(self.screen, (55, 65, 80), highlight_rect, border_radius=8)
-                    pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, highlight_rect, 2, border_radius=8)
+                    pygame.draw.rect(self.screen, (50, 58, 72), highlight_rect, border_radius=8)
 
             # Stone icon
             stone_x = PANEL_X + 32
-            stone_y = y_offset + 18
+            stone_y = y_offset + 15
             stone_color = COLOR_BLACK_STONE if color == BLACK else COLOR_WHITE_STONE
-            pygame.draw.circle(self.screen, (30, 30, 30), (stone_x + 2, stone_y + 2), 14)
-            pygame.draw.circle(self.screen, stone_color, (stone_x, stone_y), 14)
+            pygame.draw.circle(self.screen, (30, 30, 30), (stone_x + 2, stone_y + 2), 12)
+            pygame.draw.circle(self.screen, stone_color, (stone_x, stone_y), 12)
             if color == WHITE:
-                pygame.draw.circle(self.screen, (255, 255, 255), (stone_x - 4, stone_y - 4), 3)
-
-            # Winner crown icon
-            if is_winner:
-                crown_text = self.font_medium.render("👑", True, COLOR_WIN_HIGHLIGHT)
-                self.screen.blit(crown_text, (PANEL_X + PANEL_WIDTH - 50, y_offset + 5))
+                pygame.draw.circle(self.screen, (255, 255, 255), (stone_x - 3, stone_y - 3), 2)
 
             # Player name
             name_color = COLOR_WIN_HIGHLIGHT if is_winner else COLOR_TEXT
             name = self.font_medium.render(player.name, True, name_color)
-            self.screen.blit(name, (PANEL_X + 55, y_offset + 5))
+            self.screen.blit(name, (PANEL_X + 52, y_offset + 3))
 
-            # Capture count with icon
-            capture_color = COLOR_WIN_HIGHLIGHT if captures >= 10 else COLOR_TEXT
-            capture_text = f"Captures: {captures}/10"
-            capture_label = self.font_small.render(capture_text, True, capture_color)
-            self.screen.blit(capture_label, (PANEL_X + 55, y_offset + 32))
-
-            # Capture progress bar (10 captures = win)
-            bar_x = PANEL_X + 55
-            bar_y = y_offset + 52
-            bar_width = PANEL_WIDTH - 80
-            bar_height = 8
+            # Capture bar (compact)
+            bar_x = PANEL_X + 52
+            bar_y = y_offset + 32
+            bar_width = PANEL_WIDTH - 115
+            bar_height = 12
 
             # Background
             pygame.draw.rect(self.screen, COLOR_CAPTURE_BG,
-                           (bar_x, bar_y, bar_width, bar_height), border_radius=4)
+                           (bar_x, bar_y, bar_width, bar_height), border_radius=6)
             # Progress
             progress_width = int(bar_width * min(captures, 10) / 10)
             if progress_width > 0:
                 bar_color = COLOR_WIN_HIGHLIGHT if captures >= 10 else COLOR_CAPTURE_BAR
                 pygame.draw.rect(self.screen, bar_color,
-                               (bar_x, bar_y, progress_width, bar_height), border_radius=4)
-            # Border
-            pygame.draw.rect(self.screen, (100, 105, 115),
-                           (bar_x, bar_y, bar_width, bar_height), 1, border_radius=4)
+                               (bar_x, bar_y, progress_width, bar_height), border_radius=6)
 
-            y_offset += 75
+            # Capture count and AI time on same line
+            cap_text = f"Cap: {captures}/10"
+            cap_label = self.font_small.render(cap_text, True, (150, 150, 150))
+            self.screen.blit(cap_label, (bar_x, bar_y + 16))
 
-        # Divider
-        pygame.draw.line(self.screen, (80, 85, 95),
-                        (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
-        y_offset += 15
+            # Show AI move time for AI players
+            if player.player_type.value == "ai":
+                move_time = state.last_move_time.get(color, 0.0)
+                if move_time > 0:
+                    # Color based on time (green < 0.3s, yellow < 0.5s, red >= 0.5s)
+                    if move_time >= 0.5:
+                        time_color = (255, 100, 100)  # Red - too slow
+                    elif move_time >= 0.3:
+                        time_color = (255, 200, 100)  # Yellow - warning
+                    else:
+                        time_color = (100, 220, 150)  # Green - good
+                    time_text = f"{move_time:.2f}s"
+                    time_label = self.font_small.render(time_text, True, time_color)
+                    self.screen.blit(time_label, (bar_x + 90, bar_y + 16))
 
-        # Current turn or winner
-        if state.is_game_over:
-            if state.winner == BLACK:
-                status_text = "Black Wins!"
-            elif state.winner == WHITE:
-                status_text = "White Wins!"
-            else:
-                status_text = "Draw!"
-            status_color = COLOR_WIN_HIGHLIGHT
-
-            # Win reason
-            if state.captures.get(state.winner, 0) >= 10:
-                reason = "(by Capture)"
-            else:
-                reason = "(5 in a row)"
-            reason_text = self.font_small.render(reason, True, (180, 180, 180))
-        else:
-            turn_name = "Black" if state.current_turn == BLACK else "White"
-            status_text = f"{turn_name}'s Turn"
-            status_color = COLOR_TEXT
-
-        status = self.font_medium.render(status_text, True, status_color)
-        self.screen.blit(status, (PANEL_X + 20, y_offset))
-        y_offset += 28
-
-        if state.is_game_over and state.winner != EMPTY:
-            self.screen.blit(reason_text, (PANEL_X + 20, y_offset))
-            y_offset += 22
-        else:
-            y_offset += 2
-
-        # Move count
-        move_text = f"Move #{state.get_move_count() + 1}"
-        move = self.font_small.render(move_text, True, (150, 150, 150))
-        self.screen.blit(move, (PANEL_X + 20, y_offset))
-        y_offset += 25
+            y_offset += box_height + 8
 
         # Divider
-        pygame.draw.line(self.screen, (80, 85, 95),
+        y_offset += 5
+        pygame.draw.line(self.screen, (70, 75, 85),
                         (PANEL_X + 20, y_offset), (PANEL_X + PANEL_WIDTH - 20, y_offset))
-        y_offset += 12
+        y_offset += 20
 
-        # AI Timer section with box
-        timer_box = pygame.Rect(PANEL_X + 15, y_offset, PANEL_WIDTH - 30, 70)
-        pygame.draw.rect(self.screen, (45, 50, 60), timer_box, border_radius=8)
+        # Game status (AI timer during play)
+        if not state.is_game_over:
+            # Show AI timer only during AI turn
+            if state.is_ai_turn():
+                elapsed = state.get_ai_elapsed_time()
+                if elapsed > 0.4:
+                    timer_color = (255, 100, 100)
+                elif elapsed > 0.3:
+                    timer_color = (255, 200, 100)
+                else:
+                    timer_color = (100, 220, 150)
 
-        timer_label = self.font_small.render("AI Thinking Time", True, (150, 150, 150))
-        self.screen.blit(timer_label, (PANEL_X + 25, y_offset + 8))
-
-        elapsed = state.get_ai_elapsed_time()
-        if elapsed > 0.4:
-            timer_color = (255, 100, 100)
-        elif elapsed > 0.3:
-            timer_color = (255, 200, 100)
+                timer_text = f"AI: {elapsed:.2f}s"
+                timer = self.font_medium.render(timer_text, True, timer_color)
+                self.screen.blit(timer, (PANEL_X + 20, y_offset))
+                y_offset += 35
+            else:
+                y_offset += 10
         else:
-            timer_color = (100, 255, 150)
-
-        timer_text = f"{elapsed:.3f}s"
-        timer = self.font_large.render(timer_text, True, timer_color)
-        self.screen.blit(timer, (PANEL_X + 25, y_offset + 30))
-
-        # Time limit indicator
-        limit_text = "/ 0.500s limit"
-        limit = self.font_small.render(limit_text, True, (120, 120, 120))
-        self.screen.blit(limit, (PANEL_X + 130, y_offset + 42))
-
-        y_offset += 85
+            # Game over - no timer needed
+            y_offset += 10
 
         # Buttons
-        self._render_buttons()
+        y_offset += 10
+        self._render_buttons(state, y_offset)
+        y_offset += 100  # After buttons
 
-        # Instructions at bottom
-        y_offset = BOARD_MARGIN + BOARD_AREA_SIZE - 55
-        instructions = [
-            "D: Debug panel  |  V: Valid moves",
-            "ESC: Quit",
-        ]
-        for instruction in instructions:
-            text = self.font_small.render(instruction, True, (120, 120, 120))
-            self.screen.blit(text, (PANEL_X + 20, y_offset))
-            y_offset += 20
+        # Game over result (in panel, below buttons)
+        if state.is_game_over:
+            # Result box
+            result_rect = pygame.Rect(PANEL_X + 15, y_offset, PANEL_WIDTH - 30, 70)
+            pygame.draw.rect(self.screen, (55, 50, 35), result_rect, border_radius=8)
+            pygame.draw.rect(self.screen, COLOR_WIN_HIGHLIGHT, result_rect, 2, border_radius=8)
 
-    def _render_buttons(self):
+            # Winner text
+            if state.winner == BLACK:
+                winner_text = "BLACK WINS!"
+            elif state.winner == WHITE:
+                winner_text = "WHITE WINS!"
+            else:
+                winner_text = "DRAW!"
+            winner = self.font_large.render(winner_text, True, COLOR_WIN_HIGHLIGHT)
+            winner_x = PANEL_X + (PANEL_WIDTH - winner.get_width()) // 2
+            self.screen.blit(winner, (winner_x, y_offset + 8))
+
+            # Win reason
+            if state.winner != EMPTY:
+                reason = "by Capture" if state.captures.get(state.winner, 0) >= 10 else "by 5 in a row"
+                reason_text = self.font_small.render(reason, True, (180, 180, 180))
+                reason_x = PANEL_X + (PANEL_WIDTH - reason_text.get_width()) // 2
+                self.screen.blit(reason_text, (reason_x, y_offset + 45))
+            y_offset += 80
+
+        # Help hint at bottom of panel
+        hint_y = BOARD_MARGIN + BOARD_AREA_SIZE - 25
+        hint = self.font_small.render("Press ? for help  •  I for rules", True, (100, 105, 115))
+        hint_x = PANEL_X + (PANEL_WIDTH - hint.get_width()) // 2
+        self.screen.blit(hint, (hint_x, hint_y))
+
+    def _render_buttons(self, state: GameState = None, start_y: int = 480):
         """Render buttons with improved styling."""
         mouse_pos = pygame.mouse.get_pos()
+
+        button_x = PANEL_X + 18
+        button_y = start_y
+
+        # Update button positions dynamically
+        self.buttons = {
+            'new_game': pygame.Rect(button_x, button_y, self.button_width, self.button_height),
+            'undo': pygame.Rect(button_x + 128, button_y, self.button_width, self.button_height),
+            'suggest': pygame.Rect(button_x, button_y + 46, self.button_width, self.button_height),
+            'mode': pygame.Rect(button_x + 128, button_y + 46, self.button_width, self.button_height),
+        }
 
         button_labels = {
             'new_game': 'New Game',
@@ -508,43 +588,38 @@ class Renderer:
         }
 
         for name, rect in self.buttons.items():
-            # Check hover
             is_hover = rect.collidepoint(mouse_pos)
 
-            # Gradient-like effect
             if is_hover:
-                color = (85, 95, 110)
+                color = (75, 85, 100)
                 border_color = COLOR_HIGHLIGHT
             else:
-                color = (60, 70, 85)
-                border_color = (100, 105, 115)
+                color = (55, 62, 75)
+                border_color = (80, 85, 95)
 
             # Shadow
             shadow_rect = pygame.Rect(rect.x + 2, rect.y + 2, rect.width, rect.height)
-            pygame.draw.rect(self.screen, (30, 35, 45), shadow_rect, border_radius=6)
+            pygame.draw.rect(self.screen, (25, 28, 35), shadow_rect, border_radius=8)
 
-            # Draw button
-            pygame.draw.rect(self.screen, color, rect, border_radius=6)
-            pygame.draw.rect(self.screen, border_color, rect, 1, border_radius=6)
+            # Button
+            pygame.draw.rect(self.screen, color, rect, border_radius=8)
+            pygame.draw.rect(self.screen, border_color, rect, 1, border_radius=8)
 
-            # Draw label
+            # Label
             label = self.font_small.render(button_labels[name], True, COLOR_TEXT)
             label_x = rect.centerx - label.get_width() // 2
             label_y = rect.centery - label.get_height() // 2
             self.screen.blit(label, (label_x, label_y))
 
     def _render_game_over_overlay(self, state: GameState):
-        """Render a prominent game over overlay."""
-        # Semi-transparent dark overlay
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        self.screen.blit(overlay, (0, 0))
+        """Render a prominent game over overlay without hiding the board."""
+        # No full-screen overlay - keep board fully visible
 
-        # Central box
-        box_width = 400
-        box_height = 200
+        # Result box below board (doesn't block board view)
+        box_width = 500
+        box_height = 100
         box_x = (BOARD_MARGIN + BOARD_AREA_SIZE // 2) - box_width // 2
-        box_y = WINDOW_HEIGHT // 2 - box_height // 2
+        box_y = BOARD_MARGIN + BOARD_AREA_SIZE + 20  # Position below board
 
         # Animated border
         elapsed = time.time() - self.win_animation_start
@@ -569,36 +644,31 @@ class Renderer:
             winner_text = "DRAW!"
             winner_color = COLOR_TEXT
 
-        # Trophy/crown
-        trophy = self.font_xlarge.render("🏆", True, COLOR_WIN_HIGHLIGHT)
-        trophy_x = box_x + box_width // 2 - trophy.get_width() // 2
-        self.screen.blit(trophy, (trophy_x, box_y + 20))
-
-        # Winner announcement
-        winner = self.font_xlarge.render(winner_text, True, COLOR_WIN_HIGHLIGHT)
+        # Winner announcement (no emoji - pygame font issue)
+        winner = self.font_large.render(winner_text, True, COLOR_WIN_HIGHLIGHT)
         winner_x = box_x + box_width // 2 - winner.get_width() // 2
-        self.screen.blit(winner, (winner_x, box_y + 80))
+        self.screen.blit(winner, (winner_x, box_y + 15))
 
-        # Win reason
+        # Win reason and instruction on same line
         if state.winner != EMPTY:
             if state.captures.get(state.winner, 0) >= 10:
-                reason = f"Victory by Capture ({state.captures[state.winner]} stones)"
+                reason = f"by Capture ({state.captures[state.winner]} stones)"
             else:
-                reason = "Victory by 5 in a row!"
+                reason = "by 5 in a row"
             reason_text = self.font_medium.render(reason, True, (180, 180, 180))
             reason_x = box_x + box_width // 2 - reason_text.get_width() // 2
-            self.screen.blit(reason_text, (reason_x, box_y + 145))
+            self.screen.blit(reason_text, (reason_x, box_y + 55))
 
         # Instructions
-        instruction = self.font_small.render("Press R for New Game", True, (150, 150, 150))
+        instruction = self.font_small.render("Press N for New Game", True, (150, 150, 150))
         instr_x = box_x + box_width // 2 - instruction.get_width() // 2
-        self.screen.blit(instruction, (instr_x, box_y + 175))
+        self.screen.blit(instruction, (instr_x, box_y + 80))
 
     def _render_debug_panel(self, debug_info: dict):
-        """Render the debug panel with AI information."""
+        """Render the debug panel with comprehensive AI performance info."""
         # Semi-transparent background
         panel_width = 350
-        panel_height = 400
+        panel_height = 580
         panel_x = BOARD_MARGIN + 10
         panel_y = BOARD_MARGIN + 10
 
@@ -610,54 +680,122 @@ class Renderer:
         pygame.draw.rect(self.screen, COLOR_TEXT,
                         (panel_x, panel_y, panel_width, panel_height), 1)
 
-        y = panel_y + 15
+        y = panel_y + 12
 
         # Title
-        title = self.font_medium.render("AI Debug Panel", True, COLOR_HIGHLIGHT)
+        title = self.font_medium.render("AI Performance", True, COLOR_HIGHLIGHT)
         self.screen.blit(title, (panel_x + 15, y))
-        y += 35
-
-        # Debug info lines
-        info_lines = [
-            f"Thinking Time: {debug_info.get('thinking_time', 0):.3f}s",
-            f"Search Depth: {debug_info.get('search_depth', 0)}",
-            f"Nodes Evaluated: {debug_info.get('nodes_evaluated', 0):,}",
-            f"Nodes/Second: {debug_info.get('nodes_per_second', 0):,.0f}",
-            "",
-            f"Best Move: {debug_info.get('best_move', 'N/A')}",
-            f"Score: {debug_info.get('best_score', 0):+,}",
-        ]
-
-        for line in info_lines:
-            if line:
-                text = self.font_small.render(line, True, COLOR_TEXT)
-                self.screen.blit(text, (panel_x + 15, y))
-            y += 22
-
-        # Principal Variation
-        y += 10
-        pv_label = self.font_small.render("Principal Variation:", True, COLOR_TEXT)
-        self.screen.blit(pv_label, (panel_x + 15, y))
-        y += 22
-
-        pv_line = debug_info.get('pv_line', [])
-        if pv_line:
-            pv_str = " -> ".join([f"({m[0]},{m[1]})" for m in pv_line[:6]])
-            pv_text = self.font_small.render(pv_str, True, (150, 200, 255))
-            self.screen.blit(pv_text, (panel_x + 15, y))
         y += 30
 
-        # Top candidates
-        top_label = self.font_small.render("Top Candidates:", True, COLOR_TEXT)
-        self.screen.blit(top_label, (panel_x + 15, y))
+        # === Search Stats ===
+        section = self.font_small.render("[ Search ]", True, (150, 180, 255))
+        self.screen.blit(section, (panel_x + 15, y))
+        y += 20
+
+        nodes = debug_info.get('nodes_evaluated', 0)
+        nps = debug_info.get('nodes_per_second', 0)
+        search_lines = [
+            f"Time: {debug_info.get('thinking_time', 0):.3f}s",
+            f"Depth: {debug_info.get('search_depth', 0)}",
+            f"Nodes: {nodes:,}",
+            f"NPS: {nps:,.0f}",
+        ]
+        for line in search_lines:
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (panel_x + 25, y))
+            y += 18
+
+        y += 8
+
+        # === Pruning Stats ===
+        section = self.font_small.render("[ Pruning ]", True, (150, 180, 255))
+        self.screen.blit(section, (panel_x + 15, y))
+        y += 20
+
+        alpha_cuts = debug_info.get('alpha_cutoffs', 0)
+        beta_cuts = debug_info.get('beta_cutoffs', 0)
+        null_cuts = debug_info.get('null_cutoffs', 0)
+        lmr_red = debug_info.get('lmr_reductions', 0)
+        lmr_res = debug_info.get('lmr_researches', 0)
+
+        # Calculate efficiency
+        total_cuts = alpha_cuts + beta_cuts + null_cuts
+        cut_rate = (total_cuts / nodes * 100) if nodes > 0 else 0
+        lmr_success = ((lmr_red - lmr_res) / lmr_red * 100) if lmr_red > 0 else 0
+
+        prune_lines = [
+            f"Alpha: {alpha_cuts:,}  Beta: {beta_cuts:,}",
+            f"Null Move: {null_cuts:,}",
+            f"LMR: {lmr_red:,} ({lmr_success:.0f}% saved)",
+            f"Cut Rate: {cut_rate:.1f}%",
+        ]
+        for line in prune_lines:
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (panel_x + 25, y))
+            y += 18
+
+        y += 8
+
+        # === Transposition Table ===
+        section = self.font_small.render("[ TT Cache ]", True, (150, 180, 255))
+        self.screen.blit(section, (panel_x + 15, y))
+        y += 20
+
+        tt_hit = debug_info.get('tt_hit_rate', '0%')
+        tt_fill = debug_info.get('tt_filled', '0%')
+
+        tt_lines = [
+            f"Hit Rate: {tt_hit}",
+            f"Fill: {tt_fill}",
+        ]
+        for line in tt_lines:
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (panel_x + 25, y))
+            y += 18
+
+        y += 8
+
+        # === Best Move ===
+        section = self.font_small.render("[ Result ]", True, (150, 180, 255))
+        self.screen.blit(section, (panel_x + 15, y))
+        y += 20
+
+        best_move = debug_info.get('best_move', None)
+        best_score = debug_info.get('best_score', 0)
+        if best_move:
+            move_str = f"Move: ({best_move[0]},{best_move[1]})"
+        else:
+            move_str = "Move: N/A"
+        score_str = f"Score: {best_score:+,}"
+
+        text = self.font_small.render(move_str, True, COLOR_TEXT)
+        self.screen.blit(text, (panel_x + 25, y))
+        y += 18
+        text = self.font_small.render(score_str, True, COLOR_TEXT)
+        self.screen.blit(text, (panel_x + 25, y))
         y += 22
+
+        # PV Line
+        pv_line = debug_info.get('pv_line', [])
+        if pv_line:
+            pv_label = self.font_small.render("PV:", True, (120, 120, 120))
+            self.screen.blit(pv_label, (panel_x + 25, y))
+            pv_str = " ".join([f"({m[0]},{m[1]})" for m in pv_line[:4]])
+            pv_text = self.font_small.render(pv_str, True, (150, 200, 255))
+            self.screen.blit(pv_text, (panel_x + 55, y))
+        y += 22
+
+        # === Top Candidates ===
+        section = self.font_small.render("[ Top Moves ]", True, (150, 180, 255))
+        self.screen.blit(section, (panel_x + 15, y))
+        y += 20
 
         top_moves = debug_info.get('top_moves', [])
         if top_moves:
             max_score = abs(top_moves[0][1]) if top_moves[0][1] != 0 else 1
             for i, (move, score) in enumerate(top_moves[:5]):
                 # Bar
-                bar_width = min(150, int(150 * abs(score) / max_score))
+                bar_width = min(130, int(130 * abs(score) / max_score))
                 bar_color = (100, 150, 255) if score >= 0 else (255, 100, 100)
                 pygame.draw.rect(self.screen, bar_color,
                                (panel_x + 150, y + 2, bar_width, 14))
@@ -665,8 +803,197 @@ class Renderer:
                 # Text
                 move_text = f"{i+1}. ({move[0]},{move[1]}) {score:+}"
                 text = self.font_small.render(move_text, True, COLOR_TEXT)
-                self.screen.blit(text, (panel_x + 15, y))
-                y += 20
+                self.screen.blit(text, (panel_x + 25, y))
+                y += 18
+
+    def _render_help_overlay(self):
+        """Render keyboard shortcuts help overlay."""
+        # Semi-transparent background
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+
+        # Central box (increased height for spacing)
+        box_width = 420
+        box_height = 480
+        box_x = (WINDOW_WIDTH - box_width) // 2
+        box_y = (WINDOW_HEIGHT - box_height) // 2
+
+        pygame.draw.rect(self.screen, (45, 50, 60),
+                        (box_x, box_y, box_width, box_height), border_radius=12)
+        pygame.draw.rect(self.screen, COLOR_HIGHLIGHT,
+                        (box_x, box_y, box_width, box_height), 2, border_radius=12)
+
+        y = box_y + 20
+
+        # Title
+        title = self.font_large.render("KEYBOARD SHORTCUTS", True, COLOR_HIGHLIGHT)
+        title_x = box_x + (box_width - title.get_width()) // 2
+        self.screen.blit(title, (title_x, y))
+        y += 50
+
+        # Shortcuts grouped
+        sections = [
+            ("Game", [
+                ("N", "New Game"),
+                ("U / Z", "Undo Move"),
+                ("S", "Suggest Move"),
+                ("M", "Toggle Mode"),
+            ]),
+            ("Settings", [
+                ("R", "Change Rule"),
+                ("L", "AI Level"),
+                ("D", "Debug Info"),
+                ("V", "Show Valid Moves"),
+            ]),
+            ("Swap Rules", [
+                ("B / W", "Choose Black/White"),
+                ("1 / 2 / 3", "Swap2 Options"),
+            ]),
+        ]
+
+        for section_name, shortcuts in sections:
+            # Section header
+            header = self.font_medium.render(section_name, True, (180, 180, 180))
+            self.screen.blit(header, (box_x + 30, y))
+            y += 28
+
+            for key, desc in shortcuts:
+                key_text = self.font_small.render(key, True, COLOR_HIGHLIGHT)
+                desc_text = self.font_small.render(desc, True, COLOR_TEXT)
+                self.screen.blit(key_text, (box_x + 50, y))
+                self.screen.blit(desc_text, (box_x + 140, y))
+                y += 24
+
+            y += 18
+
+        # Close hint (positioned at bottom with adequate spacing)
+        close_hint = self.font_small.render("Press ? or ESC to close", True, (120, 120, 120))
+        hint_x = box_x + (box_width - close_hint.get_width()) // 2
+        self.screen.blit(close_hint, (hint_x, box_y + box_height - 35))
+
+    def _render_rules_overlay(self, state: GameState):
+        """Render current rule information overlay."""
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+
+        box_width = 450
+        box_height = 420
+        box_x = (WINDOW_WIDTH - box_width) // 2
+        box_y = (WINDOW_HEIGHT - box_height) // 2
+
+        pygame.draw.rect(self.screen, (45, 50, 60),
+                        (box_x, box_y, box_width, box_height), border_radius=12)
+        pygame.draw.rect(self.screen, (100, 180, 255),
+                        (box_x, box_y, box_width, box_height), 2, border_radius=12)
+
+        y = box_y + 20
+
+        # Rule name
+        rule_names = {
+            StartingRule.STANDARD: "STANDARD",
+            StartingRule.PRO: "PRO RULE",
+            StartingRule.SWAP: "SWAP",
+            StartingRule.SWAP2: "SWAP2",
+        }
+        rule_name = rule_names.get(state.starting_rule, "UNKNOWN")
+        title = self.font_large.render(f"RULE: {rule_name}", True, (100, 180, 255))
+        title_x = box_x + (box_width - title.get_width()) // 2
+        self.screen.blit(title, (title_x, y))
+        y += 55
+
+        # Rule description
+        rule_desc = {
+            StartingRule.STANDARD: [
+                "No restrictions on opening moves.",
+                "Players alternate turns freely.",
+            ],
+            StartingRule.PRO: [
+                "1st move: Black must play at center",
+                "2nd move: White plays anywhere",
+                "3rd move: Black must be 3+ away",
+                "         from center (Chebyshev)",
+            ],
+            StartingRule.SWAP: [
+                "Player 1 places 3 stones:",
+                "  Black, White, Black",
+                "",
+                "Player 2 chooses color (B/W keys)",
+            ],
+            StartingRule.SWAP2: [
+                "Player 1 places 3 stones",
+                "",
+                "Player 2 chooses (1/2/3 keys):",
+                "  1: Play as Black",
+                "  2: Play as White",
+                "  3: Place 2 more, P1 chooses",
+            ],
+        }
+
+        header = self.font_medium.render("Opening Rule:", True, (180, 180, 180))
+        self.screen.blit(header, (box_x + 30, y))
+        y += 30
+
+        for line in rule_desc.get(state.starting_rule, []):
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (box_x + 40, y))
+            y += 24
+
+        y += 20
+
+        # Win conditions
+        header2 = self.font_medium.render("Win Conditions:", True, (180, 180, 180))
+        self.screen.blit(header2, (box_x + 30, y))
+        y += 30
+
+        win_rules = [
+            "• 5 or more stones in a row",
+            "• Capture 10 opponent stones",
+        ]
+        for line in win_rules:
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (box_x + 40, y))
+            y += 24
+
+        y += 20
+
+        # Special rules
+        header3 = self.font_medium.render("Special Rules:", True, (180, 180, 180))
+        self.screen.blit(header3, (box_x + 30, y))
+        y += 30
+
+        special_rules = [
+            "* Capture: X-O-O-X removes O-O",
+            "* Double-three is forbidden",
+            "* 5-row can be broken by capture",
+        ]
+        for line in special_rules:
+            text = self.font_small.render(line, True, COLOR_TEXT)
+            self.screen.blit(text, (box_x + 40, y))
+            y += 24
+
+        # Close hint
+        close_hint = self.font_small.render("Press I or ESC to close", True, (120, 120, 120))
+        hint_x = box_x + (box_width - close_hint.get_width()) // 2
+        self.screen.blit(close_hint, (hint_x, box_y + box_height - 35))
+
+    def toggle_help_overlay(self):
+        """Toggle help overlay visibility."""
+        self.show_help_overlay = not self.show_help_overlay
+        if self.show_help_overlay:
+            self.show_rules_overlay = False
+
+    def toggle_rules_overlay(self):
+        """Toggle rules overlay visibility."""
+        self.show_rules_overlay = not self.show_rules_overlay
+        if self.show_rules_overlay:
+            self.show_help_overlay = False
+
+    def close_overlays(self):
+        """Close all overlays."""
+        self.show_help_overlay = False
+        self.show_rules_overlay = False
 
     def get_button_at(self, pos: tuple) -> Optional[str]:
         """Get the button name at a screen position."""

@@ -20,6 +20,15 @@ class InputAction(Enum):
     TOGGLE_MODE = auto()
     TOGGLE_DEBUG = auto()
     TOGGLE_VALID_MOVES = auto()
+    TOGGLE_RULE = auto()       # Cycle starting rules
+    CHOOSE_BLACK = auto()      # Choose black in Swap
+    CHOOSE_WHITE = auto()      # Choose white in Swap
+    SWAP2_OPTION_1 = auto()    # Swap2: take black
+    SWAP2_OPTION_2 = auto()    # Swap2: take white
+    SWAP2_OPTION_3 = auto()    # Swap2: place 2 more
+    TOGGLE_DIFFICULTY = auto()  # Cycle AI difficulty
+    TOGGLE_HELP = auto()         # Show help overlay
+    TOGGLE_RULES = auto()        # Show rules overlay
 
 
 @dataclass
@@ -80,6 +89,7 @@ class InputHandler:
                 'undo': InputAction.UNDO,
                 'suggest': InputAction.SUGGEST,
                 'mode': InputAction.TOGGLE_MODE,
+                'rule': InputAction.TOGGLE_RULE,
             }
             return InputEvent(action_map.get(button, InputAction.NONE), mouse_pos=pos)
 
@@ -101,6 +111,21 @@ class InputHandler:
             pygame.K_d: InputAction.TOGGLE_DEBUG,
             pygame.K_v: InputAction.TOGGLE_VALID_MOVES,
             pygame.K_m: InputAction.TOGGLE_MODE,
+            pygame.K_r: InputAction.TOGGLE_RULE,
+            # Swap color choices
+            pygame.K_b: InputAction.CHOOSE_BLACK,
+            pygame.K_w: InputAction.CHOOSE_WHITE,
+            # Swap2 options
+            pygame.K_1: InputAction.SWAP2_OPTION_1,
+            pygame.K_2: InputAction.SWAP2_OPTION_2,
+            pygame.K_3: InputAction.SWAP2_OPTION_3,
+            # AI difficulty
+            pygame.K_l: InputAction.TOGGLE_DIFFICULTY,
+            # Help and rules
+            pygame.K_QUESTION: InputAction.TOGGLE_HELP,
+            pygame.K_SLASH: InputAction.TOGGLE_HELP,  # ? is shift+/
+            pygame.K_h: InputAction.TOGGLE_HELP,
+            pygame.K_i: InputAction.TOGGLE_RULES,
         }
 
         action = key_map.get(key, InputAction.NONE)

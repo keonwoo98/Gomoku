@@ -7,7 +7,7 @@ Main entry point for the game.
 import sys
 import pygame
 
-from src.game.state import GameState, GameMode
+from src.game.state import GameState, GameMode, StartingRule, GamePhase, AIDifficulty
 from src.game.board import BLACK, WHITE
 from src.game.rules import Rules
 from src.ai.engine import AIEngine
@@ -35,14 +35,35 @@ class GomokuGame:
         self.modes = [GameMode.PVE, GameMode.PVP, GameMode.EVE]
         self.current_mode_idx = 0
 
+        # Starting rule cycle
+        self.rules = [
+            StartingRule.STANDARD,
+            StartingRule.PRO,
+            StartingRule.SWAP,
+            StartingRule.SWAP2
+        ]
+        self.current_rule_idx = 0
+
+        # AI difficulty cycle
+        self.difficulties = [
+            AIDifficulty.EASY,
+            AIDifficulty.MEDIUM,
+            AIDifficulty.HARD,
+            AIDifficulty.EXPERT
+        ]
+        self.current_difficulty_idx = 3  # Default: EXPERT
+        self._apply_difficulty()
+
     def run(self):
         """Main game loop."""
         while self.running:
             # Process input
             self._handle_input()
 
-            # AI turn
-            if self.state.is_ai_turn() and not self.state.is_game_over:
+            # AI turn (only in normal phase, not during special phases)
+            if (self.state.is_ai_turn() and
+                not self.state.is_game_over and
+                self.state.phase == GamePhase.NORMAL):
                 self._run_ai_turn()
 
             # Render
@@ -51,7 +72,8 @@ class GomokuGame:
                 self.state,
                 suggested_move=self.suggested_move,
                 debug_info=debug_info,
-                show_debug=self.show_debug
+                show_debug=self.show_debug,
+                difficulty=self.get_current_difficulty()
             )
 
             # Frame rate control
@@ -65,12 +87,22 @@ class GomokuGame:
 
         for event in events:
             if event.action == InputAction.QUIT:
-                self.running = False
+                # Close overlays first, then quit
+                if self.renderer.show_help_overlay or self.renderer.show_rules_overlay:
+                    self.renderer.close_overlays()
+                else:
+                    self.running = False
 
             elif event.action == InputAction.PLACE_STONE:
-                if self.state.is_human_turn() and event.position:
-                    row, col = event.position
-                    self._make_move(row, col)
+                # Allow placing stones during opening phase or normal human turn
+                if event.position:
+                    can_place = (
+                        self.state.phase in [GamePhase.OPENING_PLACE, GamePhase.SWAP2_EXTRA]
+                        or self.state.is_human_turn()
+                    )
+                    if can_place:
+                        row, col = event.position
+                        self._make_move(row, col)
 
             elif event.action == InputAction.NEW_GAME:
                 self._new_game()
@@ -90,9 +122,44 @@ class GomokuGame:
             elif event.action == InputAction.TOGGLE_VALID_MOVES:
                 self.renderer.show_valid_moves = not self.renderer.show_valid_moves
 
+            elif event.action == InputAction.TOGGLE_RULE:
+                self._toggle_rule()
+
+            # Swap color choices
+            elif event.action == InputAction.CHOOSE_BLACK:
+                self._handle_color_choice(BLACK)
+
+            elif event.action == InputAction.CHOOSE_WHITE:
+                self._handle_color_choice(WHITE)
+
+            # Swap2 options
+            elif event.action == InputAction.SWAP2_OPTION_1:
+                self._handle_swap2_option(1)
+
+            elif event.action == InputAction.SWAP2_OPTION_2:
+                self._handle_swap2_option(2)
+
+            elif event.action == InputAction.SWAP2_OPTION_3:
+                self._handle_swap2_option(3)
+
+            elif event.action == InputAction.TOGGLE_DIFFICULTY:
+                self._toggle_difficulty()
+
+            elif event.action == InputAction.TOGGLE_HELP:
+                self.renderer.toggle_help_overlay()
+
+            elif event.action == InputAction.TOGGLE_RULES:
+                self.renderer.toggle_rules_overlay()
+
     def _make_move(self, row: int, col: int, thinking_time: float = 0.0):
         """Make a move and handle UI animations."""
         color = self.state.current_turn
+
+        # Check if move is valid and get reason if not
+        reason = Rules.get_invalid_reason(self.state.board, row, col, color)
+        if reason:
+            self.renderer.show_error(reason)
+            return
 
         # Get capture positions BEFORE making the move
         captured_positions = Rules.get_captured_positions(
@@ -204,6 +271,41 @@ class GomokuGame:
         self.state.reset(new_mode)
         self.suggested_move = None
         self.renderer.reset_animations()
+
+    def _toggle_rule(self):
+        """Toggle between starting rules."""
+        self.current_rule_idx = (self.current_rule_idx + 1) % len(self.rules)
+        new_rule = self.rules[self.current_rule_idx]
+        self.state.reset(starting_rule=new_rule)
+        self.suggested_move = None
+        self.ai_engine.move_gen.clear()
+        self.renderer.reset_animations()
+
+    def _handle_color_choice(self, color: int):
+        """Handle color choice in Swap phases."""
+        if self.state.phase == GamePhase.SWAP_CHOICE:
+            self.state.choose_color(color)
+        elif self.state.phase == GamePhase.SWAP2_FINAL:
+            self.state.choose_color(color)
+
+    def _handle_swap2_option(self, option: int):
+        """Handle Swap2 option choice."""
+        if self.state.phase == GamePhase.SWAP2_CHOICE:
+            self.state.choose_swap2_option(option)
+
+    def _toggle_difficulty(self):
+        """Toggle AI difficulty level."""
+        self.current_difficulty_idx = (self.current_difficulty_idx + 1) % len(self.difficulties)
+        self._apply_difficulty()
+
+    def _apply_difficulty(self):
+        """Apply current difficulty settings to AI engine."""
+        diff = self.difficulties[self.current_difficulty_idx]
+        self.ai_engine.set_difficulty(diff.depth, diff.time_limit)
+
+    def get_current_difficulty(self) -> AIDifficulty:
+        """Get current AI difficulty."""
+        return self.difficulties[self.current_difficulty_idx]
 
 
 def main():
