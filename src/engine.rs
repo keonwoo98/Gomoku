@@ -128,6 +128,18 @@ impl MoveResult {
         }
     }
 
+    /// Create a quick alpha-beta result (for opening moves)
+    #[inline]
+    fn alpha_beta(pos: Pos, score: i32, time_ms: u64, nodes: u64) -> Self {
+        Self {
+            best_move: Some(pos),
+            score,
+            search_type: SearchType::AlphaBeta,
+            time_ms,
+            nodes,
+        }
+    }
+
     /// Create a result indicating no move found (used in tests)
     #[cfg(test)]
     fn no_move(time_ms: u64) -> Self {
@@ -298,6 +310,16 @@ impl AIEngine {
     pub fn get_move_with_stats(&mut self, board: &Board, color: Stone) -> MoveResult {
         let start = Instant::now();
 
+        // 0. Opening book for fast early game response
+        if let Some(opening_move) = self.get_opening_move(board, color) {
+            return MoveResult::alpha_beta(
+                opening_move,
+                0,
+                start.elapsed().as_millis() as u64,
+                1,
+            );
+        }
+
         // 1. Check for immediate winning move (5-in-a-row or capture win)
         if let Some(win_move) = self.find_immediate_win(board, color) {
             return MoveResult::immediate_win(win_move, start.elapsed().as_millis() as u64);
@@ -465,6 +487,92 @@ impl AIEngine {
     pub fn tt_stats(&self) -> crate::search::TTStats {
         self.searcher.tt_stats()
     }
+
+    /// Get an opening move for early game positions.
+    ///
+    /// Returns a quick move without expensive search for sparse boards:
+    /// - Empty board: play center (9,9)
+    /// - 1-2 stones: play adjacent to existing stones
+    ///
+    /// Returns `None` if:
+    /// - Board has enough stones to warrant full search (>2 stones)
+    /// - Any immediate threats exist
+    fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
+        let stone_count = board.stone_count();
+
+        // Only use opening book for very early game (0-2 stones)
+        // This ensures we don't miss tactical threats
+        if stone_count > 2 {
+            return None;
+        }
+
+        let center = Pos::new(9, 9);
+
+        // Empty board: play center
+        if stone_count == 0 {
+            return Some(center);
+        }
+
+        // If center is empty and valid, play there
+        if board.get(center) == Stone::Empty && is_valid_move(board, center, color) {
+            return Some(center);
+        }
+
+        // Find the centroid of existing stones and play near it
+        let mut sum_row: i32 = 0;
+        let mut sum_col: i32 = 0;
+        let mut count = 0;
+
+        for r in 0..BOARD_SIZE as u8 {
+            for c in 0..BOARD_SIZE as u8 {
+                let pos = Pos::new(r, c);
+                if board.get(pos) != Stone::Empty {
+                    sum_row += r as i32;
+                    sum_col += c as i32;
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 {
+            return Some(center);
+        }
+
+        let center_row = (sum_row / count) as u8;
+        let center_col = (sum_col / count) as u8;
+
+        // Try positions in expanding rings around the centroid
+        let offsets: [(i8, i8); 8] = [
+            (0, 1), (1, 0), (0, -1), (-1, 0),  // orthogonal
+            (1, 1), (1, -1), (-1, 1), (-1, -1), // diagonal
+        ];
+
+        for radius in 1..=3 {
+            for &(dr, dc) in &offsets {
+                let r = center_row as i8 + dr * radius;
+                let c = center_col as i8 + dc * radius;
+
+                if r >= 0 && r < BOARD_SIZE as i8 && c >= 0 && c < BOARD_SIZE as i8 {
+                    let pos = Pos::new(r as u8, c as u8);
+                    if is_valid_move(board, pos, color) {
+                        return Some(pos);
+                    }
+                }
+            }
+        }
+
+        // Fallback: find any valid move near center
+        for r in 7..12u8 {
+            for c in 7..12u8 {
+                let pos = Pos::new(r, c);
+                if is_valid_move(board, pos, color) {
+                    return Some(pos);
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Default for AIEngine {
@@ -599,11 +707,14 @@ mod tests {
         // Use smaller depth for faster test
         let mut engine = AIEngine::with_config(8, 4, 500);
         let mut board = Board::new();
-        // Add some stones to ensure TT gets used
+        // Add enough stones to bypass opening book and use alpha-beta (TT)
         board.place_stone(Pos::new(9, 9), Stone::Black);
+        board.place_stone(Pos::new(9, 10), Stone::White);
+        board.place_stone(Pos::new(10, 9), Stone::Black);
+        board.place_stone(Pos::new(10, 10), Stone::White);
 
         // Do a search to populate cache
-        let _ = engine.get_move(&board, Stone::White);
+        let _ = engine.get_move(&board, Stone::Black);
         let stats_before = engine.tt_stats();
         assert!(stats_before.used > 0);
 

@@ -26,11 +26,16 @@ pub fn hover_invalid() -> Color32 {
     Color32::from_rgba_unmultiplied(255, 0, 0, 80)
 }
 
-// UI colors
+// UI colors (reserved for future use)
+#[allow(dead_code)]
 pub const PANEL_BG: Color32 = Color32::from_rgb(45, 45, 48);
+#[allow(dead_code)]
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 230, 230);
+#[allow(dead_code)]
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 160, 160);
+#[allow(dead_code)]
 pub const BUTTON_BG: Color32 = Color32::from_rgb(70, 70, 75);
+#[allow(dead_code)]
 pub const BUTTON_HOVER: Color32 = Color32::from_rgb(90, 90, 95);
 
 // Timer colors

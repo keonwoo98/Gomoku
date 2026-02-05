@@ -1,7 +1,7 @@
 //! Game state management for the Gomoku GUI
 
 use crate::{AIEngine, Board, MoveResult, Pos, Stone};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -213,7 +213,7 @@ impl GameState {
     }
 
     /// Check for win condition
-    fn check_win(&self, pos: Pos, color: Stone, captures: usize) -> Option<GameResult> {
+    fn check_win(&self, pos: Pos, color: Stone, _captures: usize) -> Option<GameResult> {
         // Check capture win
         let total_captures = if color == Stone::Black {
             self.board.black_captures

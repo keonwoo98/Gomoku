@@ -1,7 +1,7 @@
 //! Main application for the Gomoku GUI
 
 use eframe::egui;
-use egui::{CentralPanel, Context, SidePanel, TopBottomPanel, Vec2};
+use egui::{CentralPanel, Context, SidePanel, TopBottomPanel};
 
 use crate::Stone;
 use super::board_view::BoardView;
@@ -13,6 +13,7 @@ pub struct GomokuApp {
     state: GameState,
     board_view: BoardView,
     show_debug: bool,
+    #[allow(dead_code)]
     show_menu: bool,
 }
 
