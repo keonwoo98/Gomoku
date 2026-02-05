@@ -77,23 +77,23 @@ impl Board {
         self.white.clear(pos);
     }
 
-    /// Get bitboard for a color
+    /// Get bitboard for a color (returns None for Empty)
     #[inline]
-    pub fn stones(&self, stone: Stone) -> &Bitboard {
+    pub fn stones(&self, stone: Stone) -> Option<&Bitboard> {
         match stone {
-            Stone::Black => &self.black,
-            Stone::White => &self.white,
-            Stone::Empty => panic!("Cannot get bitboard for Empty"),
+            Stone::Black => Some(&self.black),
+            Stone::White => Some(&self.white),
+            Stone::Empty => None,
         }
     }
 
-    /// Get mutable bitboard for a color
+    /// Get mutable bitboard for a color (returns None for Empty)
     #[inline]
-    pub fn stones_mut(&mut self, stone: Stone) -> &mut Bitboard {
+    pub fn stones_mut(&mut self, stone: Stone) -> Option<&mut Bitboard> {
         match stone {
-            Stone::Black => &mut self.black,
-            Stone::White => &mut self.white,
-            Stone::Empty => panic!("Cannot get bitboard for Empty"),
+            Stone::Black => Some(&mut self.black),
+            Stone::White => Some(&mut self.white),
+            Stone::Empty => None,
         }
     }
 
@@ -107,12 +107,12 @@ impl Board {
         }
     }
 
-    /// Add captures for a color
+    /// Add captures for a color (saturating, max 255)
     #[inline]
     pub fn add_captures(&mut self, stone: Stone, count: u8) {
         match stone {
-            Stone::Black => self.black_captures += count,
-            Stone::White => self.white_captures += count,
+            Stone::Black => self.black_captures = self.black_captures.saturating_add(count),
+            Stone::White => self.white_captures = self.white_captures.saturating_add(count),
             Stone::Empty => {}
         }
     }
