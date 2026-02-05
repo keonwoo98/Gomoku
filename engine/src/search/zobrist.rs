@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```
-//! use gomoku_engine::board::{Board, Stone, Pos};
-//! use gomoku_engine::search::ZobristTable;
+//! use gomoku::board::{Board, Stone, Pos};
+//! use gomoku::search::ZobristTable;
 //!
 //! let zt = ZobristTable::new();
 //! let mut board = Board::new();
