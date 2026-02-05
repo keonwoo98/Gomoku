@@ -3,4 +3,4 @@
 pub mod board;
 pub mod eval;
 pub mod rules;
-// pub mod search; // To be implemented
+pub mod search;
