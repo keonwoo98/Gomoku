@@ -1,12 +1,14 @@
 //! Board representation for Gomoku
 
 pub mod bitboard;
+pub mod board;
 
 #[cfg(test)]
 mod tests;
 
 // Re-exports
 pub use bitboard::Bitboard;
+pub use board::Board;
 
 /// Board size (19x19)
 pub const BOARD_SIZE: usize = 19;

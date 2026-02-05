@@ -1,5 +1,6 @@
 use super::*;
 use super::bitboard::Bitboard;
+use super::board::Board;
 
 #[test]
 fn test_stone_opponent() {
@@ -145,4 +146,47 @@ fn test_bitboard_word_boundaries() {
     assert!(bb.get(Pos::from_index(127)));
     assert!(bb.get(Pos::from_index(128)));
     assert_eq!(bb.count(), 4);
+}
+
+// Board tests
+
+#[test]
+fn test_board_new() {
+    let board = Board::new();
+    assert_eq!(board.stone_count(), 0);
+    assert!(board.is_board_empty());
+}
+
+#[test]
+fn test_board_place_get() {
+    let mut board = Board::new();
+    let pos = Pos::new(9, 9);
+
+    assert_eq!(board.get(pos), Stone::Empty);
+    board.place_stone(pos, Stone::Black);
+    assert_eq!(board.get(pos), Stone::Black);
+
+    board.remove_stone(pos);
+    assert_eq!(board.get(pos), Stone::Empty);
+}
+
+#[test]
+fn test_board_captures() {
+    let mut board = Board::new();
+    assert_eq!(board.captures(Stone::Black), 0);
+
+    board.add_captures(Stone::Black, 2);
+    assert_eq!(board.captures(Stone::Black), 2);
+    assert_eq!(board.captures(Stone::White), 0);
+}
+
+#[test]
+fn test_board_stone_count() {
+    let mut board = Board::new();
+    board.place_stone(Pos::new(0, 0), Stone::Black);
+    board.place_stone(Pos::new(1, 1), Stone::White);
+    board.place_stone(Pos::new(2, 2), Stone::Black);
+
+    assert_eq!(board.stone_count(), 3);
+    assert!(!board.is_board_empty());
 }
