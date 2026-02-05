@@ -12,6 +12,8 @@ name = "gomoku"
 path = "src/main.rs"
 
 [dependencies]
+eframe = "0.31"
+egui = "0.31"
 
 [profile.release]
 opt-level = 3

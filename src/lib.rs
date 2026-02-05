@@ -57,6 +57,7 @@ pub mod engine;
 pub mod eval;
 pub mod rules;
 pub mod search;
+pub mod ui;
 
 // Re-export commonly used types for convenience
 pub use board::{Board, Pos, Stone, BOARD_SIZE};
