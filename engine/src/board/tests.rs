@@ -1,4 +1,5 @@
 use super::*;
+use super::bitboard::Bitboard;
 
 #[test]
 fn test_stone_opponent() {
@@ -63,4 +64,85 @@ fn test_pos_corner_indices() {
     assert_eq!(Pos::new(18, 0).to_index(), 342);
     // Bottom-right
     assert_eq!(Pos::new(18, 18).to_index(), 360);
+}
+
+// Bitboard tests
+
+#[test]
+fn test_bitboard_new() {
+    let bb = Bitboard::new();
+    assert!(bb.is_empty());
+    assert_eq!(bb.count(), 0);
+}
+
+#[test]
+fn test_bitboard_set_get() {
+    let mut bb = Bitboard::new();
+    let pos = Pos::new(9, 9);
+
+    assert!(!bb.get(pos));
+    bb.set(pos);
+    assert!(bb.get(pos));
+    assert_eq!(bb.count(), 1);
+}
+
+#[test]
+fn test_bitboard_clear() {
+    let mut bb = Bitboard::new();
+    let pos = Pos::new(9, 9);
+
+    bb.set(pos);
+    assert!(bb.get(pos));
+    bb.clear(pos);
+    assert!(!bb.get(pos));
+    assert_eq!(bb.count(), 0);
+}
+
+#[test]
+fn test_bitboard_multiple_positions() {
+    let mut bb = Bitboard::new();
+
+    bb.set(Pos::new(0, 0));
+    bb.set(Pos::new(9, 9));
+    bb.set(Pos::new(18, 18));
+
+    assert!(bb.get(Pos::new(0, 0)));
+    assert!(bb.get(Pos::new(9, 9)));
+    assert!(bb.get(Pos::new(18, 18)));
+    assert!(!bb.get(Pos::new(5, 5)));
+    assert_eq!(bb.count(), 3);
+}
+
+#[test]
+fn test_bitboard_iter() {
+    let mut bb = Bitboard::new();
+    bb.set(Pos::new(0, 0));
+    bb.set(Pos::new(5, 5));
+    bb.set(Pos::new(10, 10));
+
+    let positions: Vec<Pos> = bb.iter_ones().collect();
+    assert_eq!(positions.len(), 3);
+    assert!(positions.contains(&Pos::new(0, 0)));
+    assert!(positions.contains(&Pos::new(5, 5)));
+    assert!(positions.contains(&Pos::new(10, 10)));
+}
+
+#[test]
+fn test_bitboard_word_boundaries() {
+    let mut bb = Bitboard::new();
+    
+    // Test positions at word boundaries (64 bits each)
+    // Word 0: indices 0-63
+    // Word 1: indices 64-127
+    // etc.
+    bb.set(Pos::from_index(63));  // End of word 0
+    bb.set(Pos::from_index(64));  // Start of word 1
+    bb.set(Pos::from_index(127)); // End of word 1
+    bb.set(Pos::from_index(128)); // Start of word 2
+
+    assert!(bb.get(Pos::from_index(63)));
+    assert!(bb.get(Pos::from_index(64)));
+    assert!(bb.get(Pos::from_index(127)));
+    assert!(bb.get(Pos::from_index(128)));
+    assert_eq!(bb.count(), 4);
 }

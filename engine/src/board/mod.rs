@@ -5,6 +5,9 @@ pub mod bitboard;
 #[cfg(test)]
 mod tests;
 
+// Re-exports
+pub use bitboard::Bitboard;
+
 /// Board size (19x19)
 pub const BOARD_SIZE: usize = 19;
 pub const TOTAL_CELLS: usize = BOARD_SIZE * BOARD_SIZE; // 361
