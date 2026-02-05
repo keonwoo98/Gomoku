@@ -379,7 +379,20 @@ impl AIEngine {
         }
 
         // 5. Regular Alpha-Beta search
-        let result = self.searcher.search(board, color, self.max_depth);
+        // Dynamically adjust depth based on stone count for faster early game
+        let stone_count = board.stone_count();
+        let effective_depth = if stone_count < 10 {
+            // Early game: use lower depth for speed
+            4.min(self.max_depth)
+        } else if stone_count < 20 {
+            // Mid-early game: moderate depth
+            6.min(self.max_depth)
+        } else {
+            // Mid-late game: full depth
+            self.max_depth
+        };
+
+        let result = self.searcher.search(board, color, effective_depth);
         MoveResult::from_alphabeta(result, start.elapsed().as_millis() as u64)
     }
 

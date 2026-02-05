@@ -2,9 +2,11 @@ NAME = Gomoku
 
 all: $(NAME)
 
-$(NAME):
+$(NAME): FORCE
 	@cargo build --release
 	@cp target/release/gomoku $(NAME)
+
+FORCE:
 
 clean:
 	@cargo clean
