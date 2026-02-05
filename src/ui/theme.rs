@@ -35,8 +35,11 @@ pub fn hover_invalid() -> Color32 {
 }
 
 // Panel colors - dark modern theme
+#[allow(dead_code)]
 pub const PANEL_BG: Color32 = Color32::from_rgb(32, 34, 37);
+#[allow(dead_code)]
 pub const PANEL_HEADER: Color32 = Color32::from_rgb(42, 44, 48);
+#[allow(dead_code)]
 pub const PANEL_BORDER: Color32 = Color32::from_rgb(60, 62, 66);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 240, 245);
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 165, 175);
@@ -51,7 +54,9 @@ pub const BUTTON_HOVER: Color32 = Color32::from_rgb(70, 72, 78);
 pub const BUTTON_ACTIVE: Color32 = Color32::from_rgb(85, 87, 95);
 
 // Status colors
+#[allow(dead_code)]
 pub const STATUS_BLACK: Color32 = Color32::from_rgb(60, 60, 65);
+#[allow(dead_code)]
 pub const STATUS_WHITE: Color32 = Color32::from_rgb(220, 220, 225);
 
 // Timer colors
