@@ -58,7 +58,14 @@ impl PatternScore {
 /// Score differential (positive = advantage, negative = disadvantage)
 pub fn capture_score(my_captures: u8, opp_captures: u8) -> i32 {
     // Non-linear scoring - closer to win = exponentially more valuable
-    const CAP_WEIGHTS: [i32; 6] = [0, 200, 600, 2000, 8000, PatternScore::CAPTURE_WIN];
+    const CAP_WEIGHTS: [i32; 6] = [
+        0,
+        200,
+        600,
+        2000,
+        PatternScore::NEAR_CAPTURE_WIN,
+        PatternScore::CAPTURE_WIN,
+    ];
 
     let my_score = CAP_WEIGHTS[my_captures.min(5) as usize];
     let opp_score = CAP_WEIGHTS[opp_captures.min(5) as usize];
