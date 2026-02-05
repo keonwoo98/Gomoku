@@ -309,6 +309,27 @@ class Rules:
         return True
 
     @staticmethod
+    def get_invalid_reason(board: Board, row: int, col: int, color: int) -> str:
+        """
+        Get the reason why a move is invalid.
+        Returns empty string if move is valid.
+        """
+        if not Board.is_valid_pos(row, col):
+            return "Out of bounds"
+        if not board.is_empty(row, col):
+            return "Position occupied"
+
+        # Check for captures first
+        captures = Rules.check_captures(board, row, col, color)
+
+        # Double-three check
+        if len(captures) == 0:
+            if Rules.is_double_three(board, row, col, color):
+                return "Double-three forbidden"
+
+        return ""  # Valid move
+
+    @staticmethod
     def check_winner(board: Board, row: int, col: int, color: int,
                      captures: dict) -> int:
         """
@@ -316,9 +337,10 @@ class Rules:
         captures: {BLACK: count, WHITE: count}
         Returns: BLACK, WHITE, or EMPTY (no winner)
 
-        Checks both:
-        1. Current player winning by capture or five-in-row
-        2. Opponent's existing five-in-row (if not broken by current move)
+        Checks in order:
+        1. Capture wins (either player)
+        2. Opponent's EXISTING five-in-row (they won on previous turn)
+        3. Current player's NEW five-in-row
         """
         opp_color = Rules.opposite(color)
 
@@ -326,38 +348,55 @@ class Rules:
         if captures.get(color, 0) >= Rules.WIN_CAPTURES:
             return color
 
-        # Check capture win for opponent (should have been detected earlier, but just in case)
+        # Check capture win for opponent
         if captures.get(opp_color, 0) >= Rules.WIN_CAPTURES:
             return opp_color
 
-        # Check current player's five-in-row at move position
-        if Rules.check_five_at(board, row, col, color):
-            # Endgame capture check
-            five_positions = Rules.get_five_positions(board, row, col, color)
+        # CRITICAL: Check opponent's EXISTING five-in-row FIRST
+        # If opponent already had five before this move, they won earlier
+        # (This move shouldn't have been allowed, but check anyway)
+        if board.has_five_in_row(opp_color):
+            # Verify the current move didn't break it by capture
+            # If opponent still has five, opponent wins
+            return opp_color
 
-            # If opponent can break the five by capture, no win yet
-            if Rules.can_break_five(board, five_positions, color):
-                return EMPTY
+        # Check current player's five-in-row
+        # CRITICAL: Check ENTIRE BOARD, not just the last move position!
+        # AI might already have 5-in-row but played elsewhere
+        if board.has_five_in_row(color):
+            # Find the five-in-row positions for endgame capture check
+            five_positions = Rules._find_any_five_positions(board, color)
 
-            # If opponent has 8+ captures and can reach 10, they win
-            if captures.get(opp_color, 0) >= 8:
-                # Check if opponent can capture to 10
-                for r in range(BOARD_SIZE):
-                    for c in range(BOARD_SIZE):
-                        if board.is_empty(r, c):
-                            opp_captures = Rules.check_captures(board, r, c, opp_color)
-                            if captures.get(opp_color, 0) + len(opp_captures) * 2 >= 10:
-                                return opp_color
+            if five_positions:
+                # If opponent can break the five by capture, no win yet
+                if Rules.can_break_five(board, five_positions, color):
+                    return EMPTY
+
+                # If opponent has 8+ captures and can reach 10, they win
+                if captures.get(opp_color, 0) >= 8:
+                    # Check if opponent can capture to 10
+                    for r in range(BOARD_SIZE):
+                        for c in range(BOARD_SIZE):
+                            if board.is_empty(r, c):
+                                opp_captures = Rules.check_captures(board, r, c, opp_color)
+                                if captures.get(opp_color, 0) + len(opp_captures) * 2 >= 10:
+                                    return opp_color
 
             return color
 
-        # Check opponent's existing five-in-row
-        # (Opponent made five earlier, but current player had a chance to break it by capture)
-        # If opponent still has five-in-row, they win
-        if board.has_five_in_row(opp_color):
-            return opp_color
-
         return EMPTY
+
+    @staticmethod
+    def _find_any_five_positions(board: Board, color: int) -> list:
+        """Find positions of any five-in-row for the given color."""
+        # Scan all positions to find a five-in-row
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                if board.get(r, c) == color:
+                    positions = Rules.get_five_positions(board, r, c, color)
+                    if positions and len(positions) >= 5:
+                        return positions
+        return []
 
     @staticmethod
     def get_valid_moves(board: Board, color: int) -> list:

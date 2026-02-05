@@ -104,6 +104,61 @@ class TestCaptures:
         captures = Rules.get_captured_positions(board, 5, 9, WHITE)
         assert len(captures) == 2
 
+    def test_cannot_be_captured_by_moving_into(self):
+        """Moving into a capture pattern is SAFE - you cannot be captured.
+
+        Rule: X-O-O-X captures O-O, but placing O between X-?-X is safe.
+        Example: W-B-[empty]-W -> B can safely play at [empty]
+        """
+        board = Board()
+        # Setup: W at (5,5), empty at (5,6), W at (5,7)
+        # Pattern: W-?-W - Black plays at (5,6)
+        board.place_stone(5, 5, WHITE)
+        board.place_stone(5, 7, WHITE)
+
+        # Black plays at (5,6) - between two white stones
+        # This should NOT result in Black being captured
+        captures_by_white = Rules.get_captured_positions(board, 5, 6, WHITE)
+        captures_by_black = Rules.get_captured_positions(board, 5, 6, BLACK)
+
+        # White cannot capture by Black's move (Black is the one placing)
+        # Black places the stone - only Black can potentially capture with this move
+        # Since pattern is W-B-W (not W-B-B-W), no capture happens
+        assert len(captures_by_black) == 0  # Black doesn't capture anything
+
+        # Verify the move is valid (not a double-three in this case)
+        assert Rules.is_valid_move(board, 5, 6, BLACK)
+
+    def test_safe_to_place_between_flanking_stones(self):
+        """More comprehensive test: placing stone between opponent's flanking stones is safe.
+
+        Pattern: W-W-B-?-W-W where B plays at ?
+        B is not captured because capture requires X-O-O-X pattern
+        (the capturing player must CLOSE the pattern, not the captured stones moving in)
+        """
+        board = Board()
+        # Setup: W-W-B-?-W-W pattern
+        board.place_stone(5, 3, WHITE)
+        board.place_stone(5, 4, WHITE)
+        board.place_stone(5, 5, BLACK)
+        # (5, 6) is empty - Black will play here
+        board.place_stone(5, 7, WHITE)
+        board.place_stone(5, 8, WHITE)
+
+        # Black plays at (5,6)
+        # Check no captures occur when Black makes this move
+        captures = Rules.get_captured_positions(board, 5, 6, BLACK)
+        assert len(captures) == 0  # Black doesn't capture any white stones
+
+        # The move should be valid
+        assert Rules.is_valid_move(board, 5, 6, BLACK)
+
+        # After placing, verify the state - no stones should be removed
+        board.place_stone(5, 6, BLACK)
+        # Both blacks at (5,5) and (5,6) remain - not captured
+        assert board.get(5, 5) == BLACK
+        assert board.get(5, 6) == BLACK
+
 
 class TestDoubleThree:
     """Test double-three prohibition."""
