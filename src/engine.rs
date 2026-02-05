@@ -488,41 +488,19 @@ impl AIEngine {
         self.searcher.tt_stats()
     }
 
-    /// Check if there's an immediate threat (4-in-a-row) on the board.
-    ///
-    /// This is a quick check to determine if we need full search
-    /// even during opening phase.
-    fn has_immediate_threat(&self, board: &Board, color: Stone) -> bool {
-        // Check both colors for 4-in-a-row threats
-        for check_color in [color, color.opponent()] {
-            if self.find_immediate_win(board, check_color).is_some() {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Get an opening move for early game positions.
     ///
-    /// Returns a quick move without expensive search for sparse boards:
+    /// Returns a quick move without expensive search for very sparse boards:
     /// - Empty board: play center (9,9)
-    /// - Few stones: play adjacent to existing stones near center
+    /// - 1-3 stones: play adjacent to existing stones near center
     ///
-    /// Returns `None` if:
-    /// - Board has enough stones to warrant full search (>8 stones)
-    /// - Any immediate threats exist (4+ in a row)
+    /// Returns `None` if board has 4+ stones to ensure proper threat detection.
     fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
         let stone_count = board.stone_count();
 
-        // Use opening book for early game (0-8 stones)
-        // With few stones, tactical threats are unlikely
-        if stone_count > 8 {
-            return None;
-        }
-
-        // Check for any immediate threats that require full search
-        // Look for 4-in-a-row patterns that need blocking
-        if stone_count >= 4 && self.has_immediate_threat(board, color) {
+        // Only use opening book for first few moves (0-3 stones)
+        // After that, use full search to detect and respond to threats
+        if stone_count > 3 {
             return None;
         }
 
