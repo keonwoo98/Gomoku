@@ -62,8 +62,7 @@ fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePat
             break;
         } else {
             // Empty cell
-            if gap_pos.is_none() && !stones.iter().any(|&s| s > 0 && s < i) {
-                // This might be the space before pattern ends
+            if gap_pos.is_none() {
                 // Check if there's a stone after this gap
                 let next_r = pos.row as i32 + dr * (i + 1);
                 let next_c = pos.col as i32 + dc * (i + 1);
