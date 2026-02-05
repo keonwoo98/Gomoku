@@ -352,7 +352,7 @@ impl AIEngine {
         // 4. Check opponent's threats - must defend!
         let opponent = color.opponent();
 
-        // 4a. Check opponent's immediate win
+        // 4a. Check opponent's immediate win (5-in-a-row possible)
         if let Some(opp_win) = self.find_immediate_win(board, opponent) {
             // Block it if we can
             if is_valid_move(board, opp_win, color) {
@@ -365,7 +365,17 @@ impl AIEngine {
             }
         }
 
-        // 4b. Check opponent's VCF
+        // 4b. Check opponent's four-in-a-row threats (must block or lose)
+        if let Some(block_pos) = self.find_four_threat(board, opponent, color) {
+            return MoveResult::defense(
+                block_pos,
+                -50_000,
+                start.elapsed().as_millis() as u64,
+                1,
+            );
+        }
+
+        // 4c. Check opponent's VCF
         let opp_vcf = self.threat_searcher.search_vcf(board, opponent);
         if opp_vcf.found {
             if let Some(defense) = self.find_best_defense(board, color, &opp_vcf) {
@@ -499,6 +509,73 @@ impl AIEngine {
     #[must_use]
     pub fn tt_stats(&self) -> crate::search::TTStats {
         self.searcher.tt_stats()
+    }
+
+    /// Find opponent's four-in-a-row threat and return blocking position.
+    ///
+    /// Scans the board for patterns where opponent has 4 stones with an open end.
+    /// Returns the position that would complete 5-in-a-row for the opponent.
+    fn find_four_threat(&self, board: &Board, opponent: Stone, color: Stone) -> Option<Pos> {
+        let directions: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+
+        for r in 0..BOARD_SIZE as u8 {
+            for c in 0..BOARD_SIZE as u8 {
+                let pos = Pos::new(r, c);
+                if board.get(pos) != opponent {
+                    continue;
+                }
+
+                // Check each direction from this stone
+                for &(dr, dc) in &directions {
+                    let mut count = 1;
+                    let mut open_ends = Vec::new();
+
+                    // Count in positive direction
+                    let mut nr = r as i8 + dr;
+                    let mut nc = c as i8 + dc;
+                    while nr >= 0 && nr < BOARD_SIZE as i8 && nc >= 0 && nc < BOARD_SIZE as i8 {
+                        let np = Pos::new(nr as u8, nc as u8);
+                        if board.get(np) == opponent {
+                            count += 1;
+                            nr += dr;
+                            nc += dc;
+                        } else if board.get(np) == Stone::Empty {
+                            open_ends.push(np);
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Count in negative direction
+                    nr = r as i8 - dr;
+                    nc = c as i8 - dc;
+                    while nr >= 0 && nr < BOARD_SIZE as i8 && nc >= 0 && nc < BOARD_SIZE as i8 {
+                        let np = Pos::new(nr as u8, nc as u8);
+                        if board.get(np) == opponent {
+                            count += 1;
+                            nr -= dr;
+                            nc -= dc;
+                        } else if board.get(np) == Stone::Empty {
+                            open_ends.push(np);
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // If opponent has 4 in a row with at least one open end, block it
+                    if count >= 4 {
+                        for &end_pos in &open_ends {
+                            if is_valid_move(board, end_pos, color) {
+                                return Some(end_pos);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Get an opening move for early game positions.
