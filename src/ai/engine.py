@@ -582,22 +582,31 @@ class AIEngine:
         Returns a move if one is forced, None otherwise.
 
         Priority:
-        1. Winning move (5 in a row) → Play immediately
-        2. Block opponent's winning move → MUST block
-        3. Create unstoppable threat (open-four) → Play it
-        4. Block opponent's open-four → MUST block
-        5. Block opponent's closed-four → MUST block (or we lose next turn)
+        1. Safe winning move (5 in a row that can't be broken by capture)
+        2. Capture win (10 captures)
+        3. Block opponent's winning move
+        4. Block opponent's capture win threat
+        5. Create unstoppable threat (open-four)
+        6. Block opponent's open-four
+        7. Block opponent's closed-four
+        8. Block opponent's capture threat on our stones
         """
         valid_moves = Rules.get_valid_moves(board, color)
         if not valid_moves:
             return None
 
-        # ==================== PRIORITY 1: WINNING MOVE ====================
+        # ==================== PRIORITY 1: SAFE WINNING MOVE ====================
+        # Only play 5-in-row if opponent can't break it by capture
         for row, col in valid_moves:
             board.place_stone(row, col, color)
             if board.has_five_in_row(color):
-                board.remove_stone(row, col)
-                return (row, col)
+                five_positions = Rules._find_any_five_positions(board, color)
+                if five_positions:
+                    can_break = Rules.can_break_five(board, five_positions, color)
+                    if not can_break:
+                        # Safe 5-in-row! Guaranteed win!
+                        board.remove_stone(row, col)
+                        return (row, col)
             board.remove_stone(row, col)
 
         # ==================== PRIORITY 2: CAPTURE WIN ====================
@@ -608,7 +617,19 @@ class AIEngine:
                 if new_count >= 10:
                     return (row, col)
 
-        # ==================== PRIORITY 3: BLOCK OPPONENT'S WIN ====================
+        # ==================== PRIORITY 3: BLOCK OPPONENT'S CAPTURE WIN ====================
+        # If opponent is close to 10 captures, block their capture opportunities
+        opp_captures = captures.get(opp_color, 0)
+        if opp_captures >= 6:  # Opponent has 6+ captures, danger zone!
+            capture_threats = self._find_opponent_capture_threats(board, opp_color)
+            if capture_threats:
+                # Find moves that block the most capture threats
+                best_block = self._find_best_capture_block(board, color, capture_threats, valid_moves)
+                if best_block and opp_captures >= 8:
+                    # Critical! Must block or opponent wins by capture
+                    return best_block
+
+        # ==================== PRIORITY 4: BLOCK OPPONENT'S WIN ====================
         opponent_winning_moves = []
         for row, col in valid_moves:
             board.place_stone(row, col, opp_color)
@@ -617,11 +638,8 @@ class AIEngine:
             board.remove_stone(row, col)
 
         if len(opponent_winning_moves) == 1:
-            # Only one way to block - MUST play here
             return opponent_winning_moves[0]
         elif len(opponent_winning_moves) > 1:
-            # Multiple winning threats - we can only block one, check if any is also good for us
-            # Try to find a blocking move that also creates our own threat
             for move in opponent_winning_moves:
                 row, col = move
                 board.place_stone(row, col, color)
@@ -629,10 +647,9 @@ class AIEngine:
                     board.remove_stone(row, col)
                     return move
                 board.remove_stone(row, col)
-            # No good counter - just block first one (we're likely losing anyway)
             return opponent_winning_moves[0]
 
-        # ==================== PRIORITY 4: CREATE OPEN-FOUR ====================
+        # ==================== PRIORITY 5: CREATE OPEN-FOUR ====================
         for row, col in valid_moves:
             board.place_stone(row, col, color)
             if self._creates_open_four(board, row, col, color):
@@ -640,7 +657,7 @@ class AIEngine:
                 return (row, col)
             board.remove_stone(row, col)
 
-        # ==================== PRIORITY 5: BLOCK OPPONENT'S OPEN-FOUR ====================
+        # ==================== PRIORITY 6: BLOCK OPPONENT'S OPEN-FOUR ====================
         opp_open_four_threats = []
         for row, col in valid_moves:
             board.place_stone(row, col, opp_color)
@@ -649,10 +666,9 @@ class AIEngine:
             board.remove_stone(row, col)
 
         if opp_open_four_threats:
-            # Must block opponent's open-four threat
             return opp_open_four_threats[0]
 
-        # ==================== PRIORITY 6: BLOCK OPPONENT'S CLOSED-FOUR ====================
+        # ==================== PRIORITY 7: BLOCK OPPONENT'S CLOSED-FOUR ====================
         opp_closed_four_threats = []
         for row, col in valid_moves:
             board.place_stone(row, col, opp_color)
@@ -661,8 +677,6 @@ class AIEngine:
             board.remove_stone(row, col)
 
         if len(opp_closed_four_threats) >= 2:
-            # Multiple closed-four threats = double threat, almost losing
-            # Try to create our own threat while blocking
             for move in opp_closed_four_threats:
                 row, col = move
                 board.place_stone(row, col, color)
@@ -674,7 +688,56 @@ class AIEngine:
         elif len(opp_closed_four_threats) == 1:
             return opp_closed_four_threats[0]
 
+        # ==================== PRIORITY 8: BLOCK OPPONENT'S CAPTURE THREAT ====================
+        # Protect our stones from being captured (pattern: OPP - OURS - OURS - _)
+        capture_threats = self._find_opponent_capture_threats(board, opp_color)
+        if capture_threats:
+            # Block the most dangerous capture threat
+            best_block = self._find_best_capture_block(board, color, capture_threats, valid_moves)
+            if best_block:
+                return best_block
+
         # No forced move - proceed with normal search
+        return None
+
+    def _find_opponent_capture_threats(self, board: Board, opp_color: int) -> list:
+        """
+        Find positions where opponent can capture our stones.
+        Returns list of (capture_pos, captured_stones) tuples.
+        """
+        threats = []
+        my_color = WHITE if opp_color == BLACK else BLACK
+
+        # Check all empty positions for potential captures
+        for r in range(19):
+            for c in range(19):
+                if board.is_empty(r, c):
+                    captures = Rules.get_captured_positions(board, r, c, opp_color)
+                    if captures:
+                        threats.append(((r, c), captures))
+        return threats
+
+    def _find_best_capture_block(self, board: Board, color: int,
+                                  capture_threats: list, valid_moves: list) -> Optional[tuple]:
+        """
+        Find the best move to block opponent's capture threats.
+        Returns the blocking move or None.
+        """
+        if not capture_threats:
+            return None
+
+        # Sort by number of stones that would be captured (most dangerous first)
+        capture_threats.sort(key=lambda x: len(x[1]), reverse=True)
+
+        # Strategy 1: Play at the capture position ourselves (if valid)
+        for capture_pos, captured_stones in capture_threats:
+            if capture_pos in valid_moves:
+                # Playing here prevents opponent from capturing
+                return capture_pos
+
+        # Strategy 2: Move one of the threatened stones
+        # (This is complex and may not always be possible)
+
         return None
 
     def _creates_open_four(self, board: Board, row: int, col: int, color: int) -> bool:
