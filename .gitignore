@@ -1,28 +1,11 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
-# Virtual environments
-venv/
-.venv/
-ENV/
+# Rust build artifacts
+engine/target/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
 
 # OS
 .DS_Store
@@ -31,6 +14,3 @@ Thumbs.db
 # Project specific
 Gomoku.pdf
 Gomoku
-
-# Rust build artifacts
-engine/target/
