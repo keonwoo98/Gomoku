@@ -5,10 +5,7 @@ Evaluates board positions using pattern-based scoring.
 
 from ..game.board import Board, BLACK, WHITE, EMPTY, BOARD_SIZE
 from ..game.rules import Rules
-from .patterns import (
-    PatternScore, ATTACK_PATTERNS, get_pattern_score,
-    line_to_string, count_pattern
-)
+from .patterns import PatternScore
 
 
 # Direction vectors for line extraction
@@ -27,14 +24,29 @@ class Heuristic:
     """
 
     # Weights for different factors
-    ATTACK_WEIGHT = 1.0
-    DEFENSE_WEIGHT = 1.1  # Slightly prioritize defense
-    CAPTURE_WEIGHT = 1.2
+    # AI must play to WIN - but DEFENSE FIRST to not lose!
+    # "You can't win if you lose first"
+    ATTACK_WEIGHT = 1.3   # Still aggressive
+    DEFENSE_WEIGHT = 1.6  # Defense priority - must not lose
+    CAPTURE_WEIGHT = 1.3  # Captures are powerful
     CENTER_WEIGHT = 0.1
 
     # Winning/losing scores
     WIN_SCORE = 1_000_000
     LOSE_SCORE = -1_000_000
+
+    # Pattern scores for fast evaluation (avoid hardcoding in methods)
+    SCORE_FIVE = 500_000
+    SCORE_OPEN_FOUR = 100_000
+    SCORE_CLOSED_FOUR = 50_000
+    SCORE_OPEN_THREE = 10_000
+    SCORE_CLOSED_THREE = 1_000
+    SCORE_OPEN_TWO = 500
+    SCORE_CLOSED_TWO = 50
+
+    # Capture proximity bonus
+    CAPTURE_NEAR_WIN_BONUS = 2000
+    CAPTURE_NEAR_WIN_DANGER = 2500
 
     def __init__(self):
         # Cache for evaluated positions
@@ -75,6 +87,39 @@ class Heuristic:
         if board.has_five_in_row(opp_color):
             return self.LOSE_SCORE
 
+        # Check for unstoppable threats (open-four)
+        # Open-four means opponent wins next turn unless we have 5 or capture
+        if self._has_open_four(board, opp_color):
+            return self.LOSE_SCORE // 2  # Very bad, almost losing
+        if self._has_open_four(board, color):
+            return self.WIN_SCORE // 2  # Very good, almost winning
+
+        # Check for threatening patterns (open-three and closed-four)
+        # These patterns can lead to unstoppable wins
+
+        # CRITICAL: Check for closed-four (4 in a row with at least one end open)
+        # This is an immediate threat that must be blocked!
+        if self._has_closed_four(board, opp_color):
+            return self.LOSE_SCORE // 3  # = -333,333 (very dangerous)
+        if self._has_closed_four(board, color):
+            return self.WIN_SCORE // 3  # = +333,333
+
+        # Check for open-three (3 in a row with both ends open)
+        # CRITICAL: Check opponent's threat FIRST (defense priority)
+        opp_open_threes = self._count_open_threes(board, opp_color)
+        if opp_open_threes >= 1:
+            return self.LOSE_SCORE // 4  # = -250,000
+
+        my_open_threes = self._count_open_threes(board, color)
+        if my_open_threes >= 1:
+            return self.WIN_SCORE // 4  # = +250,000
+
+        # Check for closed-three (3 in a row with one end open)
+        # Less dangerous but still needs attention
+        opp_closed_threes = self._count_closed_threes(board, opp_color)
+        if opp_closed_threes >= 2:  # Multiple closed-threes are dangerous
+            return self.LOSE_SCORE // 6  # = -166,666
+
         # Fast evaluation: only scan existing stones
         my_score = self._fast_evaluate(board, color, opp_color)
         opp_score = self._fast_evaluate(board, opp_color, color)
@@ -86,9 +131,9 @@ class Heuristic:
 
         # Extra bonus near capture win
         if my_captures >= 8:
-            capture_diff += 2000
+            capture_diff += self.CAPTURE_NEAR_WIN_BONUS
         if opp_captures >= 8:
-            capture_diff -= 2500
+            capture_diff -= self.CAPTURE_NEAR_WIN_DANGER
 
         return int(my_score * self.ATTACK_WEIGHT -
                    opp_score * self.DEFENSE_WEIGHT + capture_diff)
@@ -162,105 +207,17 @@ class Heuristic:
             else:  # Opponent
                 break
 
-        # Score based on pattern length
+        # Score based on pattern length (high values to prioritize tactical play)
         if consecutive >= 5:
-            return 100000
+            return self.SCORE_FIVE
         elif consecutive == 4:
-            return 10000 if space_after >= 1 else 1000
+            return self.SCORE_OPEN_FOUR if space_after >= 1 else self.SCORE_CLOSED_FOUR
         elif consecutive == 3:
-            return 1000 if space_after >= 2 else 100
+            return self.SCORE_OPEN_THREE if space_after >= 2 else self.SCORE_CLOSED_THREE
         elif consecutive == 2:
-            return 100 if space_after >= 2 else 10
+            return self.SCORE_OPEN_TWO if space_after >= 2 else self.SCORE_CLOSED_TWO
 
         return 0
-
-    def _evaluate_patterns(self, board: Board, color: int, opp_color: int) -> int:
-        """Evaluate pattern-based score for a color."""
-        total_score = 0
-
-        # Scan all lines on the board
-        for row in range(BOARD_SIZE):
-            for col in range(BOARD_SIZE):
-                if board.get(row, col) != color:
-                    continue
-
-                # Check each direction from this stone
-                for dr, dc in DIRECTIONS:
-                    line = self._extract_line(board, row, col, dr, dc, 9)
-                    score = get_pattern_score(line, color, opp_color)
-                    total_score += score
-
-        # Divide by 2 because patterns are counted from both ends
-        return total_score // 2
-
-    def _extract_line(self, board: Board, row: int, col: int,
-                      dr: int, dc: int, length: int) -> list:
-        """Extract a line of stones centered at (row, col)."""
-        half = length // 2
-        line = []
-
-        for i in range(-half, half + 1):
-            r, c = row + i * dr, col + i * dc
-            if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
-                line.append(board.get(r, c))
-            else:
-                line.append(-1)  # Out of bounds marker
-
-        return line
-
-    def _evaluate_captures(self, board: Board, color: int, opp_color: int,
-                          captures: dict) -> int:
-        """Evaluate capture-related scoring."""
-        score = 0
-
-        my_captures = captures.get(color, 0)
-        opp_captures = captures.get(opp_color, 0)
-
-        # Score for captures already made
-        score += my_captures * PatternScore.CAPTURE_MADE
-        score -= opp_captures * PatternScore.CAPTURE_MADE
-
-        # Bonus for being close to capture win
-        if my_captures >= 8:
-            score += PatternScore.FOUR_CAPTURES
-        if opp_captures >= 8:
-            score -= PatternScore.FOUR_CAPTURES
-
-        # Count capture threats
-        my_threats = self._count_capture_threats(board, color)
-        opp_threats = self._count_capture_threats(board, opp_color)
-
-        score += my_threats * PatternScore.CAPTURE_THREAT
-        score -= opp_threats * PatternScore.CAPTURE_DANGER
-
-        return score
-
-    def _count_capture_threats(self, board: Board, color: int) -> int:
-        """Count number of positions where color can capture."""
-        threats = 0
-        candidates = board.get_adjacent_empty(radius=1)
-
-        for row, col in candidates:
-            captures = Rules.check_captures(board, row, col, color)
-            threats += len(captures)
-
-        return threats
-
-    def _evaluate_positions(self, board: Board, color: int, opp_color: int) -> int:
-        """Evaluate positional factors like center control."""
-        score = 0
-
-        for row in range(BOARD_SIZE):
-            for col in range(BOARD_SIZE):
-                stone = board.get(row, col)
-                bonus = self._center_bonus[(row, col)]
-
-                if stone == color:
-                    score += bonus
-                elif stone == opp_color:
-                    score -= bonus
-
-        return score
 
     def evaluate_move(self, board: Board, row: int, col: int, color: int,
                       captures: dict) -> int:
@@ -333,6 +290,237 @@ class Heuristic:
                 score += PatternScore.OPEN_TWO if open_ends == 2 else PatternScore.TWO
 
         return score
+
+    def _count_open_threes(self, board: Board, color: int) -> int:
+        """
+        Count open-three patterns (3 in a row with both ends open).
+        Open-three can become open-four with one move, which is unstoppable.
+        """
+        count = 0
+        stones = board.black if color == BLACK else board.white
+        if not stones:
+            return 0
+
+        checked = set()  # Avoid counting same pattern multiple times
+
+        temp_stones = stones
+        while temp_stones:
+            bit = (temp_stones & -temp_stones).bit_length() - 1
+            row, col = bit // BOARD_SIZE, bit % BOARD_SIZE
+
+            for dr, dc in DIRECTIONS:
+                pattern_key = self._get_line_key(board, row, col, dr, dc, color)
+                if pattern_key and pattern_key not in checked:
+                    if self._is_open_three_at(board, row, col, dr, dc, color):
+                        count += 1
+                        checked.add(pattern_key)
+
+            temp_stones &= temp_stones - 1
+
+        return count
+
+    def _get_line_key(self, board: Board, row: int, col: int,
+                      dr: int, dc: int, color: int) -> tuple:
+        """Get a unique key for a line of stones (for deduplication)."""
+        positions = [(row, col)]
+        # Extend in positive direction
+        r, c = row + dr, col + dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            positions.append((r, c))
+            r, c = r + dr, c + dc
+        # Extend in negative direction
+        r, c = row - dr, col - dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            positions.append((r, c))
+            r, c = r - dr, c - dc
+
+        if len(positions) < 3:
+            return None
+        positions.sort()
+        return tuple(positions)
+
+    def _is_open_three_at(self, board: Board, row: int, col: int,
+                          dr: int, dc: int, color: int) -> bool:
+        """Check if there's an open-three through (row, col) in direction (dr, dc)."""
+        # Count consecutive stones including this one
+        count = 1
+
+        # Positive direction
+        r, c = row + dr, col + dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r + dr, c + dc
+        pos_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+        # Check if there's space for extension (not just one empty)
+        pos_space = pos_end_open
+        if pos_end_open:
+            nr, nc = r + dr, c + dc
+            pos_space = not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and
+                            board.get(nr, nc) != EMPTY and board.get(nr, nc) != color)
+
+        # Negative direction
+        r, c = row - dr, col - dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r - dr, c - dc
+        neg_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+        neg_space = neg_end_open
+        if neg_end_open:
+            nr, nc = r - dr, c - dc
+            neg_space = not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and
+                            board.get(nr, nc) != EMPTY and board.get(nr, nc) != color)
+
+        # Open-three: exactly 3 consecutive with both ends open and room to grow
+        return count == 3 and pos_end_open and neg_end_open and (pos_space or neg_space)
+
+    def _has_open_four(self, board: Board, color: int) -> bool:
+        """
+        Check if color has an open-four (4 in a row with both ends open).
+        Open-four is unstoppable - guaranteed win next move.
+        """
+        stones = board.black if color == BLACK else board.white
+        if not stones:
+            return False
+
+        # Check each stone for open-four pattern
+        temp_stones = stones
+        while temp_stones:
+            bit = (temp_stones & -temp_stones).bit_length() - 1
+            row, col = bit // BOARD_SIZE, bit % BOARD_SIZE
+
+            for dr, dc in DIRECTIONS:
+                if self._is_open_four_at(board, row, col, dr, dc, color):
+                    return True
+
+            temp_stones &= temp_stones - 1
+
+        return False
+
+    def _is_open_four_at(self, board: Board, row: int, col: int,
+                         dr: int, dc: int, color: int) -> bool:
+        """Check if there's an open-four through (row, col) in direction (dr, dc)."""
+        # Count consecutive stones including this one
+        count = 1
+
+        # Positive direction
+        r, c = row + dr, col + dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r + dr, c + dc
+        pos_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Negative direction
+        r, c = row - dr, col - dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r - dr, c - dc
+        neg_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Open-four: exactly 4 consecutive with both ends open
+        return count == 4 and pos_end_open and neg_end_open
+
+    def _has_closed_four(self, board: Board, color: int) -> bool:
+        """
+        Check if color has a closed-four (4 in a row with at least one end open).
+        Closed-four requires immediate blocking!
+        """
+        stones = board.black if color == BLACK else board.white
+        if not stones:
+            return False
+
+        temp_stones = stones
+        while temp_stones:
+            bit = (temp_stones & -temp_stones).bit_length() - 1
+            row, col = bit // BOARD_SIZE, bit % BOARD_SIZE
+
+            for dr, dc in DIRECTIONS:
+                if self._is_closed_four_at(board, row, col, dr, dc, color):
+                    return True
+
+            temp_stones &= temp_stones - 1
+
+        return False
+
+    def _is_closed_four_at(self, board: Board, row: int, col: int,
+                           dr: int, dc: int, color: int) -> bool:
+        """Check if there's a closed-four (4 consecutive with at least one end open)."""
+        count = 1
+
+        # Positive direction
+        r, c = row + dr, col + dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r + dr, c + dc
+        pos_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Negative direction
+        r, c = row - dr, col - dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r - dr, c - dc
+        neg_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Closed-four: 4 consecutive with at least one end open (but not both - that's open-four)
+        return count == 4 and (pos_end_open or neg_end_open) and not (pos_end_open and neg_end_open)
+
+    def _count_closed_threes(self, board: Board, color: int) -> int:
+        """
+        Count closed-three patterns (3 in a row with exactly one end open).
+        Less dangerous than open-three but still needs attention.
+        """
+        count = 0
+        stones = board.black if color == BLACK else board.white
+        if not stones:
+            return 0
+
+        checked = set()
+
+        temp_stones = stones
+        while temp_stones:
+            bit = (temp_stones & -temp_stones).bit_length() - 1
+            row, col = bit // BOARD_SIZE, bit % BOARD_SIZE
+
+            for dr, dc in DIRECTIONS:
+                pattern_key = self._get_line_key(board, row, col, dr, dc, color)
+                if pattern_key and pattern_key not in checked:
+                    if self._is_closed_three_at(board, row, col, dr, dc, color):
+                        count += 1
+                        checked.add(pattern_key)
+
+            temp_stones &= temp_stones - 1
+
+        return count
+
+    def _is_closed_three_at(self, board: Board, row: int, col: int,
+                            dr: int, dc: int, color: int) -> bool:
+        """Check if there's a closed-three (3 consecutive with exactly one end open)."""
+        count = 1
+
+        # Positive direction
+        r, c = row + dr, col + dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r + dr, c + dc
+        pos_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Negative direction
+        r, c = row - dr, col - dc
+        while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board.get(r, c) == color:
+            count += 1
+            r, c = r - dr, c - dc
+        neg_end_open = (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and
+                        board.get(r, c) == EMPTY)
+
+        # Closed-three: exactly 3 consecutive with exactly one end open
+        # (XOR: one open but not both)
+        return count == 3 and (pos_end_open != neg_end_open)
 
     def clear_cache(self):
         """Clear the evaluation cache."""

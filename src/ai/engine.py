@@ -53,24 +53,27 @@ class AIEngine:
     # Default settings
     DEFAULT_TIME_LIMIT = 0.5
     DEFAULT_MAX_DEPTH = 20
-    MIN_DEPTH = 4  # Minimum depth to search
+    MIN_DEPTH = 5  # Minimum depth to search (must be >= 5 to detect open-four threats)
 
     # Null Move Pruning settings
-    NMP_MIN_DEPTH = 3  # Only apply NMP at depth >= 3
+    NMP_MIN_DEPTH = 4  # Only apply NMP at depth >= 4 (more conservative)
     NMP_REDUCTION = 2  # Depth reduction for null move
 
     # Late Move Reduction settings
-    LMR_MIN_DEPTH = 3  # Only apply LMR at depth >= 3
-    LMR_MIN_MOVES = 4  # Apply after searching this many moves
+    LMR_MIN_DEPTH = 4  # Only apply LMR at depth >= 4 (more conservative)
+    LMR_MIN_MOVES = 6  # Apply after searching this many moves (was 4)
 
     # Aspiration Window settings
     ASP_WINDOW = 50  # Initial window size
     ASP_MIN_DEPTH = 100  # Disabled for now (was 4)
 
-    def __init__(self):
+    def __init__(self, max_depth: int = DEFAULT_MAX_DEPTH):
         self.heuristic = Heuristic()
         self.move_gen = MoveGenerator(self.heuristic)
         self.tt = TranspositionTable(size_mb=16)
+
+        # Configurable settings
+        self.max_depth = max_depth
 
         # Search state
         self.node_count = 0
@@ -91,6 +94,12 @@ class AIEngine:
         # Best move storage for each depth
         self.best_moves_at_depth = {}
         self.best_score_at_depth = {}
+
+    def set_difficulty(self, max_depth: int, time_limit: float = None):
+        """Set AI difficulty parameters."""
+        self.max_depth = max_depth
+        if time_limit is not None:
+            self.time_limit = time_limit
 
     def get_move(self, board: Board, color: int, captures: dict,
                  time_limit: float = DEFAULT_TIME_LIMIT) -> tuple:
@@ -124,6 +133,22 @@ class AIEngine:
         # Reset debug info
         self.debug_info = AIDebugInfo()
 
+        opp_color = self._opposite(color)
+
+        # ==================== FORCED MOVE CHECK ====================
+        # Check for immediate winning/blocking moves BEFORE search
+        # This ensures we NEVER miss critical tactical moves!
+
+        forced_move = self._check_forced_moves(board, color, opp_color, captures)
+        if forced_move:
+            self.debug_info.thinking_time = time.time() - self.start_time
+            self.debug_info.best_move = forced_move
+            self.debug_info.best_score = self.WIN_SCORE
+            self.debug_info.search_depth = 1
+            return forced_move
+
+        # ==================== END FORCED MOVE CHECK ====================
+
         best_move = None
         best_score = -self.INF
         all_root_scores = []
@@ -134,7 +159,7 @@ class AIEngine:
             self.move_gen.last_opponent_move = (last_move[0], last_move[1])
 
         # Iterative Deepening with Aspiration Windows
-        for depth in range(1, self.DEFAULT_MAX_DEPTH + 1):
+        for depth in range(1, self.max_depth + 1):
             # Check time before starting new depth
             elapsed = time.time() - self.start_time
             if depth > self.MIN_DEPTH and elapsed > time_limit * 0.8:
@@ -391,9 +416,15 @@ class AIEngine:
 
         # ==================== NULL MOVE PRUNING ====================
         # Skip if: too shallow, or already did null move, or very few stones
+        # CRITICAL: Also skip if opponent has threatening patterns!
+        opp_has_threat = (self.heuristic._has_closed_four(board, opp_color) or
+                         self.heuristic._count_open_threes(board, opp_color) > 0 or
+                         self.heuristic._count_closed_threes(board, opp_color) >= 2)
+
         if (allow_null and
             depth >= self.NMP_MIN_DEPTH and
-            board.count_stones(color) + board.count_stones(opp_color) > 4):
+            board.count_stones(color) + board.count_stones(opp_color) > 4 and
+            not opp_has_threat):  # Don't use NMP when opponent has threats!
 
             # Null move: pass turn to opponent
             null_score = -self._alphabeta(
@@ -435,10 +466,12 @@ class AIEngine:
             is_killer = depth in self.move_gen.killer_moves and move in self.move_gen.killer_moves[depth]
 
             # LMR: reduce depth for late, quiet moves
+            # CRITICAL: Don't apply LMR when opponent has threats!
             if (moves_searched >= self.LMR_MIN_MOVES and
                 depth >= self.LMR_MIN_DEPTH and
                 not is_capture and
-                not is_killer):
+                not is_killer and
+                not opp_has_threat):  # Don't use LMR when opponent has threats!
 
                 # Calculate reduction
                 reduction = 1
@@ -531,7 +564,7 @@ class AIEngine:
             'lmr_reductions': self.lmr_reductions,
             'lmr_researches': self.lmr_researches,
             'tt_hit_rate': tt_stats['hit_rate'],
-            'tt_filled': tt_stats['filled'],
+            'tt_filled': tt_stats['fill_rate'],
         }
 
     def suggest_move(self, board: Board, color: int, captures: dict,
@@ -541,3 +574,160 @@ class AIEngine:
         Uses shorter time limit than regular search.
         """
         return self.get_move(board, color, captures, time_limit)
+
+    def _check_forced_moves(self, board: Board, color: int, opp_color: int,
+                            captures: dict) -> Optional[tuple]:
+        """
+        Check for forced moves that MUST be played.
+        Returns a move if one is forced, None otherwise.
+
+        Priority:
+        1. Winning move (5 in a row) → Play immediately
+        2. Block opponent's winning move → MUST block
+        3. Create unstoppable threat (open-four) → Play it
+        4. Block opponent's open-four → MUST block
+        5. Block opponent's closed-four → MUST block (or we lose next turn)
+        """
+        valid_moves = Rules.get_valid_moves(board, color)
+        if not valid_moves:
+            return None
+
+        # ==================== PRIORITY 1: WINNING MOVE ====================
+        for row, col in valid_moves:
+            board.place_stone(row, col, color)
+            if board.has_five_in_row(color):
+                board.remove_stone(row, col)
+                return (row, col)
+            board.remove_stone(row, col)
+
+        # ==================== PRIORITY 2: CAPTURE WIN ====================
+        for row, col in valid_moves:
+            capture_pos = Rules.get_captured_positions(board, row, col, color)
+            if capture_pos:
+                new_count = captures.get(color, 0) + len(capture_pos)
+                if new_count >= 10:
+                    return (row, col)
+
+        # ==================== PRIORITY 3: BLOCK OPPONENT'S WIN ====================
+        opponent_winning_moves = []
+        for row, col in valid_moves:
+            board.place_stone(row, col, opp_color)
+            if board.has_five_in_row(opp_color):
+                opponent_winning_moves.append((row, col))
+            board.remove_stone(row, col)
+
+        if len(opponent_winning_moves) == 1:
+            # Only one way to block - MUST play here
+            return opponent_winning_moves[0]
+        elif len(opponent_winning_moves) > 1:
+            # Multiple winning threats - we can only block one, check if any is also good for us
+            # Try to find a blocking move that also creates our own threat
+            for move in opponent_winning_moves:
+                row, col = move
+                board.place_stone(row, col, color)
+                if self._creates_open_four(board, row, col, color):
+                    board.remove_stone(row, col)
+                    return move
+                board.remove_stone(row, col)
+            # No good counter - just block first one (we're likely losing anyway)
+            return opponent_winning_moves[0]
+
+        # ==================== PRIORITY 4: CREATE OPEN-FOUR ====================
+        for row, col in valid_moves:
+            board.place_stone(row, col, color)
+            if self._creates_open_four(board, row, col, color):
+                board.remove_stone(row, col)
+                return (row, col)
+            board.remove_stone(row, col)
+
+        # ==================== PRIORITY 5: BLOCK OPPONENT'S OPEN-FOUR ====================
+        opp_open_four_threats = []
+        for row, col in valid_moves:
+            board.place_stone(row, col, opp_color)
+            if self._creates_open_four(board, row, col, opp_color):
+                opp_open_four_threats.append((row, col))
+            board.remove_stone(row, col)
+
+        if opp_open_four_threats:
+            # Must block opponent's open-four threat
+            return opp_open_four_threats[0]
+
+        # ==================== PRIORITY 6: BLOCK OPPONENT'S CLOSED-FOUR ====================
+        opp_closed_four_threats = []
+        for row, col in valid_moves:
+            board.place_stone(row, col, opp_color)
+            if self._creates_closed_four(board, row, col, opp_color):
+                opp_closed_four_threats.append((row, col))
+            board.remove_stone(row, col)
+
+        if len(opp_closed_four_threats) >= 2:
+            # Multiple closed-four threats = double threat, almost losing
+            # Try to create our own threat while blocking
+            for move in opp_closed_four_threats:
+                row, col = move
+                board.place_stone(row, col, color)
+                if self._creates_closed_four(board, row, col, color):
+                    board.remove_stone(row, col)
+                    return move
+                board.remove_stone(row, col)
+            return opp_closed_four_threats[0]
+        elif len(opp_closed_four_threats) == 1:
+            return opp_closed_four_threats[0]
+
+        # No forced move - proceed with normal search
+        return None
+
+    def _creates_open_four(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) creates an open four (4 with both ends open)."""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            if count == 4 and open_ends == 2:
+                return True
+
+        return False
+
+    def _creates_closed_four(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) creates a closed four (4 with at least one end open)."""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Closed-four: 4 consecutive with at least one end open
+            if count == 4 and open_ends >= 1:
+                return True
+
+        return False

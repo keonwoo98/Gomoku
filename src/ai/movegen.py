@@ -59,10 +59,19 @@ class MoveGenerator:
         Returns:
             List of (row, col) tuples, ordered by expected quality
         """
+        opp_color = WHITE if color == BLACK else BLACK
+
+        # CRITICAL: First check for immediate threats that MUST be addressed
+        # This ensures we don't miss winning/blocking moves due to radius limits
+        critical_moves = self._find_critical_moves(board, color, opp_color)
+
         # Get all candidate positions (near existing stones)
         # Use smaller radius at deeper depths for pruning
         radius = 2 if depth >= 3 else 1
         candidates = board.get_adjacent_empty(radius=radius)
+
+        # Merge critical moves into candidates (they might be outside radius)
+        candidates = candidates.union(critical_moves)
 
         # If board is empty, return center
         if not candidates:
@@ -99,16 +108,76 @@ class MoveGenerator:
                     tt_move: Optional[tuple] = None) -> int:
         """
         Score a move for ordering purposes.
-        Ultra-optimized: Minimal computation for fast move ordering.
+        Prioritizes tactical moves (wins, blocks) over positional heuristics.
         """
         row, col = move
+        opp_color = WHITE if color == BLACK else BLACK
 
-        # Priority levels (return immediately for high-priority moves)
-        # 1. TT move
+        # Priority 0: Check for IMMEDIATE WINNING MOVE
+        board.place_stone(row, col, color)
+        if board.has_five_in_row(color):
+            board.remove_stone(row, col)
+            return 100_000_000  # Highest priority - we win!
+        board.remove_stone(row, col)
+
+        # Priority 0.5: Check for BLOCKING OPPONENT'S WIN
+        board.place_stone(row, col, opp_color)
+        if board.has_five_in_row(opp_color):
+            board.remove_stone(row, col)
+            return 90_000_000  # Must block or we lose!
+        board.remove_stone(row, col)
+
+        # Priority 1: Check for creating OPEN FOUR (unstoppable threat)
+        board.place_stone(row, col, color)
+        if self._creates_open_four(board, row, col, color):
+            board.remove_stone(row, col)
+            return 80_000_000
+        board.remove_stone(row, col)
+
+        # Priority 1.5: Block opponent's open four threat
+        board.place_stone(row, col, opp_color)
+        if self._creates_open_four(board, row, col, opp_color):
+            board.remove_stone(row, col)
+            return 70_000_000
+        board.remove_stone(row, col)
+
+        # Priority 1.6: Block opponent's closed-four threat (4 in a row, at least one end open)
+        # This is CRITICAL - higher than our own open-four because opponent moves first!
+        board.place_stone(row, col, opp_color)
+        if self._creates_closed_four(board, row, col, opp_color):
+            board.remove_stone(row, col)
+            return 85_000_000  # Higher than our open-four (80M) - defense first!
+        board.remove_stone(row, col)
+
+        # Priority 1.7: Block opponent's three-to-four extension
+        # If opponent places here, they go from 3 to 4 - very dangerous!
+        board.place_stone(row, col, opp_color)
+        if self._creates_three_in_row(board, row, col, opp_color):
+            board.remove_stone(row, col)
+            return 55_000_000  # Block 3->4 extension early!
+        board.remove_stone(row, col)
+
+        # Priority 1.8: Block opponent's two-to-three extension (open two becoming open three)
+        # Preventive defense - stop threats before they become dangerous!
+        board.place_stone(row, col, opp_color)
+        if self._creates_open_two_extension(board, row, col, opp_color):
+            board.remove_stone(row, col)
+            return 30_000_000  # Block 2->3 extension proactively!
+        board.remove_stone(row, col)
+
+        # Priority 2: Capture move that wins
+        capture_positions = Rules.get_captured_positions(board, row, col, color)
+        if capture_positions:
+            new_captures = captures.get(color, 0) + len(capture_positions)
+            if new_captures >= 10:
+                return 95_000_000  # Win by capture
+
+        # Priority levels for move ordering heuristics
+        # 3. TT move
         if tt_move and move == tt_move:
             return 20_000_000
 
-        # 2. Previous iteration's best
+        # 4. Previous iteration's best
         if prev_best and move == prev_best:
             return 10_000_000
 
@@ -150,6 +219,178 @@ class MoveGenerator:
         score += adjacency_bonus
 
         return score
+
+    def _find_critical_moves(self, board: Board, color: int, opp_color: int) -> set:
+        """
+        Find critical moves that MUST be considered regardless of radius.
+        Scans sliding windows of 5 across all lines to find:
+        1. Winning moves (complete 5 in a row)
+        2. Blocking moves (prevent opponent's 5 in a row)
+        3. Strong threats (4 in a row with gaps)
+        """
+        critical = set()
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+        # Scan all possible 5-position windows
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                for dr, dc in directions:
+                    # Check if this 5-window fits on board
+                    end_r, end_c = r + 4 * dr, c + 4 * dc
+                    if not Board.is_valid_pos(end_r, end_c):
+                        continue
+
+                    # Analyze the 5-position window
+                    window = []
+                    positions = []
+                    for i in range(5):
+                        pr, pc = r + i * dr, c + i * dc
+                        window.append(board.get(pr, pc))
+                        positions.append((pr, pc))
+
+                    # Check for both colors
+                    for check_color in [color, opp_color]:
+                        other = opp_color if check_color == color else color
+                        color_count = window.count(check_color)
+                        empty_count = window.count(EMPTY)
+                        other_count = window.count(other)
+
+                        # CRITICAL: 4 stones + 1 empty = winning/blocking move
+                        if color_count == 4 and empty_count == 1 and other_count == 0:
+                            for i, v in enumerate(window):
+                                if v == EMPTY:
+                                    critical.add(positions[i])
+
+                        # IMPORTANT: 3 stones + 2 empty = potential open-four
+                        if color_count == 3 and empty_count == 2 and other_count == 0:
+                            for i, v in enumerate(window):
+                                if v == EMPTY:
+                                    critical.add(positions[i])
+
+        return critical
+
+    def _creates_open_four(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) creates an open four (4 with both ends open)."""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            if count == 4 and open_ends == 2:
+                return True
+
+        return False
+
+    def _creates_closed_four(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) creates a closed four (4 with at least one end open)."""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Closed-four: 4 consecutive with at least one end open (includes open-four)
+            if count == 4 and open_ends >= 1:
+                return True
+
+        return False
+
+    def _creates_three_in_row(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) creates a three with at least one end open.
+        This means opponent is building toward a four - need to block early!"""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            if Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY:
+                open_ends += 1
+
+            # Three with at least one open end - opponent can extend to four
+            if count == 3 and open_ends >= 1:
+                return True
+
+        return False
+
+    def _creates_open_two_extension(self, board: Board, row: int, col: int, color: int) -> bool:
+        """Check if placing at (row, col) extends an open two to an open three.
+        This is preventive defense - stop patterns before they become dangerous!"""
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            count = 1
+            open_ends = 0
+
+            # Positive direction
+            r, c = row + dr, col + dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r + dr, c + dc
+            pos_open = Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY
+            if pos_open:
+                open_ends += 1
+                # Check for additional space beyond
+                nr, nc = r + dr, c + dc
+                if Board.is_valid_pos(nr, nc) and board.get(nr, nc) == EMPTY:
+                    open_ends += 1  # Extra space = more dangerous
+
+            # Negative direction
+            r, c = row - dr, col - dc
+            while Board.is_valid_pos(r, c) and board.get(r, c) == color:
+                count += 1
+                r, c = r - dr, c - dc
+            neg_open = Board.is_valid_pos(r, c) and board.get(r, c) == EMPTY
+            if neg_open:
+                open_ends += 1
+                # Check for additional space beyond
+                nr, nc = r - dr, c - dc
+                if Board.is_valid_pos(nr, nc) and board.get(nr, nc) == EMPTY:
+                    open_ends += 1  # Extra space = more dangerous
+
+            # Open three (3 stones with both ends open) - very dangerous pattern
+            if count == 3 and open_ends >= 3:  # Both ends open with room to grow
+                return True
+
+        return False
 
     def record_killer(self, move: tuple, depth: int):
         """Record a killer move at a depth."""
