@@ -31,3 +31,6 @@ Thumbs.db
 # Project specific
 Gomoku.pdf
 Gomoku
+
+# Rust build artifacts
+engine/target/
