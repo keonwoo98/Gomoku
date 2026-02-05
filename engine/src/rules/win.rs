@@ -35,6 +35,21 @@ pub fn find_five_positions(board: &Board, stone: Stone) -> Option<Vec<Pos>> {
         for &(dr, dc) in &DIRECTIONS {
             let mut line = vec![pos];
 
+            // Extend in negative direction first
+            for i in 1..5 {
+                let r = pos.row as i32 - dr * i;
+                let c = pos.col as i32 - dc * i;
+                if !Pos::is_valid(r, c) {
+                    break;
+                }
+                let prev = Pos::new(r as u8, c as u8);
+                if board.get(prev) == stone {
+                    line.insert(0, prev);
+                } else {
+                    break;
+                }
+            }
+
             // Extend in positive direction
             for i in 1..5 {
                 let r = pos.row as i32 + dr * i;
