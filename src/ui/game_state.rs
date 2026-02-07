@@ -1,6 +1,6 @@
 //! Game state management for the Gomoku GUI
 
-use crate::{AIEngine, Board, MoveResult, Pos, Stone};
+use crate::{AIEngine, Board, MoveResult, Pos, Stone, ai_log, pos_to_notation, rules};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ impl Default for GameMode {
 pub enum AiState {
     Idle,
     Thinking {
-        receiver: Receiver<MoveResult>,
+        receiver: Receiver<(MoveResult, AIEngine)>,
         start_time: Instant,
     },
 }
@@ -61,6 +61,63 @@ impl CaptureAnimation {
     }
 }
 
+/// Cumulative AI statistics across a game
+#[derive(Default, Clone)]
+pub struct AiStats {
+    /// Number of AI moves made
+    pub move_count: u32,
+    /// Total time spent by AI (ms)
+    pub total_time_ms: u64,
+    /// Total nodes searched across all moves
+    pub total_nodes: u64,
+    /// Maximum depth reached in any single move
+    pub max_depth: i8,
+    /// Fastest move (ms)
+    pub min_time_ms: u64,
+    /// Slowest move (ms)
+    pub max_time_ms: u64,
+    /// History of per-move times for display
+    pub move_times: Vec<u64>,
+    /// History of per-move depths
+    pub move_depths: Vec<i8>,
+}
+
+impl AiStats {
+    pub fn record(&mut self, result: &MoveResult) {
+        self.move_count += 1;
+        self.total_time_ms += result.time_ms;
+        self.total_nodes += result.nodes;
+        if result.depth > self.max_depth {
+            self.max_depth = result.depth;
+        }
+        if self.move_count == 1 {
+            self.min_time_ms = result.time_ms;
+            self.max_time_ms = result.time_ms;
+        } else {
+            if result.time_ms < self.min_time_ms {
+                self.min_time_ms = result.time_ms;
+            }
+            if result.time_ms > self.max_time_ms {
+                self.max_time_ms = result.time_ms;
+            }
+        }
+        self.move_times.push(result.time_ms);
+        self.move_depths.push(result.depth);
+    }
+
+    pub fn avg_time_ms(&self) -> f64 {
+        if self.move_count == 0 { 0.0 } else { self.total_time_ms as f64 / self.move_count as f64 }
+    }
+
+    pub fn avg_depth(&self) -> f64 {
+        if self.move_depths.is_empty() { 0.0 } else { self.move_depths.iter().map(|&d| d as f64).sum::<f64>() / self.move_depths.len() as f64 }
+    }
+
+    pub fn avg_nps(&self) -> u64 {
+        if self.total_time_ms == 0 { 0 } else { self.total_nodes * 1000 / self.total_time_ms / 1000 }
+    }
+}
+
 /// Main game state
 pub struct GameState {
     pub board: Board,
@@ -75,6 +132,14 @@ pub struct GameState {
     pub suggested_move: Option<Pos>,
     pub message: Option<String>,
     pub capture_animation: Option<CaptureAnimation>,
+    pub ai_stats: AiStats,
+    /// Review mode: when Some(index), shows board at move #index
+    pub review_index: Option<usize>,
+    /// Redo stack: each entry is a group of moves (1 for PvP, 2 for PvE)
+    pub redo_groups: Vec<Vec<(Pos, Stone)>>,
+
+    // Persistent AI engine (reuses TT across moves)
+    ai_engine: Option<AIEngine>,
 
     // AI engine configuration
     ai_depth: i8,
@@ -148,7 +213,11 @@ impl GameState {
             suggested_move: None,
             message: None,
             capture_animation: None,
-            ai_depth: 6,
+            ai_stats: AiStats::default(),
+            review_index: None,
+            redo_groups: Vec::new(),
+            ai_engine: Some(AIEngine::with_config(64, 20, 500)),
+            ai_depth: 20,
             ai_time_limit_ms: 500,
         }
     }
@@ -165,6 +234,12 @@ impl GameState {
         self.suggested_move = None;
         self.message = None;
         self.capture_animation = None;
+        self.ai_stats = AiStats::default();
+        self.review_index = None;
+        self.redo_groups.clear();
+        if let Some(ref mut engine) = self.ai_engine {
+            engine.clear_cache();
+        }
     }
 
     /// Check if it's the human's turn
@@ -203,9 +278,18 @@ impl GameState {
         }
 
         // Check if move is valid
-        if !crate::rules::is_valid_move(&self.board, pos, self.current_turn) {
-            return Err("Invalid move (forbidden or occupied)".to_string());
+        if !self.board.is_empty(pos) {
+            return Err("Position is occupied".to_string());
         }
+        if rules::is_double_three(&self.board, pos, self.current_turn) {
+            return Err("Forbidden: Double-three".to_string());
+        }
+        if !rules::is_valid_move(&self.board, pos, self.current_turn) {
+            return Err("Invalid move".to_string());
+        }
+
+        // New move invalidates redo history
+        self.redo_groups.clear();
 
         // Place the stone
         self.execute_move(pos);
@@ -215,11 +299,26 @@ impl GameState {
     /// Execute a move (for both human and AI)
     fn execute_move(&mut self, pos: Pos) {
         let color = self.current_turn;
+        let is_human = !self.is_ai_turn();
+        let move_num = self.move_history.len() + 1;
 
         // Place stone and handle captures
         self.board.place_stone(pos, color);
-        let captured_positions = crate::rules::execute_captures(&mut self.board, pos, color);
+        let captured_positions = rules::execute_captures(&mut self.board, pos, color);
         let capture_count = captured_positions.len() / 2; // Each capture is a pair
+
+        // Log human moves for game reconstruction
+        if is_human {
+            let color_str = if color == Stone::Black { "Black" } else { "White" };
+            let cap_str = if capture_count > 0 {
+                format!(" +{}cap [{}]", capture_count,
+                    captured_positions.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>().join(", "))
+            } else {
+                String::new()
+            };
+            ai_log(&format!("  >> Human #{}: {} plays {}{}",
+                move_num, color_str, pos_to_notation(pos), cap_str));
+        }
 
         // Start capture animation if any captures occurred
         if !captured_positions.is_empty() {
@@ -331,15 +430,18 @@ impl GameState {
 
         let board = self.board.clone();
         let color = self.current_turn;
-        let depth = self.ai_depth;
-        let time_limit = self.ai_time_limit_ms;
+
+        // Take engine out (will be returned after search)
+        let mut engine = match self.ai_engine.take() {
+            Some(e) => e,
+            None => AIEngine::with_config(64, self.ai_depth, self.ai_time_limit_ms),
+        };
 
         let (tx, rx) = channel();
 
         thread::spawn(move || {
-            let mut engine = AIEngine::with_config(32, depth, time_limit);
             let result = engine.get_move_with_stats(&board, color);
-            let _ = tx.send(result);
+            let _ = tx.send((result, engine));
         });
 
         self.ai_state = AiState::Thinking {
@@ -350,10 +452,34 @@ impl GameState {
 
     /// Check if AI has finished thinking
     pub fn check_ai_result(&mut self) {
+        // First, check if AI has timed out (5 seconds)
+        let should_force_move = match &self.ai_state {
+            AiState::Thinking { start_time, .. } => {
+                start_time.elapsed() > Duration::from_secs(5)
+            }
+            AiState::Idle => false,
+        };
+
+        // If timed out, force a quick fallback move
+        if should_force_move {
+            // Engine is lost in the thread; create a fresh one
+            if self.ai_engine.is_none() {
+                self.ai_engine = Some(AIEngine::with_config(64, self.ai_depth, self.ai_time_limit_ms));
+            }
+            self.ai_state = AiState::Idle;
+            self.message = Some("AI timeout - quick move".to_string());
+
+            // Find any valid move quickly
+            if let Some(fallback) = self.find_fallback_move() {
+                self.execute_move(fallback);
+            }
+            return;
+        }
+
         let result = match &self.ai_state {
             AiState::Thinking { receiver, start_time } => {
                 match receiver.try_recv() {
-                    Ok(result) => Some((result, start_time.elapsed())),
+                    Ok((result, engine)) => Some((result, engine, start_time.elapsed())),
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.ai_state = AiState::Idle;
@@ -365,8 +491,10 @@ impl GameState {
             AiState::Idle => None,
         };
 
-        if let Some((move_result, elapsed)) = result {
+        if let Some((move_result, engine, elapsed)) = result {
             self.ai_state = AiState::Idle;
+            self.ai_engine = Some(engine); // Return engine for reuse
+            self.ai_stats.record(&move_result);
             self.last_ai_result = Some(move_result.clone());
             self.move_timer.set_ai_time(elapsed);
 
@@ -376,6 +504,73 @@ impl GameState {
                 self.message = Some("AI could not find a move".to_string());
             }
         }
+    }
+
+    /// Find a quick fallback move when AI times out
+    fn find_fallback_move(&self) -> Option<Pos> {
+        let color = self.current_turn;
+
+        // 1. Try to find a winning move
+        for r in 0..19u8 {
+            for c in 0..19u8 {
+                let pos = Pos::new(r, c);
+                if rules::is_valid_move(&self.board, pos, color) {
+                    let mut test = self.board.clone();
+                    test.place_stone(pos, color);
+                    rules::execute_captures(&mut test, pos, color);
+                    if rules::check_winner(&test) == Some(color) {
+                        return Some(pos);
+                    }
+                }
+            }
+        }
+
+        // 2. Try to block opponent's winning move
+        let opponent = color.opponent();
+        for r in 0..19u8 {
+            for c in 0..19u8 {
+                let pos = Pos::new(r, c);
+                if rules::is_valid_move(&self.board, pos, opponent) {
+                    let mut test = self.board.clone();
+                    test.place_stone(pos, opponent);
+                    rules::execute_captures(&mut test, pos, opponent);
+                    if rules::check_winner(&test) == Some(opponent) {
+                        // Opponent would win here, so block it
+                        if rules::is_valid_move(&self.board, pos, color) {
+                            return Some(pos);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Find any valid move near existing stones
+        if let Some(last) = self.last_move {
+            for dr in -2i8..=2 {
+                for dc in -2i8..=2 {
+                    let r = last.row as i8 + dr;
+                    let c = last.col as i8 + dc;
+                    if r >= 0 && r < 19 && c >= 0 && c < 19 {
+                        let pos = Pos::new(r as u8, c as u8);
+                        if rules::is_valid_move(&self.board, pos, color) {
+                            return Some(pos);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Any valid move near center
+        for r in 7..12u8 {
+            for c in 7..12u8 {
+                let pos = Pos::new(r, c);
+                if rules::is_valid_move(&self.board, pos, color) {
+                    return Some(pos);
+                }
+            }
+        }
+
+        None
     }
 
     /// Get AI thinking elapsed time
@@ -409,15 +604,22 @@ impl GameState {
             return;
         }
 
+        // Exit review mode if active
+        self.review_index = None;
+
         // For PvE, undo two moves (human + AI)
         let undo_count = match self.mode {
             GameMode::PvE { .. } if self.move_history.len() >= 2 => 2,
             _ => 1,
         };
 
-        // Simple undo: reset and replay
-        let moves_to_keep = self.move_history.len().saturating_sub(undo_count);
-        let moves: Vec<_> = self.move_history.drain(..moves_to_keep).collect();
+        // Save undone moves for redo
+        let keep = self.move_history.len().saturating_sub(undo_count);
+        let redo_moves: Vec<_> = self.move_history[keep..].to_vec();
+        self.redo_groups.push(redo_moves);
+
+        // Truncate and replay
+        let moves: Vec<_> = self.move_history[..keep].to_vec();
 
         self.board = Board::new();
         self.current_turn = Stone::Black;
@@ -425,15 +627,75 @@ impl GameState {
         self.last_move = None;
         self.suggested_move = None;
         self.capture_animation = None;
+        self.move_history.clear();
 
         for (pos, color) in moves {
             self.board.place_stone(pos, color);
-            crate::rules::execute_captures(&mut self.board, pos, color);
+            rules::execute_captures(&mut self.board, pos, color);
             self.move_history.push((pos, color));
             self.last_move = Some(pos);
             self.current_turn = color.opponent();
         }
 
         self.move_timer.start();
+    }
+
+    /// Redo last undone move(s)
+    pub fn redo(&mut self) {
+        if self.redo_groups.is_empty() || self.is_ai_thinking() {
+            return;
+        }
+
+        // Exit review mode if active
+        self.review_index = None;
+
+        if let Some(moves) = self.redo_groups.pop() {
+            for (pos, _color) in moves {
+                if self.game_over.is_some() {
+                    break;
+                }
+                self.execute_move(pos);
+            }
+        }
+    }
+
+    /// Build a board from a subset of moves (for review mode)
+    pub fn build_review_board(&self, up_to: usize) -> (Board, Option<Pos>) {
+        let mut board = Board::new();
+        let mut last = None;
+        for &(pos, color) in self.move_history.iter().take(up_to) {
+            board.place_stone(pos, color);
+            rules::execute_captures(&mut board, pos, color);
+            last = Some(pos);
+        }
+        (board, last)
+    }
+
+    /// Navigate review mode
+    pub fn review_prev(&mut self) {
+        if self.game_over.is_none() { return; }
+        let current = self.review_index.unwrap_or(self.move_history.len());
+        if current > 0 {
+            self.review_index = Some(current - 1);
+        }
+    }
+
+    pub fn review_next(&mut self) {
+        if self.game_over.is_none() { return; }
+        if let Some(idx) = self.review_index {
+            if idx < self.move_history.len() {
+                let next = idx + 1;
+                if next >= self.move_history.len() {
+                    self.review_index = None; // Back to final position
+                } else {
+                    self.review_index = Some(next);
+                }
+            }
+        }
+    }
+
+    /// Check if currently reviewing a past position
+    pub fn is_reviewing(&self) -> bool {
+        self.review_index.is_some()
     }
 }

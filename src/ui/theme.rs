@@ -35,15 +35,18 @@ pub fn hover_invalid() -> Color32 {
 }
 
 // Panel colors - dark modern theme
-#[allow(dead_code)]
-pub const PANEL_BG: Color32 = Color32::from_rgb(32, 34, 37);
+pub const PANEL_BG: Color32 = Color32::from_rgb(30, 32, 36);
+pub const PANEL_CARD: Color32 = Color32::from_rgb(38, 40, 45);
+pub const PANEL_CARD_ACCENT: Color32 = Color32::from_rgb(44, 46, 52);
 #[allow(dead_code)]
 pub const PANEL_HEADER: Color32 = Color32::from_rgb(42, 44, 48);
 #[allow(dead_code)]
 pub const PANEL_BORDER: Color32 = Color32::from_rgb(60, 62, 66);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 240, 245);
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 165, 175);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(120, 125, 135);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(100, 105, 115);
+pub const ACCENT_BLUE: Color32 = Color32::from_rgb(70, 140, 220);
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(55, 65, 80);
 
 // Button colors
 #[allow(dead_code)]
@@ -71,7 +74,7 @@ pub const CAPTURE_BLACK_BG: Color32 = Color32::from_rgb(50, 50, 55);
 pub const CAPTURE_WHITE_BG: Color32 = Color32::from_rgb(200, 200, 205);
 
 // Sizes
-pub const BOARD_MARGIN: f32 = 40.0;
+pub const BOARD_MARGIN: f32 = 34.0;
 pub const STONE_RADIUS_RATIO: f32 = 0.45;
 pub const STAR_POINT_RADIUS: f32 = 4.0;
 pub const GRID_LINE_WIDTH: f32 = 1.0;

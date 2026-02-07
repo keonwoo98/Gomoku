@@ -38,16 +38,22 @@ impl BoardView {
     ) -> Option<Pos> {
         let available_size = ui.available_size();
 
-        // Calculate board size to fit available space
-        let board_size = available_size.x.min(available_size.y) - 20.0;
+        // Calculate board size to fit available space (square, filling the smaller axis)
+        let board_size = available_size.x.min(available_size.y);
         self.cell_size = (board_size - 2.0 * BOARD_MARGIN) / (BOARD_SIZE as f32 - 1.0);
 
+        // Center the board horizontally by allocating full width
+        let pad_x = (available_size.x - board_size).max(0.0) / 2.0;
         let (response, painter) = ui.allocate_painter(
-            Vec2::new(board_size, board_size),
+            Vec2::new(available_size.x, board_size),
             Sense::click(),
         );
 
-        self.board_rect = response.rect;
+        // Set board_rect to the centered square within the allocation
+        self.board_rect = Rect::from_min_size(
+            egui::pos2(response.rect.min.x + pad_x, response.rect.min.y),
+            Vec2::splat(board_size),
+        );
 
         // Draw board background
         painter.rect_filled(self.board_rect, CornerRadius::same(4), BOARD_BG);
