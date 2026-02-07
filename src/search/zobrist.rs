@@ -39,6 +39,8 @@ pub struct ZobristTable {
     white: [u64; TOTAL_CELLS],
     /// Random value XORed when black is to move
     black_to_move: u64,
+    /// Random values for capture counts: [color][count 0..6]
+    captures: [[u64; 6]; 2],
 }
 
 impl ZobristTable {
@@ -67,10 +69,18 @@ impl ZobristTable {
             white[i] = next_rand();
         }
 
+        let mut captures = [[0u64; 6]; 2];
+        for color in 0..2 {
+            for count in 0..6 {
+                captures[color][count] = next_rand();
+            }
+        }
+
         Self {
             black,
             white,
             black_to_move: next_rand(),
+            captures,
         }
     }
 
@@ -93,6 +103,11 @@ impl ZobristTable {
         if side_to_move == Stone::Black {
             h ^= self.black_to_move;
         }
+
+        // Include capture counts in hash to distinguish positions with same stones
+        // but different capture counts (affects win conditions)
+        h ^= self.captures[0][board.captures(Stone::Black).min(5) as usize];
+        h ^= self.captures[1][board.captures(Stone::White).min(5) as usize];
 
         h
     }
@@ -143,6 +158,18 @@ impl ZobristTable {
         };
         hash ^ stone_hash
     }
+
+    /// Update hash when capture count changes for a color.
+    ///
+    /// XORs out the old capture count hash and XORs in the new one.
+    /// Call this after `execute_captures_fast` updates the board's capture count.
+    #[inline]
+    #[must_use]
+    pub fn update_capture_count(&self, hash: u64, color: Stone, old_count: u8, new_count: u8) -> u64 {
+        let cidx = if color == Stone::Black { 0 } else { 1 };
+        hash ^ self.captures[cidx][old_count.min(5) as usize]
+             ^ self.captures[cidx][new_count.min(5) as usize]
+    }
 }
 
 impl Default for ZobristTable {
@@ -165,10 +192,10 @@ mod tests {
 
         // Different side to move = different hash
         assert_ne!(hash1, hash2);
-        // Empty board with white to move should be 0 (no stones, no black_to_move XOR)
-        assert_eq!(hash2, 0);
-        // Empty board with black to move should be just the black_to_move value
-        assert_eq!(hash1, zt.black_to_move);
+        // Empty board includes capture hash for (0,0) captures
+        let cap_base = zt.captures[0][0] ^ zt.captures[1][0];
+        assert_eq!(hash2, cap_base);
+        assert_eq!(hash1, zt.black_to_move ^ cap_base);
     }
 
     #[test]
@@ -330,11 +357,13 @@ mod tests {
 
         let hash = zt.hash(&board, Stone::White);
 
-        // Hash should be XOR of all four corner values
+        // Hash should be XOR of all four corner values + capture hashes for (0,0)
         let expected = zt.black[corners[0].to_index()]
             ^ zt.black[corners[1].to_index()]
             ^ zt.black[corners[2].to_index()]
-            ^ zt.black[corners[3].to_index()];
+            ^ zt.black[corners[3].to_index()]
+            ^ zt.captures[0][0]
+            ^ zt.captures[1][0];
 
         assert_eq!(hash, expected);
     }

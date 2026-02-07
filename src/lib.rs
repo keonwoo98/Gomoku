@@ -61,4 +61,4 @@ pub mod ui;
 
 // Re-export commonly used types for convenience
 pub use board::{Board, Pos, Stone, BOARD_SIZE};
-pub use engine::{AIEngine, MoveResult, SearchType};
+pub use engine::{AIEngine, MoveResult, SearchType, ai_log, pos_to_notation};

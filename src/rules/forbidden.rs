@@ -8,6 +8,8 @@
 
 use crate::board::{Board, Pos, Stone};
 
+use super::capture::has_capture;
+#[cfg(test)]
 use super::capture::get_captured_positions;
 
 /// Direction vectors for pattern checking (4 directions)
@@ -200,11 +202,10 @@ fn creates_free_three_in_direction(
     dr: i32,
     dc: i32,
 ) -> bool {
-    // Temporarily place the stone to analyze
-    let mut temp_board = board.clone();
-    temp_board.place_stone(pos, stone);
-
-    let pattern = scan_line(&temp_board, pos, stone, dr, dc);
+    // scan_line starts with stones=[0] (the placed stone) and only reads
+    // cells at distance 1-5 from pos. It never reads board.get(pos).
+    // So we can safely analyze the original board without cloning.
+    let pattern = scan_line(board, pos, stone, dr, dc);
     is_free_three(&pattern)
 }
 
@@ -215,6 +216,10 @@ pub fn count_free_threes(board: &Board, pos: Pos, stone: Stone) -> u8 {
     for &(dr, dc) in &DIRECTIONS {
         if creates_free_three_in_direction(board, pos, stone, dr, dc) {
             count += 1;
+            // Early exit: double-three only needs 2+
+            if count >= 2 {
+                return count;
+            }
         }
     }
 
@@ -235,8 +240,8 @@ pub fn count_free_threes(board: &Board, pos: Pos, stone: Stone) -> u8 {
 /// `true` if the move is a forbidden double-three, `false` otherwise
 pub fn is_double_three(board: &Board, pos: Pos, stone: Stone) -> bool {
     // Exception: if this move captures, double-three is allowed
-    let captures = get_captured_positions(board, pos, stone);
-    if !captures.is_empty() {
+    // Use has_capture (no Vec allocation) instead of get_captured_positions
+    if has_capture(board, pos, stone) {
         return false;
     }
 

@@ -119,6 +119,16 @@ impl Board {
         }
     }
 
+    /// Subtract captures for a color (saturating, min 0) - used for unmake
+    #[inline]
+    pub fn sub_captures(&mut self, stone: Stone, count: u8) {
+        match stone {
+            Stone::Black => self.black_captures = self.black_captures.saturating_sub(count),
+            Stone::White => self.white_captures = self.white_captures.saturating_sub(count),
+            Stone::Empty => {}
+        }
+    }
+
     /// Total stones on board
     #[inline]
     pub fn stone_count(&self) -> u32 {

@@ -24,31 +24,32 @@ impl PatternScore {
     /// Open three: _OOO_ (becomes open four if not blocked)
     pub const OPEN_THREE: i32 = 10_000;
     /// Closed three: XOOO_ or _OOOX (one side blocked)
-    pub const CLOSED_THREE: i32 = 1_000;
+    pub const CLOSED_THREE: i32 = 5_000;
 
     // Building patterns
     /// Open two: _OO_ (potential to grow)
-    pub const OPEN_TWO: i32 = 500;
+    pub const OPEN_TWO: i32 = 1_000;
     /// Closed two: XOO_ or _OOX (one side blocked)
-    pub const CLOSED_TWO: i32 = 50;
+    pub const CLOSED_TWO: i32 = 200;
 
-    // Capture related
+    // Capture related — Pente captures are critical in Ninuki-renju.
+    // A single capture removes 2 opponent stones AND advances toward capture win.
     /// Can capture opponent's pair next move
-    pub const CAPTURE_THREAT: i32 = 3_000;
+    pub const CAPTURE_THREAT: i32 = 8_000;
     /// Value per captured pair
-    pub const CAPTURE_PAIR: i32 = 500;
-    /// 4 pairs captured (one more = win)
-    pub const NEAR_CAPTURE_WIN: i32 = 8_000;
+    pub const CAPTURE_PAIR: i32 = 2_000;
+    /// 4 pairs captured (one more = win) - must be >> OPEN_FOUR
+    pub const NEAR_CAPTURE_WIN: i32 = 80_000;
 
-    // Defense weights
-    /// Defense is weighted higher than offense
-    pub const DEFENSE_MULTIPLIER: f32 = 1.5;
+    // Note: Defense-first behavior is handled by move ordering (score_move),
+    // NOT by the evaluation function. The evaluation must be symmetric
+    // for negamax correctness: evaluate(board, A) == -evaluate(board, B).
 }
 
 /// Capture-based scoring with non-linear weights
 ///
 /// The scoring is exponential as captures approach the winning threshold.
-/// Defense is weighted higher to ensure the AI responds to capture threats.
+/// MUST be symmetric for negamax: capture_score(a, b) == -capture_score(b, a).
 ///
 /// # Arguments
 /// * `my_captures` - Number of pairs captured by the player
@@ -58,19 +59,21 @@ impl PatternScore {
 /// Score differential (positive = advantage, negative = disadvantage)
 pub fn capture_score(my_captures: u8, opp_captures: u8) -> i32 {
     // Non-linear scoring - closer to win = exponentially more valuable
+    // Each level must be significantly higher than pattern threats at that stage
+    // to ensure the AI treats capture accumulation as a serious strategic factor.
     const CAP_WEIGHTS: [i32; 6] = [
         0,
-        200,
-        600,
-        2000,
-        PatternScore::NEAR_CAPTURE_WIN,
-        PatternScore::CAPTURE_WIN,
+        2_000,     // 1 capture: minor advantage
+        7_000,     // 2 captures: moderate (> CLOSED_THREE)
+        20_000,    // 3 captures: serious threat (> OPEN_THREE)
+        PatternScore::NEAR_CAPTURE_WIN, // 4 captures: 80K, near-winning
+        PatternScore::CAPTURE_WIN,      // 5 captures: 1M, game over
     ];
 
     let my_score = CAP_WEIGHTS[my_captures.min(5) as usize];
     let opp_score = CAP_WEIGHTS[opp_captures.min(5) as usize];
 
-    my_score - (opp_score as f32 * PatternScore::DEFENSE_MULTIPLIER) as i32
+    my_score - opp_score
 }
 
 #[cfg(test)]
@@ -102,19 +105,26 @@ mod tests {
     #[test]
     fn test_capture_score_near_win() {
         let score = capture_score(4, 0);
-        assert!(score >= 8000, "4 captures should be highly valuable");
+        assert!(score >= 60_000, "4 captures should be highly valuable (near-win)");
     }
 
     #[test]
-    fn test_capture_score_defense_weighted() {
-        let own_captures = capture_score(1, 0);
-        let opp_captures = capture_score(0, 1);
-        // Defense should be weighted more (negative score should be larger in magnitude)
-        assert!(
-            own_captures < -opp_captures,
-            "Defense should be weighted higher: own={}, opp={}",
-            own_captures,
-            opp_captures
+    fn test_capture_score_symmetric() {
+        // Negamax requires: capture_score(a, b) == -capture_score(b, a)
+        let score_1_0 = capture_score(1, 0);
+        let score_0_1 = capture_score(0, 1);
+        assert_eq!(
+            score_1_0, -score_0_1,
+            "capture_score must be symmetric: (1,0)={}, (0,1)={}",
+            score_1_0, score_0_1
+        );
+
+        let score_2_1 = capture_score(2, 1);
+        let score_1_2 = capture_score(1, 2);
+        assert_eq!(
+            score_2_1, -score_1_2,
+            "capture_score must be symmetric: (2,1)={}, (1,2)={}",
+            score_2_1, score_1_2
         );
     }
 
@@ -125,17 +135,18 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_score_symmetry_with_defense_weight() {
-        // Opponent having captures should hurt more than our captures help
-        let we_lead = capture_score(2, 1);
-        let they_lead = capture_score(1, 2);
-
-        // Both should reflect the asymmetry
-        assert!(we_lead > 0, "Leading in captures should be positive");
-        assert!(they_lead < 0, "Trailing in captures should be negative");
-        assert!(
-            we_lead.abs() < they_lead.abs(),
-            "Defense weight should make trailing worse than leading is good"
-        );
+    fn test_capture_score_negamax_symmetry() {
+        // Verify negamax property: score(a,b) == -score(b,a) for all values
+        for a in 0..=5u8 {
+            for b in 0..=5u8 {
+                let score_ab = capture_score(a, b);
+                let score_ba = capture_score(b, a);
+                assert_eq!(
+                    score_ab, -score_ba,
+                    "Negamax symmetry violated: capture_score({},{})={}, capture_score({},{})={}",
+                    a, b, score_ab, b, a, score_ba
+                );
+            }
+        }
     }
 }

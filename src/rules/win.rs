@@ -24,6 +24,47 @@ pub fn has_five_in_row(board: &Board, stone: Stone) -> bool {
     find_five_positions(board, stone).is_some()
 }
 
+/// Fast five-in-a-row check at a specific position.
+///
+/// Only checks 4 directions from the given position. No allocation.
+/// Much faster than `has_five_in_row` which iterates ALL stones.
+#[inline]
+pub fn has_five_at_pos(board: &Board, pos: Pos, color: Stone) -> bool {
+    let sz = 19i8;
+    let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+    for (dr, dc) in dirs {
+        let mut count = 1i32;
+        // Positive direction
+        let mut r = pos.row as i8 + dr;
+        let mut c = pos.col as i8 + dc;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            if board.get(Pos::new(r as u8, c as u8)) == color {
+                count += 1;
+                r += dr;
+                c += dc;
+            } else {
+                break;
+            }
+        }
+        // Negative direction
+        r = pos.row as i8 - dr;
+        c = pos.col as i8 - dc;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            if board.get(Pos::new(r as u8, c as u8)) == color {
+                count += 1;
+                r -= dr;
+                c -= dc;
+            } else {
+                break;
+            }
+        }
+        if count >= 5 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Find the positions of a 5-in-a-row if exists
 ///
 /// Returns Some(Vec<Pos>) with at least 5 positions if a winning line exists,

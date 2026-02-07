@@ -136,7 +136,107 @@ pub fn has_capture(board: &Board, pos: Pos, stone: Stone) -> bool {
 /// Count how many pairs would be captured by a move.
 #[inline]
 pub fn count_captures(board: &Board, pos: Pos, stone: Stone) -> u8 {
-    (get_captured_positions(board, pos, stone).len() / 2) as u8
+    count_captures_fast(board, pos, stone)
+}
+
+/// Count how many pairs would be captured by a move (no heap allocation).
+#[inline]
+pub fn count_captures_fast(board: &Board, pos: Pos, stone: Stone) -> u8 {
+    let opponent = stone.opponent();
+    let mut pairs = 0u8;
+
+    for &(dr, dc) in &DIRECTIONS {
+        for sign in [-1i32, 1i32] {
+            let dr = dr * sign;
+            let dc = dc * sign;
+
+            let r3 = pos.row as i32 + dr * 3;
+            let c3 = pos.col as i32 + dc * 3;
+
+            if !Pos::is_valid(r3, c3) {
+                continue;
+            }
+
+            let pos1 = Pos::new((pos.row as i32 + dr) as u8, (pos.col as i32 + dc) as u8);
+            let pos2 = Pos::new((pos.row as i32 + dr * 2) as u8, (pos.col as i32 + dc * 2) as u8);
+            let pos3 = Pos::new(r3 as u8, c3 as u8);
+
+            if board.get(pos1) == opponent
+                && board.get(pos2) == opponent
+                && board.get(pos3) == stone
+            {
+                pairs += 1;
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Maximum captured positions per move (8 directions × 2 stones each)
+pub const MAX_CAPTURES: usize = 16;
+
+/// Result of capture execution without heap allocation
+#[derive(Clone, Copy)]
+pub struct CaptureInfo {
+    pub positions: [Pos; MAX_CAPTURES],
+    pub count: u8,
+    pub pairs: u8,
+}
+
+/// Execute captures and return info without heap allocation.
+/// Use with `undo_captures` for make/unmake pattern.
+pub fn execute_captures_fast(board: &mut Board, pos: Pos, stone: Stone) -> CaptureInfo {
+    let opponent = stone.opponent();
+    let mut info = CaptureInfo {
+        positions: [Pos::new(0, 0); MAX_CAPTURES],
+        count: 0,
+        pairs: 0,
+    };
+
+    for &(dr, dc) in &DIRECTIONS {
+        for sign in [-1i32, 1i32] {
+            let dr = dr * sign;
+            let dc = dc * sign;
+
+            let r3 = pos.row as i32 + dr * 3;
+            let c3 = pos.col as i32 + dc * 3;
+
+            if !Pos::is_valid(r3, c3) {
+                continue;
+            }
+
+            let pos1 = Pos::new((pos.row as i32 + dr) as u8, (pos.col as i32 + dc) as u8);
+            let pos2 = Pos::new((pos.row as i32 + dr * 2) as u8, (pos.col as i32 + dc * 2) as u8);
+            let pos3 = Pos::new(r3 as u8, c3 as u8);
+
+            if board.get(pos1) == opponent
+                && board.get(pos2) == opponent
+                && board.get(pos3) == stone
+            {
+                let idx = info.count as usize;
+                info.positions[idx] = pos1;
+                info.positions[idx + 1] = pos2;
+                info.count += 2;
+                info.pairs += 1;
+                board.remove_stone(pos1);
+                board.remove_stone(pos2);
+            }
+        }
+    }
+
+    board.add_captures(stone, info.pairs);
+    info
+}
+
+/// Undo captures from a CaptureInfo (restore captured stones and decrement count).
+#[inline]
+pub fn undo_captures(board: &mut Board, stone: Stone, info: &CaptureInfo) {
+    let opponent = stone.opponent();
+    for i in 0..info.count as usize {
+        board.place_stone(info.positions[i], opponent);
+    }
+    board.sub_captures(stone, info.pairs);
 }
 
 #[cfg(test)]
