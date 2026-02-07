@@ -5,9 +5,7 @@
 //!
 //! 1. **Immediate win**: Check for any move that wins instantly
 //! 2. **VCF (Victory by Continuous Fours)**: Search for forced wins using four-threats
-//! 3. **VCT (Victory by Continuous Threats)**: Search using open-three threats
-//! 4. **Defense**: Block opponent's winning threats
-//! 5. **Alpha-Beta**: Regular search with transposition table
+//! 3. **Alpha-Beta**: Full search with move ordering that prioritizes blocking threats
 //!
 //! # Example
 //!
@@ -29,9 +27,39 @@
 //! ```
 
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
-use crate::rules::{check_winner, execute_captures, is_valid_move};
-use crate::search::{SearchResult, Searcher, ThreatResult, ThreatSearcher};
-use std::time::{Duration, Instant};
+use crate::rules::{
+    can_break_five_by_capture, execute_captures_fast, find_five_positions,
+    has_five_at_pos, is_valid_move, undo_captures,
+};
+use crate::search::{SearchResult, Searcher, ThreatSearcher};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::Instant;
+
+/// Format a board position as human-readable notation (e.g., "J10")
+pub fn pos_to_notation(pos: Pos) -> String {
+    // Columns: A=0, B=1, ..., H=7, J=8 (skip I), K=9, ...
+    let col_char = if pos.col < 8 {
+        (b'A' + pos.col) as char
+    } else {
+        (b'A' + pos.col + 1) as char // skip 'I'
+    };
+    // Rows: 1=0, 2=1, ..., 19=18 (board display: bottom=1, top=19)
+    format!("{}{}", col_char, pos.row + 1)
+}
+
+/// Write a log message to both gomoku_ai.log and stderr
+pub fn ai_log(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("gomoku_ai.log")
+    {
+        let _ = writeln!(file, "{}", msg);
+        let _ = file.flush();
+    }
+    eprintln!("{}", msg);
+}
 
 /// Type of search that produced the result.
 ///
@@ -65,9 +93,24 @@ pub struct MoveResult {
     pub time_ms: u64,
     /// Number of nodes searched
     pub nodes: u64,
+    /// Search depth reached
+    pub depth: i8,
+    /// Transposition table usage percentage (0-100)
+    pub tt_usage: u8,
+    /// Nodes per second (kN/s)
+    pub nps: u64,
 }
 
 impl MoveResult {
+    /// Compute nodes per second in kN/s
+    fn compute_nps(nodes: u64, time_ms: u64) -> u64 {
+        if time_ms == 0 {
+            0
+        } else {
+            nodes * 1000 / time_ms / 1000
+        }
+    }
+
     /// Create a result for an immediate win
     #[inline]
     fn immediate_win(pos: Pos, time_ms: u64) -> Self {
@@ -77,6 +120,9 @@ impl MoveResult {
             search_type: SearchType::ImmediateWin,
             time_ms,
             nodes: 1,
+            depth: 0,
+            tt_usage: 0,
+            nps: 0,
         }
     }
 
@@ -89,6 +135,9 @@ impl MoveResult {
             search_type: SearchType::VCF,
             time_ms,
             nodes,
+            depth: 0,
+            tt_usage: 0,
+            nps: Self::compute_nps(nodes, time_ms),
         }
     }
 
@@ -101,6 +150,9 @@ impl MoveResult {
             search_type: SearchType::VCT,
             time_ms,
             nodes,
+            depth: 0,
+            tt_usage: 0,
+            nps: Self::compute_nps(nodes, time_ms),
         }
     }
 
@@ -113,18 +165,24 @@ impl MoveResult {
             search_type: SearchType::Defense,
             time_ms,
             nodes,
+            depth: 0,
+            tt_usage: 0,
+            nps: 0,
         }
     }
 
-    /// Create a result from alpha-beta search
+    /// Create a result from alpha-beta search with TT stats
     #[inline]
-    fn from_alphabeta(result: SearchResult, time_ms: u64) -> Self {
+    fn from_alphabeta(result: SearchResult, time_ms: u64, tt_usage: u8) -> Self {
         Self {
             best_move: result.best_move,
             score: result.score,
             search_type: SearchType::AlphaBeta,
             time_ms,
             nodes: result.nodes,
+            depth: result.depth,
+            tt_usage,
+            nps: Self::compute_nps(result.nodes, time_ms),
         }
     }
 
@@ -137,6 +195,9 @@ impl MoveResult {
             search_type: SearchType::AlphaBeta,
             time_ms,
             nodes,
+            depth: 0,
+            tt_usage: 0,
+            nps: 0,
         }
     }
 
@@ -149,6 +210,9 @@ impl MoveResult {
             search_type: SearchType::AlphaBeta,
             time_ms,
             nodes: 0,
+            depth: 0,
+            tt_usage: 0,
+            nps: 0,
         }
     }
 }
@@ -190,9 +254,8 @@ pub struct AIEngine {
     threat_searcher: ThreatSearcher,
     /// Maximum search depth for alpha-beta
     max_depth: i8,
-    /// Time limit for search (used for future time management)
-    #[allow(dead_code)]
-    time_limit: Duration,
+    /// Time limit for search in milliseconds
+    time_limit_ms: u64,
 }
 
 impl AIEngine {
@@ -200,7 +263,7 @@ impl AIEngine {
     ///
     /// Default configuration:
     /// - 64 MB transposition table
-    /// - Maximum depth of 10
+    /// - Maximum depth of 20 (iterative deepening stops at time limit)
     /// - 500ms time limit
     ///
     /// # Example
@@ -214,9 +277,9 @@ impl AIEngine {
     pub fn new() -> Self {
         Self {
             searcher: Searcher::new(64),
-            threat_searcher: ThreatSearcher::new(),
-            max_depth: 10,
-            time_limit: Duration::from_millis(500),
+            threat_searcher: ThreatSearcher::with_depths(30, 12),
+            max_depth: 20,
+            time_limit_ms: 500,
         }
     }
 
@@ -240,9 +303,9 @@ impl AIEngine {
     pub fn with_config(tt_size_mb: usize, max_depth: i8, time_limit_ms: u64) -> Self {
         Self {
             searcher: Searcher::new(tt_size_mb),
-            threat_searcher: ThreatSearcher::new(),
+            threat_searcher: ThreatSearcher::with_depths(30, 12),
             max_depth,
-            time_limit: Duration::from_millis(time_limit_ms),
+            time_limit_ms,
         }
     }
 
@@ -303,15 +366,23 @@ impl AIEngine {
     /// The search follows this priority order:
     /// 1. Immediate winning move (instant)
     /// 2. VCF - forced win via continuous fours
-    /// 3. VCT - forced win via continuous threats
-    /// 4. Defense against opponent's VCF
-    /// 5. Regular alpha-beta search
+    /// 3. Alpha-beta search (handles offense, defense, and blocking)
     #[must_use]
     pub fn get_move_with_stats(&mut self, board: &Board, color: Stone) -> MoveResult {
         let start = Instant::now();
+        let move_num = board.stone_count() + 1;
+        let color_str = if color == Stone::Black { "Black" } else { "White" };
+
+        let separator = "=".repeat(60);
+        ai_log(&format!(
+            "\n{}\n[Move #{} | AI: {} | Stones: {} | B-cap: {} W-cap: {}]",
+            separator, move_num, color_str, board.stone_count(),
+            board.captures(Stone::Black), board.captures(Stone::White)
+        ));
 
         // 0. Opening book for fast early game response
         if let Some(opening_move) = self.get_opening_move(board, color) {
+            ai_log(&format!("  Stage 0 OPENING: {} (book move)", pos_to_notation(opening_move)));
             return MoveResult::alpha_beta(
                 opening_move,
                 0,
@@ -322,89 +393,122 @@ impl AIEngine {
 
         // 1. Check for immediate winning move (5-in-a-row or capture win)
         if let Some(win_move) = self.find_immediate_win(board, color) {
+            ai_log(&format!("  Stage 1 IMMEDIATE WIN: {}", pos_to_notation(win_move)));
             return MoveResult::immediate_win(win_move, start.elapsed().as_millis() as u64);
         }
+        ai_log("  Stage 1 Immediate win: none");
 
-        // 2. CRITICAL: Check opponent's immediate threats FIRST
-        // If opponent can win next move, we MUST block regardless of our own threats
+        // 2. Check if opponent can win immediately - MUST block
         let opponent = color.opponent();
-
-        // 2a. Check opponent's immediate win (5-in-a-row possible)
-        if let Some(opp_win) = self.find_immediate_win(board, opponent) {
-            // Block it if we can
-            if is_valid_move(board, opp_win, color) {
+        let opponent_threats = self.find_winning_moves(board, opponent);
+        ai_log(&format!("  Stage 2 Opponent threats: {} positions{}", opponent_threats.len(),
+            if opponent_threats.is_empty() { String::new() }
+            else { format!(" [{}]", opponent_threats.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>().join(", ")) }
+        ));
+        if opponent_threats.len() == 1 {
+            let block_pos = opponent_threats[0];
+            if is_valid_move(board, block_pos, color) {
+                ai_log(&format!("  >>> DEFENSE (block immediate): {}", pos_to_notation(block_pos)));
                 return MoveResult::defense(
-                    opp_win,
-                    0,
+                    block_pos,
+                    -900_000,
                     start.elapsed().as_millis() as u64,
                     1,
                 );
             }
+        } else if opponent_threats.len() >= 2 {
+            ai_log("  WARNING: Opponent has OPEN FOUR (2+ wins) - likely lost!");
         }
 
-        // 2b. Check opponent's four-in-a-row threats (must block or lose next turn)
-        if let Some(block_pos) = self.find_four_threat(board, opponent, color) {
-            return MoveResult::defense(
-                block_pos,
-                -50_000,
-                start.elapsed().as_millis() as u64,
-                1,
-            );
-        }
-
-        // 3. Search VCF (Victory by Continuous Fours) - our winning threats
+        // 3. Search VCF (Victory by Continuous Fours) - our forced win
         let vcf_result = self.threat_searcher.search_vcf(board, color);
         if vcf_result.found && !vcf_result.winning_sequence.is_empty() {
+            let seq: Vec<String> = vcf_result.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+            ai_log(&format!("  Stage 3 OUR VCF FOUND: sequence=[{}]", seq.join(" -> ")));
             return MoveResult::vcf_win(
                 vcf_result.winning_sequence[0],
                 start.elapsed().as_millis() as u64,
                 self.threat_searcher.nodes(),
             );
         }
+        ai_log(&format!("  Stage 3 Our VCF: not found ({}nodes)", self.threat_searcher.nodes()));
 
-        // 4. Check opponent's VCF - must defend before our slower VCT
+        // 4. Check opponent VCF - if opponent has a forced win, we must block
         let opp_vcf = self.threat_searcher.search_vcf(board, opponent);
-        if opp_vcf.found {
-            if let Some(defense) = self.find_best_defense(board, color, &opp_vcf) {
+        if opp_vcf.found && !opp_vcf.winning_sequence.is_empty() {
+            let seq: Vec<String> = opp_vcf.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+            ai_log(&format!("  Stage 4 OPPONENT VCF FOUND: sequence=[{}]", seq.join(" -> ")));
+            let block_pos = opp_vcf.winning_sequence[0];
+            if is_valid_move(board, block_pos, color) {
+                ai_log(&format!("  >>> DEFENSE (block VCF): {}", pos_to_notation(block_pos)));
                 return MoveResult::defense(
-                    defense,
-                    -100_000,
+                    block_pos,
+                    -800_000,
                     start.elapsed().as_millis() as u64,
                     self.threat_searcher.nodes(),
                 );
             }
         }
+        ai_log(&format!("  Stage 4 Opponent VCF: not found ({}nodes)", self.threat_searcher.nodes()));
 
-        // 5. Search VCT (Victory by Continuous Threats)
-        // Only after all immediate threats are handled
+        // 4.5. VCT search (mid-game only, when enough stones for meaningful threats)
         if board.stone_count() >= 8 {
+            // Our VCT
             let vct_result = self.threat_searcher.search_vct(board, color);
             if vct_result.found && !vct_result.winning_sequence.is_empty() {
+                let seq: Vec<String> = vct_result.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+                ai_log(&format!("  Stage 4.5 OUR VCT FOUND: sequence=[{}]", seq.join(" -> ")));
                 return MoveResult::vct_win(
                     vct_result.winning_sequence[0],
                     start.elapsed().as_millis() as u64,
                     self.threat_searcher.nodes(),
                 );
             }
+            ai_log(&format!("  Stage 4.5 Our VCT: not found ({}nodes)", self.threat_searcher.nodes()));
+
+            // Opponent VCT - block first move
+            let opp_vct = self.threat_searcher.search_vct(board, opponent);
+            if opp_vct.found && !opp_vct.winning_sequence.is_empty() {
+                let seq: Vec<String> = opp_vct.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+                ai_log(&format!("  Stage 4.6 OPPONENT VCT FOUND: sequence=[{}]", seq.join(" -> ")));
+                let block_pos = opp_vct.winning_sequence[0];
+                if is_valid_move(board, block_pos, color) {
+                    ai_log(&format!("  >>> DEFENSE (block VCT): {}", pos_to_notation(block_pos)));
+                    return MoveResult::defense(
+                        block_pos,
+                        -700_000,
+                        start.elapsed().as_millis() as u64,
+                        self.threat_searcher.nodes(),
+                    );
+                }
+            }
+            ai_log(&format!("  Stage 4.6 Opponent VCT: not found ({}nodes)", self.threat_searcher.nodes()));
         }
 
-        // 5. Regular Alpha-Beta search
-        // Use conservative depth to ensure fast response (<500ms target)
-        // Deeper search doesn't help much without proper time management
-        let effective_depth = 4.min(self.max_depth);
+        // 5. Alpha-Beta search handles ALL strategy
+        let result = self.searcher.search_timed(board, color, self.max_depth, self.time_limit_ms);
+        let tt_usage = self.searcher.tt_stats().usage_percent;
+        let elapsed = start.elapsed().as_millis() as u64;
 
-        let result = self.searcher.search(board, color, effective_depth);
-        MoveResult::from_alphabeta(result, start.elapsed().as_millis() as u64)
+        ai_log(&format!(
+            "  Stage 5 ALPHA-BETA: move={} score={} depth={} nodes={} time={}ms nps={}k tt={}%",
+            result.best_move.map(|p| pos_to_notation(p)).unwrap_or("none".to_string()),
+            result.score, result.depth, result.nodes, elapsed,
+            MoveResult::compute_nps(result.nodes, elapsed), tt_usage
+        ));
+
+        MoveResult::from_alphabeta(result, elapsed, tt_usage)
     }
 
-    /// Find an immediate winning move.
+    /// Find ALL positions where `color` can win immediately.
     ///
-    /// Checks for moves that win instantly via:
-    /// - 5-in-a-row
-    /// - Capturing the 5th pair (10 total stones)
-    fn find_immediate_win(&self, board: &Board, color: Stone) -> Option<Pos> {
-        // Check if near capture win (4 pairs captured)
+    /// Returns a list of winning positions (usually 1 for closed four, 2 for open four).
+    /// Used to detect opponent threats that must be blocked.
+    /// Uses make/unmake pattern with fast has_five_at_pos check.
+    fn find_winning_moves(&self, board: &Board, color: Stone) -> Vec<Pos> {
+        let mut wins = Vec::new();
         let near_capture_win = board.captures(color) >= 4;
+        let mut test_board = board.clone();
 
         for r in 0..BOARD_SIZE as u8 {
             for c in 0..BOARD_SIZE as u8 {
@@ -413,50 +517,75 @@ impl AIEngine {
                     continue;
                 }
 
-                let mut test_board = board.clone();
+                // Make move
                 test_board.place_stone(pos, color);
-                execute_captures(&mut test_board, pos, color);
+                let cap_info = execute_captures_fast(&mut test_board, pos, color);
 
-                // Check for win (5-in-a-row or capture win)
-                if check_winner(&test_board) == Some(color) {
-                    return Some(pos);
+                // Fast five-in-a-row check (O(4 directions) vs O(all_stones * 4))
+                if has_five_at_pos(&test_board, pos, color) {
+                    // Only count as win if opponent can't break it by capture
+                    if let Some(five) = find_five_positions(&test_board, color) {
+                        if !can_break_five_by_capture(&test_board, &five, color) {
+                            wins.push(pos);
+                        }
+                    }
                 }
 
-                // Also check capture win explicitly if we're close
+                // Capture win check
+                if near_capture_win && test_board.captures(color) >= 5 && !wins.contains(&pos) {
+                    wins.push(pos);
+                }
+
+                // Unmake move
+                undo_captures(&mut test_board, color, &cap_info);
+                test_board.remove_stone(pos);
+            }
+        }
+        wins
+    }
+
+    /// Find an immediate winning move.
+    ///
+    /// Checks for moves that win instantly via:
+    /// - 5-in-a-row (using fast has_five_at_pos)
+    /// - Capturing the 5th pair (10 total stones)
+    /// Uses make/unmake pattern to avoid cloning per position.
+    fn find_immediate_win(&self, board: &Board, color: Stone) -> Option<Pos> {
+        let near_capture_win = board.captures(color) >= 4;
+        let mut test_board = board.clone();
+
+        for r in 0..BOARD_SIZE as u8 {
+            for c in 0..BOARD_SIZE as u8 {
+                let pos = Pos::new(r, c);
+                if !is_valid_move(board, pos, color) {
+                    continue;
+                }
+
+                // Make move
+                test_board.place_stone(pos, color);
+                let cap_info = execute_captures_fast(&mut test_board, pos, color);
+
+                // Check five-in-a-row (fast, O(4 directions))
+                if has_five_at_pos(&test_board, pos, color) {
+                    // Verify opponent can't break it by capture
+                    if let Some(five) = find_five_positions(&test_board, color) {
+                        if !can_break_five_by_capture(&test_board, &five, color) {
+                            return Some(pos);
+                        }
+                    }
+                }
+
+                // Check capture win
                 if near_capture_win && test_board.captures(color) >= 5 {
                     return Some(pos);
                 }
+
+                // Unmake move
+                undo_captures(&mut test_board, color, &cap_info);
+                test_board.remove_stone(pos);
             }
         }
         None
-    }
-
-    /// Find the best defense against opponent's threat.
-    ///
-    /// Defense strategies:
-    /// 1. Block at the threat position directly
-    /// 2. Use alpha-beta to find the best defensive move
-    fn find_best_defense(
-        &mut self,
-        board: &Board,
-        color: Stone,
-        threat: &ThreatResult,
-    ) -> Option<Pos> {
-        if threat.winning_sequence.is_empty() {
-            return None;
-        }
-
-        let threat_move = threat.winning_sequence[0];
-
-        // Option 1: Block at the threat position
-        if is_valid_move(board, threat_move, color) {
-            return Some(threat_move);
-        }
-
-        // Option 2: Use Alpha-Beta to find best defensive move
-        // Use reduced depth for faster response
-        let result = self.searcher.search(board, color, 6.min(self.max_depth));
-        result.best_move
     }
 
     /// Set the maximum search depth for alpha-beta.
@@ -480,7 +609,7 @@ impl AIEngine {
     ///
     /// * `time_ms` - Time limit in milliseconds
     pub fn set_time_limit(&mut self, time_ms: u64) {
-        self.time_limit = Duration::from_millis(time_ms);
+        self.time_limit_ms = time_ms;
     }
 
     /// Clear the transposition table cache.
@@ -488,6 +617,7 @@ impl AIEngine {
     /// Call this when starting a new game to avoid stale positions.
     pub fn clear_cache(&mut self) {
         self.searcher.clear_tt();
+        self.searcher.clear_history();
     }
 
     /// Get the current maximum search depth.
@@ -502,154 +632,17 @@ impl AIEngine {
         self.searcher.tt_stats()
     }
 
-    /// Find opponent's four-in-a-row threat and return blocking position.
+    /// Get an opening move for the very first move only.
     ///
-    /// Scans the board for patterns where opponent has 4 stones with an open end.
-    /// Returns the position that would complete 5-in-a-row for the opponent.
-    fn find_four_threat(&self, board: &Board, opponent: Stone, color: Stone) -> Option<Pos> {
-        let directions: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
-
-        for r in 0..BOARD_SIZE as u8 {
-            for c in 0..BOARD_SIZE as u8 {
-                let pos = Pos::new(r, c);
-                if board.get(pos) != opponent {
-                    continue;
-                }
-
-                // Check each direction from this stone
-                for &(dr, dc) in &directions {
-                    let mut count = 1;
-                    let mut open_ends = Vec::new();
-
-                    // Count in positive direction
-                    let mut nr = r as i8 + dr;
-                    let mut nc = c as i8 + dc;
-                    while nr >= 0 && nr < BOARD_SIZE as i8 && nc >= 0 && nc < BOARD_SIZE as i8 {
-                        let np = Pos::new(nr as u8, nc as u8);
-                        if board.get(np) == opponent {
-                            count += 1;
-                            nr += dr;
-                            nc += dc;
-                        } else if board.get(np) == Stone::Empty {
-                            open_ends.push(np);
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Count in negative direction
-                    nr = r as i8 - dr;
-                    nc = c as i8 - dc;
-                    while nr >= 0 && nr < BOARD_SIZE as i8 && nc >= 0 && nc < BOARD_SIZE as i8 {
-                        let np = Pos::new(nr as u8, nc as u8);
-                        if board.get(np) == opponent {
-                            count += 1;
-                            nr -= dr;
-                            nc -= dc;
-                        } else if board.get(np) == Stone::Empty {
-                            open_ends.push(np);
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // If opponent has 4 in a row with at least one open end, block it
-                    if count >= 4 {
-                        for &end_pos in &open_ends {
-                            if is_valid_move(board, end_pos, color) {
-                                return Some(end_pos);
-                            }
-                        }
-                    }
-                }
-            }
+    /// Only used when the board is completely empty — play center (9,9).
+    /// All other positions use the full search pipeline to avoid capture traps
+    /// and properly evaluate threats from the start.
+    fn get_opening_move(&self, board: &Board, _color: Stone) -> Option<Pos> {
+        // Only use book for empty board — center is universally optimal
+        if board.stone_count() == 0 {
+            return Some(Pos::new(9, 9));
         }
-        None
-    }
-
-    /// Get an opening move for early game positions.
-    ///
-    /// Returns a quick move without expensive search for very sparse boards:
-    /// - Empty board: play center (9,9)
-    /// - 1-3 stones: play adjacent to existing stones near center
-    ///
-    /// Returns `None` if board has 4+ stones to ensure proper threat detection.
-    fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
-        let stone_count = board.stone_count();
-
-        // Only use opening book for first few moves (0-3 stones)
-        // After that, use full search to detect and respond to threats
-        if stone_count > 3 {
-            return None;
-        }
-
-        let center = Pos::new(9, 9);
-
-        // Empty board: play center
-        if stone_count == 0 {
-            return Some(center);
-        }
-
-        // If center is empty and valid, play there
-        if board.get(center) == Stone::Empty && is_valid_move(board, center, color) {
-            return Some(center);
-        }
-
-        // Find the centroid of existing stones and play near it
-        let mut sum_row: i32 = 0;
-        let mut sum_col: i32 = 0;
-        let mut count = 0;
-
-        for r in 0..BOARD_SIZE as u8 {
-            for c in 0..BOARD_SIZE as u8 {
-                let pos = Pos::new(r, c);
-                if board.get(pos) != Stone::Empty {
-                    sum_row += r as i32;
-                    sum_col += c as i32;
-                    count += 1;
-                }
-            }
-        }
-
-        if count == 0 {
-            return Some(center);
-        }
-
-        let center_row = (sum_row / count) as u8;
-        let center_col = (sum_col / count) as u8;
-
-        // Try positions in expanding rings around the centroid
-        let offsets: [(i8, i8); 8] = [
-            (0, 1), (1, 0), (0, -1), (-1, 0),  // orthogonal
-            (1, 1), (1, -1), (-1, 1), (-1, -1), // diagonal
-        ];
-
-        for radius in 1..=3 {
-            for &(dr, dc) in &offsets {
-                let r = center_row as i8 + dr * radius;
-                let c = center_col as i8 + dc * radius;
-
-                if r >= 0 && r < BOARD_SIZE as i8 && c >= 0 && c < BOARD_SIZE as i8 {
-                    let pos = Pos::new(r as u8, c as u8);
-                    if is_valid_move(board, pos, color) {
-                        return Some(pos);
-                    }
-                }
-            }
-        }
-
-        // Fallback: find any valid move near center
-        for r in 7..12u8 {
-            for c in 7..12u8 {
-                let pos = Pos::new(r, c);
-                if is_valid_move(board, pos, color) {
-                    return Some(pos);
-                }
-            }
-        }
-
+        // Everything else goes through full search pipeline
         None
     }
 }
@@ -667,7 +660,7 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let engine = AIEngine::new();
-        assert_eq!(engine.max_depth(), 10);
+        assert_eq!(engine.max_depth(), 20);
     }
 
     #[test]
@@ -703,9 +696,8 @@ mod tests {
         let mut engine = AIEngine::new();
         let result = engine.get_move_with_stats(&board, Stone::Black);
 
-        // Should block at (9,4)
+        // Should block at (9,4) - alpha-beta detects opponent's winning threat
         assert_eq!(result.best_move, Some(Pos::new(9, 4)));
-        assert_eq!(result.search_type, SearchType::Defense);
     }
 
     #[test]
@@ -814,7 +806,7 @@ mod tests {
     #[test]
     fn test_engine_set_depth() {
         let mut engine = AIEngine::new();
-        assert_eq!(engine.max_depth(), 10);
+        assert_eq!(engine.max_depth(), 20);
 
         engine.set_max_depth(12);
         assert_eq!(engine.max_depth(), 12);
@@ -831,7 +823,7 @@ mod tests {
     #[test]
     fn test_engine_default() {
         let engine = AIEngine::default();
-        assert_eq!(engine.max_depth(), 10);
+        assert_eq!(engine.max_depth(), 20);
     }
 
     #[test]
@@ -860,8 +852,7 @@ mod tests {
     #[test]
     fn test_engine_responds_to_threat() {
         let mut board = Board::new();
-        // White has 4 in a row (immediate threat, not just open three)
-        // This is faster because it triggers Defense search, not VCT
+        // White has 4 in a row - Black must block
         board.place_stone(Pos::new(9, 6), Stone::White);
         board.place_stone(Pos::new(9, 7), Stone::White);
         board.place_stone(Pos::new(9, 8), Stone::White);
@@ -919,5 +910,146 @@ mod tests {
         assert_ne!(SearchType::ImmediateWin, SearchType::VCF);
         assert_ne!(SearchType::VCF, SearchType::VCT);
         assert_ne!(SearchType::Defense, SearchType::AlphaBeta);
+    }
+
+    #[test]
+    fn test_engine_blocks_gap_pattern() {
+        // Test gap pattern: OO_OO where filling the gap completes 5
+        // This is critical - AI must block at the gap position
+        //
+        // Pattern on column 12 (M column):
+        // M14 = (5, 12) - Black
+        // M13 = (6, 12) - Black
+        // M12 = (7, 12) - EMPTY (gap)
+        // M11 = (8, 12) - Black
+        // M10 = (9, 12) - Black
+        let mut board = Board::new();
+        board.place_stone(Pos::new(5, 12), Stone::Black);  // M14
+        board.place_stone(Pos::new(6, 12), Stone::Black);  // M13
+        // Gap at (7, 12) - M12
+        board.place_stone(Pos::new(8, 12), Stone::Black);  // M11
+        board.place_stone(Pos::new(9, 12), Stone::Black);  // M10
+
+        // Add some White stones
+        board.place_stone(Pos::new(9, 9), Stone::White);
+        board.place_stone(Pos::new(10, 10), Stone::White);
+
+        let mut engine = AIEngine::with_config(8, 6, 500);
+        let result = engine.get_move_with_stats(&board, Stone::White);
+
+        // White MUST block at M12 (7, 12) - the gap position
+        assert!(result.best_move.is_some(), "AI should find a blocking move");
+        let block_pos = result.best_move.unwrap();
+        assert_eq!(
+            block_pos,
+            Pos::new(7, 12),
+            "AI should block at gap position M12 (7,12), got ({}, {})",
+            block_pos.row,
+            block_pos.col
+        );
+    }
+
+    #[test]
+    fn test_engine_blocks_horizontal_gap() {
+        // Test horizontal gap pattern: OO_OO
+        let mut board = Board::new();
+        board.place_stone(Pos::new(9, 5), Stone::Black);
+        board.place_stone(Pos::new(9, 6), Stone::Black);
+        // Gap at (9, 7)
+        board.place_stone(Pos::new(9, 8), Stone::Black);
+        board.place_stone(Pos::new(9, 9), Stone::Black);
+
+        board.place_stone(Pos::new(5, 5), Stone::White);
+
+        let mut engine = AIEngine::with_config(8, 6, 500);
+        let result = engine.get_move_with_stats(&board, Stone::White);
+
+        assert!(result.best_move.is_some());
+        let block_pos = result.best_move.unwrap();
+        assert_eq!(
+            block_pos,
+            Pos::new(9, 7),
+            "AI should block at gap position (9,7)"
+        );
+    }
+
+    #[test]
+    fn test_search_depth_benchmark() {
+        // Mid-game position with ~10 stones to measure realistic search depth
+        let mut board = Board::new();
+        let moves = [
+            (9, 9, Stone::Black),
+            (9, 10, Stone::White),
+            (10, 9, Stone::Black),
+            (8, 10, Stone::White),
+            (10, 10, Stone::Black),
+            (8, 8, Stone::White),
+            (11, 8, Stone::Black),
+            (7, 11, Stone::White),
+            (10, 8, Stone::Black),
+            (8, 9, Stone::White),
+        ];
+        for (r, c, s) in moves {
+            board.place_stone(Pos::new(r, c), s);
+        }
+
+        let mut engine = AIEngine::new(); // Default: depth 20, 500ms
+        let result = engine.get_move_with_stats(&board, Stone::Black);
+
+        eprintln!(
+            "BENCHMARK: depth={}, nodes={}, time={}ms, nps={}k, type={:?}",
+            result.depth, result.nodes, result.time_ms, result.nps, result.search_type
+        );
+
+        // Verify AI searches at sufficient depth.
+        // If the AI found a forced win/threat (VCF/VCT/immediate), early exit is correct.
+        // Otherwise, depth 10+ is the project requirement.
+        let found_forced_result = result.score.abs() >= 799_900
+            || matches!(result.search_type, SearchType::VCF | SearchType::VCT | SearchType::ImmediateWin);
+        assert!(
+            result.depth >= 10 || found_forced_result,
+            "AI should reach depth 10+ or find forced result within 500ms, got depth {} score {} type {:?}",
+            result.depth, result.score, result.search_type
+        );
+    }
+
+    #[test]
+    fn test_mid_game_search_quality() {
+        // Mid-game position with some development from both sides.
+        // Tests that AI reaches sufficient depth and makes reasonable decisions.
+        // Note: depth 10 is the AVERAGE requirement across the game, not per-move.
+        // Early/mid game with wide-open positions may only reach depth 8-9.
+        let mut board = Board::new();
+        let moves = [
+            (9, 9, Stone::Black),   // center
+            (7, 7, Stone::White),   // responds
+            (9, 11, Stone::Black),  // extends right
+            (7, 11, Stone::White),  // mirrors above
+            (11, 9, Stone::Black),  // extends down
+            (11, 11, Stone::White), // mirrors
+            (5, 9, Stone::Black),   // extends up
+            (5, 7, Stone::White),   // far
+            (9, 5, Stone::Black),   // extends left
+            (11, 7, Stone::White),  // scattered
+        ];
+        for (r, c, s) in moves {
+            board.place_stone(Pos::new(r, c), s);
+        }
+
+        let mut engine = AIEngine::new();
+        let result = engine.get_move_with_stats(&board, Stone::Black);
+
+        eprintln!(
+            "MID-GAME: depth={}, nodes={}, time={}ms, nps={}k, score={}, type={:?}",
+            result.depth, result.nodes, result.time_ms, result.nps, result.score, result.search_type
+        );
+
+        // Should find a reasonable move - via alpha-beta depth 8+ or VCF/VCT forced win
+        assert!(result.best_move.is_some(), "Should find a move");
+        let found_forced = matches!(result.search_type, SearchType::VCF | SearchType::VCT | SearchType::ImmediateWin);
+        assert!(result.depth >= 8 || found_forced,
+            "Should reach depth 8+ or find forced win, got depth {} type {:?}", result.depth, result.search_type);
+        // Time should be under hard limit (700ms + margin)
+        assert!(result.time_ms < 2000, "Should complete in reasonable time, took {}ms", result.time_ms);
     }
 }

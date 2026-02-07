@@ -9,8 +9,8 @@
 
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
 use crate::rules::{
-    can_break_five_by_capture, execute_captures, find_five_positions, get_captured_positions,
-    has_five_in_row, is_valid_move,
+    can_break_five_by_capture, execute_captures_fast, find_five_positions,
+    get_captured_positions, has_five_at_pos, is_valid_move, undo_captures,
 };
 
 /// Direction vectors for line checking (4 directions)
@@ -94,18 +94,19 @@ impl ThreatSearcher {
     pub fn search_vcf(&mut self, board: &Board, color: Stone) -> ThreatResult {
         self.nodes = 0;
         let mut sequence = Vec::new();
+        let mut work_board = board.clone();
 
-        if self.vcf_search(board, color, 0, &mut sequence) {
+        if self.vcf_search_mut(&mut work_board, color, 0, &mut sequence) {
             ThreatResult::found(sequence)
         } else {
             ThreatResult::not_found()
         }
     }
 
-    /// Internal recursive VCF search
-    fn vcf_search(
+    /// Internal recursive VCF search using make/unmake pattern
+    fn vcf_search_mut(
         &mut self,
-        board: &Board,
+        board: &mut Board,
         color: Stone,
         depth: u8,
         sequence: &mut Vec<Pos>,
@@ -121,47 +122,67 @@ impl ThreatSearcher {
 
         for threat_move in threats {
             // Make the threat move
-            let mut new_board = board.clone();
-            new_board.place_stone(threat_move, color);
-            execute_captures(&mut new_board, threat_move, color);
+            board.place_stone(threat_move, color);
+            let cap_info = execute_captures_fast(board, threat_move, color);
 
             sequence.push(threat_move);
 
             // Check for immediate win by five-in-a-row
-            if has_five_in_row(&new_board, color) {
-                if let Some(five) = find_five_positions(&new_board, color) {
-                    if !can_break_five_by_capture(&new_board, &five, color) {
-                        return true;
+            let mut found_win = false;
+            if has_five_at_pos(board, threat_move, color) {
+                if let Some(five) = find_five_positions(board, color) {
+                    if !can_break_five_by_capture(board, &five, color) {
+                        found_win = true;
                     }
                 }
             }
 
             // Check for capture win (5 pairs = 10 stones)
-            if new_board.captures(color) >= 5 {
+            if !found_win && board.captures(color) >= 5 {
+                found_win = true;
+            }
+
+            if found_win {
+                // Unmake before returning (board must be restored)
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
                 return true;
             }
 
             // Find opponent's forced defenses against this four
-            let defenses = self.find_defense_moves(&new_board, threat_move, color);
+            let defenses = self.find_defense_moves(board, threat_move, color);
 
             if defenses.is_empty() {
-                // No defense means we win (opponent cannot block the four)
+                // No defense means we win
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
                 return true;
             }
 
             // If only one defense, opponent is forced to play there
-            // Continue VCF search after their defense
             if defenses.len() == 1 {
                 let defense = defenses[0];
-                let mut def_board = new_board.clone();
-                def_board.place_stone(defense, color.opponent());
-                execute_captures(&mut def_board, defense, color.opponent());
+                let defender = color.opponent();
+                board.place_stone(defense, defender);
+                let def_cap = execute_captures_fast(board, defense, defender);
 
-                if self.vcf_search(&def_board, color, depth + 1, sequence) {
+                let result = self.vcf_search_mut(board, color, depth + 1, sequence);
+
+                // Unmake defense
+                undo_captures(board, defender, &def_cap);
+                board.remove_stone(defense);
+
+                if result {
+                    undo_captures(board, color, &cap_info);
+                    board.remove_stone(threat_move);
                     return true;
                 }
             }
-            // Multiple defenses: VCF fails at this branch (opponent has choice)
+            // Multiple defenses: VCF fails at this branch
+
+            // Unmake threat move
+            undo_captures(board, color, &cap_info);
+            board.remove_stone(threat_move);
 
             sequence.pop();
         }
@@ -399,24 +420,25 @@ impl ThreatSearcher {
     pub fn search_vct(&mut self, board: &Board, color: Stone) -> ThreatResult {
         self.nodes = 0;
         let mut sequence = Vec::new();
+        let mut work_board = board.clone();
 
         // First try VCF (faster and more forcing)
-        if self.vcf_search(board, color, 0, &mut sequence) {
+        if self.vcf_search_mut(&mut work_board, color, 0, &mut sequence) {
             return ThreatResult::found(sequence);
         }
 
         sequence.clear();
-        if self.vct_search(board, color, 0, &mut sequence) {
+        if self.vct_search_mut(&mut work_board, color, 0, &mut sequence) {
             ThreatResult::found(sequence)
         } else {
             ThreatResult::not_found()
         }
     }
 
-    /// Internal recursive VCT search
-    fn vct_search(
+    /// Internal recursive VCT search using make/unmake pattern
+    fn vct_search_mut(
         &mut self,
-        board: &Board,
+        board: &mut Board,
         color: Stone,
         depth: u8,
         sequence: &mut Vec<Pos>,
@@ -432,53 +454,73 @@ impl ThreatSearcher {
 
         for threat_move in threats {
             // Make the threat move
-            let mut new_board = board.clone();
-            new_board.place_stone(threat_move, color);
-            execute_captures(&mut new_board, threat_move, color);
+            board.place_stone(threat_move, color);
+            let cap_info = execute_captures_fast(board, threat_move, color);
 
             sequence.push(threat_move);
 
             // Check for immediate win
-            if has_five_in_row(&new_board, color) {
-                if let Some(five) = find_five_positions(&new_board, color) {
-                    if !can_break_five_by_capture(&new_board, &five, color) {
-                        return true;
+            let mut found_win = false;
+            if has_five_at_pos(board, threat_move, color) {
+                if let Some(five) = find_five_positions(board, color) {
+                    if !can_break_five_by_capture(board, &five, color) {
+                        found_win = true;
                     }
                 }
             }
 
-            if new_board.captures(color) >= 5 {
+            if !found_win && board.captures(color) >= 5 {
+                found_win = true;
+            }
+
+            if found_win {
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
                 return true;
             }
 
             // Try VCF from this position (faster path to victory)
             let mut vcf_seq = Vec::new();
-            if self.vcf_search(&new_board, color, 0, &mut vcf_seq) {
+            if self.vcf_search_mut(board, color, 0, &mut vcf_seq) {
                 sequence.extend(vcf_seq);
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
                 return true;
             }
 
             // Find all possible defenses
-            let defenses = self.find_threat_defenses(&new_board, threat_move, color);
+            let defenses = self.find_threat_defenses(board, threat_move, color);
 
             if defenses.is_empty() {
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
                 return true;
             }
 
             // For VCT, we need to beat ALL possible defenses
             let mut all_defenses_beaten = true;
+            let defender = color.opponent();
             for defense in &defenses {
-                let mut def_board = new_board.clone();
-                def_board.place_stone(*defense, color.opponent());
-                execute_captures(&mut def_board, *defense, color.opponent());
+                board.place_stone(*defense, defender);
+                let def_cap = execute_captures_fast(board, *defense, defender);
 
                 // Recursively try to find a win against this defense
                 let mut sub_sequence = sequence.clone();
-                if !self.vct_search(&def_board, color, depth + 1, &mut sub_sequence) {
+                let beaten = self.vct_search_mut(board, color, depth + 1, &mut sub_sequence);
+
+                // Unmake defense
+                undo_captures(board, defender, &def_cap);
+                board.remove_stone(*defense);
+
+                if !beaten {
                     all_defenses_beaten = false;
                     break;
                 }
             }
+
+            // Unmake threat move
+            undo_captures(board, color, &cap_info);
+            board.remove_stone(threat_move);
 
             if all_defenses_beaten {
                 return true;
