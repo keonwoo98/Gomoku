@@ -21,6 +21,8 @@
 //! }
 //! ```
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::board::Pos;
 
 /// Entry type for score interpretation
@@ -230,6 +232,224 @@ pub struct TTStats {
     pub used: usize,
     /// Percentage of table in use (0-100)
     pub usage_percent: u8,
+}
+
+// =============================================================================
+// Lock-free AtomicTT for Lazy SMP parallel search
+// =============================================================================
+
+/// Pack a TT entry into a u64 for atomic storage.
+///
+/// Layout (42 bits used):
+/// ```text
+/// bits [0..7]   depth (i8 → u8: +128 offset)        8 bits
+/// bits [8..28]  score (i32 → u21: +1_048_576)       21 bits
+/// bits [29..30] entry_type (0=Exact,1=LB,2=UB)       2 bits
+/// bits [31]     has_move (bool)                       1 bit
+/// bits [32..36] row (u5, 0-18)                        5 bits
+/// bits [37..41] col (u5, 0-18)                        5 bits
+/// ```
+fn pack_entry(depth: i8, score: i32, entry_type: EntryType, best_move: Option<Pos>) -> u64 {
+    let d = (depth as i16 + 128) as u64 & 0xFF;
+    let s = (score as i64 + 1_048_576) as u64 & 0x1F_FFFF; // 21 bits
+    let t = match entry_type {
+        EntryType::Exact => 0u64,
+        EntryType::LowerBound => 1u64,
+        EntryType::UpperBound => 2u64,
+    };
+    let (has_move, row, col) = match best_move {
+        Some(p) => (1u64, p.row as u64, p.col as u64),
+        None => (0u64, 0u64, 0u64),
+    };
+    d | (s << 8) | (t << 29) | (has_move << 31) | (row << 32) | (col << 37)
+}
+
+/// Unpack a u64 back into TT entry fields.
+fn unpack_entry(data: u64) -> (i8, i32, EntryType, Option<Pos>) {
+    let d = (data & 0xFF) as i16 - 128;
+    let depth = d as i8;
+    let s = ((data >> 8) & 0x1F_FFFF) as i64 - 1_048_576;
+    let score = s as i32;
+    let t = (data >> 29) & 0x3;
+    let entry_type = match t {
+        0 => EntryType::Exact,
+        1 => EntryType::LowerBound,
+        _ => EntryType::UpperBound,
+    };
+    let has_move = ((data >> 31) & 1) != 0;
+    let best_move = if has_move {
+        let row = ((data >> 32) & 0x1F) as u8;
+        let col = ((data >> 37) & 0x1F) as u8;
+        Some(Pos::new(row, col))
+    } else {
+        None
+    };
+    (depth, score, entry_type, best_move)
+}
+
+/// Lock-free transposition table for Lazy SMP parallel search.
+///
+/// Uses XOR trick (Hyatt 1994): each slot stores `(key, data)` where
+/// `key = hash ^ data`. On probe, validity is checked via `key ^ data == hash`.
+/// Torn reads (partial writes from concurrent threads) fail the hash check
+/// and are treated as cache misses — safe and lock-free.
+///
+/// All methods take `&self` (not `&mut self`), enabling `Arc<AtomicTT>` sharing.
+pub struct AtomicTT {
+    keys: Vec<AtomicU64>,
+    data: Vec<AtomicU64>,
+    size: usize,
+}
+
+// Safety: AtomicTT only contains AtomicU64 + usize, all thread-safe.
+unsafe impl Sync for AtomicTT {}
+unsafe impl Send for AtomicTT {}
+
+impl AtomicTT {
+    /// Create a new atomic transposition table with the given size in megabytes.
+    #[must_use]
+    pub fn new(size_mb: usize) -> Self {
+        // Each slot = 2 x AtomicU64 = 16 bytes
+        let slot_size = 16usize;
+        let size = ((size_mb * 1024 * 1024) / slot_size).max(1024);
+
+        let mut keys = Vec::with_capacity(size);
+        let mut data = Vec::with_capacity(size);
+        for _ in 0..size {
+            keys.push(AtomicU64::new(0));
+            data.push(AtomicU64::new(0));
+        }
+
+        Self { keys, data, size }
+    }
+
+    /// Probe the table for a position.
+    ///
+    /// Returns `Some((score, best_move))` if valid entry found.
+    /// Score is 0 if entry exists but depth insufficient (best_move still returned).
+    #[must_use]
+    pub fn probe(&self, hash: u64, depth: i8, alpha: i32, beta: i32) -> Option<(i32, Option<Pos>)> {
+        let idx = (hash as usize) % self.size;
+        let key = self.keys[idx].load(Ordering::Relaxed);
+        let raw_data = self.data[idx].load(Ordering::Relaxed);
+
+        // Empty slot
+        if key == 0 && raw_data == 0 {
+            return None;
+        }
+
+        // XOR verification: torn read → hash mismatch → safe miss
+        if key ^ raw_data != hash {
+            return None;
+        }
+
+        let (entry_depth, score, entry_type, best_move) = unpack_entry(raw_data);
+
+        if entry_depth >= depth {
+            match entry_type {
+                EntryType::Exact => return Some((score, best_move)),
+                EntryType::LowerBound if score >= beta => return Some((score, best_move)),
+                EntryType::UpperBound if score <= alpha => return Some((score, best_move)),
+                _ => {}
+            }
+        }
+
+        // Return best move for ordering even if score not usable
+        Some((0, best_move))
+    }
+
+    /// Get best move from the table for move ordering.
+    #[must_use]
+    pub fn get_best_move(&self, hash: u64) -> Option<Pos> {
+        let idx = (hash as usize) % self.size;
+        let key = self.keys[idx].load(Ordering::Relaxed);
+        let raw_data = self.data[idx].load(Ordering::Relaxed);
+
+        if key == 0 && raw_data == 0 {
+            return None;
+        }
+        if key ^ raw_data != hash {
+            return None;
+        }
+
+        let (_depth, _score, _entry_type, best_move) = unpack_entry(raw_data);
+        best_move
+    }
+
+    /// Store a position in the table (&self — safe for concurrent access).
+    ///
+    /// Uses depth-preferred replacement: replaces if deeper or same hash.
+    /// XOR trick: stores key = hash ^ data so concurrent reads can detect torn writes.
+    pub fn store(
+        &self,
+        hash: u64,
+        depth: i8,
+        score: i32,
+        entry_type: EntryType,
+        best_move: Option<Pos>,
+    ) {
+        let idx = (hash as usize) % self.size;
+
+        // Check replacement policy: replace if empty, same hash, or deeper
+        let existing_data = self.data[idx].load(Ordering::Relaxed);
+        let existing_key = self.keys[idx].load(Ordering::Relaxed);
+        if existing_data != 0 || existing_key != 0 {
+            let existing_hash = existing_key ^ existing_data;
+            if existing_hash != hash {
+                // Different position: only replace if deeper
+                let (existing_depth, _, _, _) = unpack_entry(existing_data);
+                if depth < existing_depth {
+                    return;
+                }
+            }
+        }
+
+        let packed = pack_entry(depth, score, entry_type, best_move);
+        let key = hash ^ packed;
+        // Write data first, then key. This ordering means a concurrent reader
+        // either sees old (key, data) pair or gets a hash mismatch on torn read.
+        self.data[idx].store(packed, Ordering::Relaxed);
+        self.keys[idx].store(key, Ordering::Relaxed);
+    }
+
+    /// Clear all entries (&self — safe for concurrent access).
+    pub fn clear(&self) {
+        for i in 0..self.size {
+            self.keys[i].store(0, Ordering::Relaxed);
+            self.data[i].store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Get statistics about table usage.
+    ///
+    /// Note: This is approximate under concurrent access.
+    #[must_use]
+    pub fn stats(&self) -> TTStats {
+        let mut used = 0usize;
+        // Sample every 64th entry for speed (approximate is fine for stats)
+        let step = if self.size > 65536 { 64 } else { 1 };
+        let mut sampled = 0usize;
+        let mut i = 0;
+        while i < self.size {
+            sampled += 1;
+            let k = self.keys[i].load(Ordering::Relaxed);
+            let d = self.data[i].load(Ordering::Relaxed);
+            if k != 0 || d != 0 {
+                used += 1;
+            }
+            i += step;
+        }
+        let estimated_used = if step > 1 {
+            used * self.size / sampled
+        } else {
+            used
+        };
+        TTStats {
+            size: self.size,
+            used: estimated_used,
+            usage_percent: (estimated_used as f64 / self.size as f64 * 100.0) as u8,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +682,161 @@ mod tests {
         let entry_size = std::mem::size_of::<Option<TTEntry>>();
         let expected_size = (1024 * 1024) / entry_size;
         assert_eq!(tt.size, expected_size.max(1024));
+    }
+
+    // =========================================================================
+    // AtomicTT tests
+    // =========================================================================
+
+    #[test]
+    fn test_pack_unpack_roundtrip() {
+        let cases: Vec<(i8, i32, EntryType, Option<Pos>)> = vec![
+            (5, 100, EntryType::Exact, Some(Pos::new(9, 9))),
+            (-3, -500_000, EntryType::LowerBound, None),
+            (0, 0, EntryType::UpperBound, Some(Pos::new(0, 0))),
+            (15, 999_999, EntryType::Exact, Some(Pos::new(18, 18))),
+            (-128, -1_048_575, EntryType::LowerBound, Some(Pos::new(0, 18))),
+            (127, 1_048_575, EntryType::UpperBound, Some(Pos::new(18, 0))),
+        ];
+        for (depth, score, et, bm) in cases {
+            let packed = pack_entry(depth, score, et, bm);
+            let (d, s, t, m) = unpack_entry(packed);
+            assert_eq!(d, depth, "depth mismatch for ({}, {})", depth, score);
+            assert_eq!(s, score, "score mismatch for ({}, {})", depth, score);
+            assert_eq!(t, et, "type mismatch for ({}, {})", depth, score);
+            assert_eq!(m, bm, "move mismatch for ({}, {})", depth, score);
+        }
+    }
+
+    #[test]
+    fn test_atomic_tt_store_probe_exact() {
+        let tt = AtomicTT::new(1);
+        let hash = 0x123456789ABCDEF0;
+
+        tt.store(hash, 5, 100, EntryType::Exact, Some(Pos::new(9, 9)));
+
+        let result = tt.probe(hash, 5, -1000, 1000);
+        assert!(result.is_some());
+        let (score, best_move) = result.unwrap();
+        assert_eq!(score, 100);
+        assert_eq!(best_move, Some(Pos::new(9, 9)));
+    }
+
+    #[test]
+    fn test_atomic_tt_depth_requirement() {
+        let tt = AtomicTT::new(1);
+        let hash = 0x123456789ABCDEF0;
+
+        tt.store(hash, 3, 100, EntryType::Exact, Some(Pos::new(5, 5)));
+
+        let result = tt.probe(hash, 5, -1000, 1000);
+        assert!(result.is_some());
+        let (score, best_move) = result.unwrap();
+        assert_eq!(score, 0); // Depth insufficient
+        assert_eq!(best_move, Some(Pos::new(5, 5))); // Move still returned
+    }
+
+    #[test]
+    fn test_atomic_tt_bounds() {
+        let tt = AtomicTT::new(1);
+
+        // LowerBound
+        let hash_lb = 0x111;
+        tt.store(hash_lb, 5, 200, EntryType::LowerBound, None);
+        assert_eq!(tt.probe(hash_lb, 5, -1000, 150).unwrap().0, 200); // 200 >= 150
+        assert_eq!(tt.probe(hash_lb, 5, -1000, 300).unwrap().0, 0); // 200 < 300
+
+        // UpperBound
+        let hash_ub = 0x222;
+        tt.store(hash_ub, 5, 50, EntryType::UpperBound, None);
+        assert_eq!(tt.probe(hash_ub, 5, 100, 1000).unwrap().0, 50); // 50 <= 100
+        assert_eq!(tt.probe(hash_ub, 5, 30, 1000).unwrap().0, 0); // 50 > 30
+    }
+
+    #[test]
+    fn test_atomic_tt_hash_mismatch() {
+        let tt = AtomicTT::new(1);
+        tt.store(0xAABBCCDD_11223344, 5, 100, EntryType::Exact, Some(Pos::new(9, 9)));
+
+        // Different hash should return None (XOR check fails)
+        let result = tt.probe(0xFFEEDDCC_44332211, 5, -1000, 1000);
+        // Either None or (0, _) since hash verification fails
+        match result {
+            None => {} // expected
+            Some((score, _)) => assert_eq!(score, 0),
+        }
+    }
+
+    #[test]
+    fn test_atomic_tt_get_best_move() {
+        let tt = AtomicTT::new(1);
+        let hash = 0x123456789ABCDEF0;
+
+        tt.store(hash, 5, 100, EntryType::Exact, Some(Pos::new(9, 9)));
+        assert_eq!(tt.get_best_move(hash), Some(Pos::new(9, 9)));
+        assert!(tt.get_best_move(0xFFFF_FFFF_FFFF_FFFF).is_none());
+    }
+
+    #[test]
+    fn test_atomic_tt_clear() {
+        let tt = AtomicTT::new(1);
+        let hash = 0x123456789ABCDEF0;
+
+        tt.store(hash, 5, 100, EntryType::Exact, None);
+        tt.clear();
+
+        assert!(tt.probe(hash, 5, -1000, 1000).is_none());
+    }
+
+    #[test]
+    fn test_atomic_tt_stats() {
+        let tt = AtomicTT::new(1);
+        let stats = tt.stats();
+        assert_eq!(stats.used, 0);
+
+        tt.store(0x111, 5, 100, EntryType::Exact, None);
+        tt.store(0x222, 5, 100, EntryType::Exact, None);
+
+        let stats = tt.stats();
+        assert!(stats.used >= 2);
+    }
+
+    #[test]
+    fn test_atomic_tt_replacement_policy() {
+        let tt = AtomicTT::new(1);
+        let hash = 0x123456789ABCDEF0;
+
+        // Store shallow, then deeper — deeper replaces
+        tt.store(hash, 3, 100, EntryType::Exact, Some(Pos::new(5, 5)));
+        tt.store(hash, 5, 200, EntryType::Exact, Some(Pos::new(9, 9)));
+        assert_eq!(tt.probe(hash, 5, -1000, 1000).unwrap().0, 200);
+    }
+
+    #[test]
+    fn test_atomic_tt_concurrent_safety() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tt = Arc::new(AtomicTT::new(1));
+        let mut handles = Vec::new();
+
+        // Spawn 4 threads writing different entries concurrently
+        for t in 0..4u64 {
+            let tt = Arc::clone(&tt);
+            handles.push(thread::spawn(move || {
+                for i in 0..1000u64 {
+                    let hash = t * 100_000 + i;
+                    tt.store(hash, 5, (i as i32) * 10, EntryType::Exact, Some(Pos::new(9, 9)));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify: some entries should be readable (exact count depends on collisions)
+        let stats = tt.stats();
+        assert!(stats.used > 0, "Should have some entries after concurrent writes");
     }
 }

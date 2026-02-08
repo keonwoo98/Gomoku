@@ -9,6 +9,7 @@
 //! - Transposition table for avoiding redundant searches
 //! - Early cutoff when winning move is found
 //! - Move generation with proximity filtering
+//! - **Lazy SMP**: parallel search with lock-free shared TT
 //!
 //! # Example
 //!
@@ -25,6 +26,8 @@
 //! }
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
@@ -33,7 +36,7 @@ use crate::rules::{
     count_captures_fast, execute_captures_fast, has_five_at_pos, is_valid_move, undo_captures,
 };
 
-use super::{EntryType, TranspositionTable, TTStats, ZobristTable};
+use super::{AtomicTT, EntryType, TTStats, ZobristTable};
 
 /// Infinity score for alpha-beta bounds
 const INF: i32 = PatternScore::FIVE + 1;
@@ -41,7 +44,7 @@ const INF: i32 = PatternScore::FIVE + 1;
 /// Maximum moves to consider at root.
 /// Defense-first move ordering puts critical moves at the top,
 /// so we don't need as many to catch all threats.
-const MAX_ROOT_MOVES: usize = 20;
+const MAX_ROOT_MOVES: usize = 30;
 
 /// Maximum moves to consider at internal nodes at high remaining depth.
 /// Defense-first move ordering (score_move) ensures critical blocking
@@ -62,126 +65,82 @@ pub struct SearchResult {
     pub nodes: u64,
 }
 
-/// Alpha-Beta search engine with iterative deepening and transposition table.
-///
-/// The searcher maintains a transposition table across searches for efficiency.
-/// For a new game, call `clear_tt()` to reset the cached positions.
-pub struct Searcher {
+// =============================================================================
+// SharedState: thread-safe state shared across all workers
+// =============================================================================
+
+/// State shared between all search worker threads.
+struct SharedState {
     zobrist: ZobristTable,
-    tt: TranspositionTable,
+    tt: AtomicTT,
+    /// Global stop signal — set by main thread when time is up.
+    stopped: AtomicBool,
+}
+
+// =============================================================================
+// WorkerSearcher: per-thread search state
+// =============================================================================
+
+/// Per-thread search worker. Each worker has its own killer/history tables
+/// and shares the TT + zobrist via Arc<SharedState>.
+struct WorkerSearcher {
+    shared: Arc<SharedState>,
     nodes: u64,
     max_depth: i8,
     killer_moves: [[Option<Pos>; 2]; 64],
     history: [[[i32; BOARD_SIZE]; BOARD_SIZE]; 2],
     start_time: Option<Instant>,
     time_limit: Option<Duration>,
-    stopped: bool,
 }
 
-impl Searcher {
-    /// Create a new searcher with the specified transposition table size.
-    ///
-    /// # Arguments
-    ///
-    /// * `tt_size_mb` - Size of transposition table in megabytes
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use gomoku::search::Searcher;
-    ///
-    /// let searcher = Searcher::new(32); // 32 MB table
-    /// ```
-    #[must_use]
-    pub fn new(tt_size_mb: usize) -> Self {
+impl WorkerSearcher {
+    fn new(
+        shared: Arc<SharedState>,
+        max_depth: i8,
+        start_time: Instant,
+        time_limit: Duration,
+    ) -> Self {
         Self {
-            zobrist: ZobristTable::new(),
-            tt: TranspositionTable::new(tt_size_mb),
+            shared,
             nodes: 0,
-            max_depth: 10,
+            max_depth,
             killer_moves: [[None; 2]; 64],
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
-            start_time: None,
-            time_limit: None,
-            stopped: false,
+            start_time: Some(start_time),
+            time_limit: Some(time_limit),
         }
     }
 
-    /// Search for the best move using iterative deepening.
-    ///
-    /// Performs iterative deepening alpha-beta search up to the specified
-    /// maximum depth. Returns early if a winning move is found.
-    ///
-    /// # Arguments
-    ///
-    /// * `board` - Current board state
-    /// * `color` - Color to move
-    /// * `max_depth` - Maximum search depth
-    ///
-    /// # Returns
-    ///
-    /// `SearchResult` containing the best move, score, depth reached, and node count.
-    #[must_use]
-    pub fn search(&mut self, board: &Board, color: Stone, max_depth: i8) -> SearchResult {
-        self.nodes = 0;
-        self.killer_moves = [[None; 2]; 64];
-        // Don't clear history - it persists across iterative deepening depths
-        self.max_depth = max_depth;
-
-        let mut best_result = SearchResult {
-            best_move: None,
-            score: 0,
-            depth: 0,
-            nodes: 0,
-        };
-
-        // Clone board once for make/unmake during search
-        let mut work_board = board.clone();
-
-        // Iterative deepening: search progressively deeper
-        for depth in 1..=max_depth {
-            let result = self.search_root(&mut work_board, color, depth, -INF, INF);
-            best_result = result;
-            best_result.depth = depth;
-
-            // Early exit: winning at depth 10+ or confirmed loss at 8+
-            if best_result.score >= PatternScore::FIVE - 100 && depth >= 10 {
-                break;
-            }
-            if best_result.score <= -(PatternScore::FIVE - 100) && depth >= 8 {
-                break;
-            }
-        }
-
-        best_result.nodes = self.nodes;
-        best_result
+    /// Check if search should stop (time limit or global stop signal).
+    #[inline]
+    fn is_stopped(&self) -> bool {
+        self.shared.stopped.load(Ordering::Relaxed)
     }
 
-    /// Search with smart time management. Returns the best result found within the time budget.
-    ///
-    /// Two hard constraints (project requirements):
-    /// 1. **Minimum depth 10** — always reached regardless of time
-    /// 2. **Average < 500ms** — time prediction prevents over-runs beyond depth 10
-    ///
-    /// Strategy: always complete depth 10, then use predictive time control
-    /// to decide whether deeper search is worthwhile.
-    #[must_use]
-    pub fn search_timed(
+    /// Check time and set global stop if exceeded.
+    #[inline]
+    fn check_time(&self) -> bool {
+        if self.shared.stopped.load(Ordering::Relaxed) {
+            return true;
+        }
+        if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
+            if start.elapsed() >= limit {
+                self.shared.stopped.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Iterative deepening search. `start_depth_offset` allows workers
+    /// to begin at different depths for natural tree diversification.
+    fn search_iterative(
         &mut self,
         board: &Board,
         color: Stone,
         max_depth: i8,
-        time_limit_ms: u64,
+        start_depth_offset: i8,
     ) -> SearchResult {
-        self.start_time = Some(Instant::now());
-        // Hard time limit is generous — allows depth 10 to complete even if slow.
-        // The soft limit (time prediction) handles staying near 500ms average.
-        self.time_limit = Some(Duration::from_millis((time_limit_ms + 200).max(300)));
-        self.stopped = false;
-        self.nodes = 0;
-        self.max_depth = max_depth;
-        self.killer_moves = [[None; 2]; 64];
-
         let mut best_result = SearchResult {
             best_move: None,
             score: 0,
@@ -190,23 +149,23 @@ impl Searcher {
         };
 
         let mut work_board = board.clone();
-        let search_start = Instant::now();
-        let soft_limit = Duration::from_millis(time_limit_ms);
+        let search_start = self.start_time.unwrap_or_else(Instant::now);
+        let soft_limit = self.time_limit.unwrap_or(Duration::from_millis(500));
         let mut prev_depth_time = Duration::ZERO;
 
-        /// Minimum depth the AI must always complete (project requirement).
-        const MIN_DEPTH: i8 = 10;
-        /// Aspiration window size for iterative deepening
+        let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 10 };
         const ASP_WINDOW: i32 = 100;
 
-        for depth in 1..=max_depth {
-            if self.stopped {
+        // Workers with offset skip early depths (they're cheap anyway and TT handles it)
+        let first_depth = (1 + start_depth_offset).max(1);
+
+        for depth in first_depth..=max_depth {
+            if self.is_stopped() {
                 break;
             }
 
             let depth_start = Instant::now();
 
-            // Aspiration windows: narrow search bounds based on previous result
             let (mut asp_alpha, mut asp_beta) = if depth >= 3
                 && best_result.score.abs() < PatternScore::FIVE - 100
             {
@@ -217,24 +176,19 @@ impl Searcher {
 
             let result = loop {
                 let result = self.search_root(&mut work_board, color, depth, asp_alpha, asp_beta);
-                if self.stopped {
+                if self.is_stopped() {
                     break result;
                 }
                 if result.score <= asp_alpha {
-                    // Fail low: widen alpha
                     asp_alpha = (result.score - ASP_WINDOW * 4).max(-INF);
                 } else if result.score >= asp_beta {
-                    // Fail high: widen beta
                     asp_beta = (result.score + ASP_WINDOW * 4).min(INF);
                 } else {
-                    // Result within window
                     break result;
                 }
             };
 
-            if self.stopped {
-                // Search was interrupted mid-depth by hard time limit.
-                // Keep previous completed depth's result.
+            if self.is_stopped() {
                 break;
             }
 
@@ -251,9 +205,7 @@ impl Searcher {
                 break;
             }
 
-            // Below minimum depth: continue, but allow early stop at depth 8+
-            // if past soft time limit (wide-open positions in early game)
-            if depth < MIN_DEPTH {
+            if depth < min_depth {
                 if depth >= 8 && total_elapsed > soft_limit {
                     break;
                 }
@@ -261,9 +213,7 @@ impl Searcher {
                 continue;
             }
 
-            // Above minimum depth: use smart time prediction.
             let remaining = soft_limit.saturating_sub(total_elapsed);
-
             let estimated_next = if prev_depth_time.as_millis() > 0 && depth_time.as_millis() > 0 {
                 let bf = depth_time.as_millis() as f64 / prev_depth_time.as_millis().max(1) as f64;
                 let bf = bf.clamp(1.5, 5.0);
@@ -274,64 +224,94 @@ impl Searcher {
 
             prev_depth_time = depth_time;
 
-            // Don't start next depth if estimated time exceeds remaining soft budget
             if estimated_next > remaining {
                 break;
             }
         }
 
         best_result.nodes = self.nodes;
-        self.start_time = None;
-        self.time_limit = None;
         best_result
     }
 
     /// Root-level search with full alpha-beta window.
-    /// Uses make/unmake pattern to avoid board cloning per move.
-    fn search_root(&mut self, board: &mut Board, color: Stone, depth: i8, mut alpha: i32, beta: i32) -> SearchResult {
+    fn search_root(
+        &mut self,
+        board: &mut Board,
+        color: Stone,
+        depth: i8,
+        mut alpha: i32,
+        beta: i32,
+    ) -> SearchResult {
         let mut best_move = None;
         let mut best_score = -INF;
 
-        let hash = self.zobrist.hash(board, color);
-        let tt_move = self.tt.get_best_move(hash);
+        let hash = self.shared.zobrist.hash(board, color);
+        let tt_move = self.shared.tt.get_best_move(hash);
         let mut moves = self.generate_moves_ordered(board, color, tt_move, depth);
         moves.truncate(MAX_ROOT_MOVES);
 
         for (i, mov) in moves.iter().enumerate() {
-            // Make move
             board.place_stone(*mov, color);
             let cap_info = execute_captures_fast(board, *mov, color);
 
-            // Compute child hash incrementally (O(1) per stone)
-            let mut child_hash = self.zobrist.update_place(hash, *mov, color);
+            let mut child_hash = self.shared.zobrist.update_place(hash, *mov, color);
             for j in 0..cap_info.count as usize {
-                child_hash = self.zobrist.update_capture(child_hash, cap_info.positions[j], color.opponent());
+                child_hash = self.shared.zobrist.update_capture(
+                    child_hash,
+                    cap_info.positions[j],
+                    color.opponent(),
+                );
             }
             if cap_info.pairs > 0 {
                 let new_count = board.captures(color);
                 let old_count = new_count - cap_info.pairs;
-                child_hash = self.zobrist.update_capture_count(child_hash, color, old_count, new_count);
+                child_hash =
+                    self.shared
+                        .zobrist
+                        .update_capture_count(child_hash, color, old_count, new_count);
             }
 
             let score = if i == 0 {
-                -self.alpha_beta(board, color.opponent(), depth - 1, -beta, -alpha, *mov, child_hash, true)
+                -self.alpha_beta(
+                    board,
+                    color.opponent(),
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    *mov,
+                    child_hash,
+                    true,
+                )
             } else {
                 let mut s = -self.alpha_beta(
-                    board, color.opponent(), depth - 1, -(alpha + 1), -alpha, *mov, child_hash, true,
+                    board,
+                    color.opponent(),
+                    depth - 1,
+                    -(alpha + 1),
+                    -alpha,
+                    *mov,
+                    child_hash,
+                    true,
                 );
-                if !self.stopped && s > alpha && s < beta {
+                if !self.is_stopped() && s > alpha && s < beta {
                     s = -self.alpha_beta(
-                        board, color.opponent(), depth - 1, -beta, -alpha, *mov, child_hash, true,
+                        board,
+                        color.opponent(),
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        *mov,
+                        child_hash,
+                        true,
                     );
                 }
                 s
             };
 
-            // Unmake move
             undo_captures(board, color, &cap_info);
             board.remove_stone(*mov);
 
-            if self.stopped {
+            if self.is_stopped() {
                 break;
             }
 
@@ -351,22 +331,16 @@ impl Searcher {
         }
     }
 
-    /// Check if the side to move faces an immediate tactical threat
-    /// (opponent has a four-in-a-row or is one capture from winning).
-    /// Used to skip Null Move Pruning in threatened positions.
-    /// O(4) constant time — only checks lines through last_move.
+    /// Check if the side to move faces an immediate tactical threat.
     fn is_threatened(board: &Board, color: Stone, last_move: Pos) -> bool {
-        // Opponent near capture win
         let opp = color.opponent();
         if board.captures(opp) >= 4 {
             return true;
         }
-        // Check if the last opponent move created a four-in-a-row
         let sz = BOARD_SIZE as i8;
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         for (dr, dc) in dirs {
             let mut count = 1i32;
-            // Positive direction
             let mut r = last_move.row as i8 + dr;
             let mut c = last_move.col as i8 + dc;
             while r >= 0 && r < sz && c >= 0 && c < sz {
@@ -378,7 +352,6 @@ impl Searcher {
                     break;
                 }
             }
-            // Negative direction
             r = last_move.row as i8 - dr;
             c = last_move.col as i8 - dc;
             while r >= 0 && r < sz && c >= 0 && c < sz {
@@ -398,13 +371,6 @@ impl Searcher {
     }
 
     /// Recursive alpha-beta search with negamax formulation.
-    ///
-    /// Pruning techniques applied:
-    /// 1. **Transposition Table** — cached results from identical positions
-    /// 2. **Null Move Pruning** — skip our turn; if still >= beta, prune (b_eff -30~40%)
-    /// 3. **Futility Pruning** — at depth 1-2, skip hopeless moves (leaf nodes -60~70%)
-    /// 4. **PVS** — null-window search for non-PV moves
-    /// 5. **LMR** — reduced depth for late, non-tactical moves (b_eff -20%)
     fn alpha_beta(
         &mut self,
         board: &mut Board,
@@ -420,19 +386,16 @@ impl Searcher {
 
         // Time check every 1024 nodes
         if self.nodes & 1023 == 0 {
-            if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
-                if start.elapsed() >= limit {
-                    self.stopped = true;
-                    return 0;
-                }
+            if self.check_time() {
+                return 0;
             }
         }
 
-        if self.stopped {
+        if self.is_stopped() {
             return 0;
         }
 
-        // Fast terminal check: only at last_move position (no full board scan)
+        // Fast terminal check
         let last_player = color.opponent();
         if board.captures(last_player) >= 5 {
             return -PatternScore::FIVE;
@@ -441,78 +404,67 @@ impl Searcher {
             return -PatternScore::FIVE;
         }
 
-        // Depth limit reached - evaluate position
         if depth <= 0 {
             return evaluate(board, color);
         }
 
-        // Transposition table probe
-        if let Some((score, _best_move)) = self.tt.probe(hash, depth, alpha, beta) {
+        // TT probe
+        if let Some((score, _best_move)) = self.shared.tt.probe(hash, depth, alpha, beta) {
             if score != 0 {
                 return score;
             }
         }
 
-        // ===== NULL MOVE PRUNING =====
-        // If we skip our turn and the position is STILL >= beta,
-        // then the position is so good we can prune without searching.
-        // Don't use: at root, in threatened positions, at shallow depth, after a null move.
+        // Null Move Pruning
         if allow_null && depth >= 3 && !Self::is_threatened(board, color, last_move) {
-            // Adaptive reduction: R=3 for deep, R=2 for shallow
             let r = if depth >= 5 { 3i8 } else { 2i8 };
             let null_depth = (depth - 1 - r).max(0);
 
-            // Null move = pass turn, search with zero window around beta
-            // We flip the hash's side-to-move bit by just using the same hash
-            // (since Zobrist doesn't encode side-to-move separately in our impl)
             let null_score = -self.alpha_beta(
-                board, color.opponent(), null_depth,
-                -beta, -(beta - 1), last_move, hash,
-                false, // no consecutive null moves
+                board,
+                color.opponent(),
+                null_depth,
+                -beta,
+                -(beta - 1),
+                last_move,
+                hash,
+                false,
             );
 
-            if !self.stopped && null_score >= beta {
-                // Verify with a shallow search to avoid zugzwang errors
+            if !self.is_stopped() && null_score >= beta {
                 if depth <= 8 {
                     return beta;
                 }
-                // For deep nodes, do a verification search at reduced depth
                 let verify = self.alpha_beta(
-                    board, color, depth - r, alpha, beta,
-                    last_move, hash, false,
+                    board, color, depth - r, alpha, beta, last_move, hash, false,
                 );
-                if !self.stopped && verify >= beta {
+                if !self.is_stopped() && verify >= beta {
                     return beta;
                 }
             }
         }
 
-        let tt_move = self.tt.get_best_move(hash);
+        let tt_move = self.shared.tt.get_best_move(hash);
         let mut moves = self.generate_moves_ordered(board, color, tt_move, depth);
         if moves.is_empty() {
             return evaluate(board, color);
         }
 
-        // Graduated move limits — keep tight for speed (depth 10 in 500ms).
-        // Better move ordering (two-detection, reduced vulnerability penalty)
-        // ensures the top moves are the right ones.
         let max_moves = match depth {
-            0..=1 => 5,
-            2..=3 => 7,
-            4..=5 => 9,
-            _ => 11,
+            0..=1 => 7,
+            2..=3 => 9,
+            4..=5 => 12,
+            _ => 15,
         };
         moves.truncate(max_moves);
 
-        // ===== FUTILITY PRUNING SETUP =====
-        // At shallow depths, compute static eval once. If eval + margin < alpha,
-        // non-tactical moves can be skipped (they can't possibly raise alpha).
+        // Futility pruning setup
         let futility_ok = depth <= 2 && alpha.abs() < PatternScore::FIVE - 100;
         let static_eval = if futility_ok { evaluate(board, color) } else { 0 };
         let futility_margin = if depth == 1 {
-            PatternScore::CLOSED_FOUR  // 50,000 — one forcing move away
+            PatternScore::CLOSED_FOUR
         } else {
-            PatternScore::OPEN_FOUR    // 100,000 — two moves of tactical swing
+            PatternScore::OPEN_FOUR
         };
 
         let mut best_score = -INF;
@@ -520,85 +472,105 @@ impl Searcher {
         let mut entry_type = EntryType::UpperBound;
 
         for (i, mov) in moves.iter().enumerate() {
-            // ===== FUTILITY PRUNING =====
-            // Skip non-tactical late moves at shallow depths if they can't improve alpha.
-            // Never prune the first move (PV), TT moves, or captures.
+            // Futility pruning
             if futility_ok && i > 0 && static_eval + futility_margin <= alpha {
                 let move_score = self.score_move(board, *mov, color, tt_move, depth);
-                // Only prune non-tactical moves (score < 800K means not a winning/blocking threat)
                 if move_score < 800_000 {
                     continue;
                 }
             }
 
-            // Make move
             board.place_stone(*mov, color);
             let cap_info = execute_captures_fast(board, *mov, color);
 
-            // Compute child hash incrementally
-            let mut child_hash = self.zobrist.update_place(hash, *mov, color);
+            let mut child_hash = self.shared.zobrist.update_place(hash, *mov, color);
             for j in 0..cap_info.count as usize {
-                child_hash = self.zobrist.update_capture(child_hash, cap_info.positions[j], color.opponent());
+                child_hash = self.shared.zobrist.update_capture(
+                    child_hash,
+                    cap_info.positions[j],
+                    color.opponent(),
+                );
             }
             if cap_info.pairs > 0 {
                 let new_count = board.captures(color);
                 let old_count = new_count - cap_info.pairs;
-                child_hash = self.zobrist.update_capture_count(child_hash, color, old_count, new_count);
+                child_hash =
+                    self.shared
+                        .zobrist
+                        .update_capture_count(child_hash, color, old_count, new_count);
             }
 
-            // ===== PVS + LMR =====
             let is_capture = cap_info.pairs > 0;
+
+            // PVS + LMR
             let score = if i == 0 {
-                // PV move: full window, full depth
                 -self.alpha_beta(
-                    board, color.opponent(), depth - 1, -beta, -alpha,
-                    *mov, child_hash, true,
+                    board,
+                    color.opponent(),
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    *mov,
+                    child_hash,
+                    true,
                 )
             } else {
-                // LMR: reduce non-tactical late moves. More aggressive to
-                // compensate for wider move limits (18 vs old 11).
                 let reduction = if is_capture || depth < 3 {
-                    0i8 // Never reduce captures or at shallow depth
+                    0i8
                 } else if i >= 8 && depth >= 5 {
-                    3i8 // Very late moves at deep search: heavy reduction
+                    3i8
                 } else if i >= 5 && depth >= 4 {
-                    2i8 // Late moves: moderate reduction
+                    2i8
                 } else if i >= 3 && depth >= 3 {
-                    1i8 // Early-late moves: light reduction
+                    1i8
                 } else {
                     0i8
                 };
                 let search_depth = (depth - 1 - reduction).max(0);
 
-                // Null window search (possibly reduced)
                 let mut s = -self.alpha_beta(
-                    board, color.opponent(), search_depth,
-                    -(alpha + 1), -alpha, *mov, child_hash, true,
+                    board,
+                    color.opponent(),
+                    search_depth,
+                    -(alpha + 1),
+                    -alpha,
+                    *mov,
+                    child_hash,
+                    true,
                 );
 
-                // Re-search at full depth if reduced search beat alpha
-                if !self.stopped && reduction > 0 && s > alpha {
+                if !self.is_stopped() && reduction > 0 && s > alpha {
                     s = -self.alpha_beta(
-                        board, color.opponent(), depth - 1,
-                        -(alpha + 1), -alpha, *mov, child_hash, true,
+                        board,
+                        color.opponent(),
+                        depth - 1,
+                        -(alpha + 1),
+                        -alpha,
+                        *mov,
+                        child_hash,
+                        true,
                     );
                 }
 
-                // Re-search with full window if null window improved within (alpha, beta)
-                if !self.stopped && s > alpha && s < beta {
+                if !self.is_stopped() && s > alpha && s < beta {
                     s = -self.alpha_beta(
-                        board, color.opponent(), depth - 1,
-                        -beta, -alpha, *mov, child_hash, true,
+                        board,
+                        color.opponent(),
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        *mov,
+                        child_hash,
+                        true,
                     );
                 }
                 s
             };
 
-            // Unmake move
             undo_captures(board, color, &cap_info);
             board.remove_stone(*mov);
 
-            if self.stopped {
+            if self.is_stopped() {
                 return 0;
             }
 
@@ -608,7 +580,6 @@ impl Searcher {
             }
 
             if score >= beta {
-                // Update killer moves
                 #[allow(clippy::cast_sign_loss)]
                 let ply = (self.max_depth - depth).max(0) as usize;
                 if ply < 64 {
@@ -617,7 +588,6 @@ impl Searcher {
                         self.killer_moves[ply][0] = Some(*mov);
                     }
                 }
-                // Update history heuristic
                 let cidx = if color == Stone::Black { 0 } else { 1 };
                 self.history[cidx][mov.row as usize][mov.col as usize] +=
                     i32::from(depth) * i32::from(depth);
@@ -632,42 +602,26 @@ impl Searcher {
             }
         }
 
-        // Store result in transposition table
-        self.tt
+        self.shared
+            .tt
             .store(hash, depth, best_score, entry_type, best_move);
 
         best_score
     }
 
     /// Generate candidate moves near existing stones.
-    ///
-    /// Uses a proximity heuristic: only considers empty positions within
-    /// a radius of 2 from any existing stone. This dramatically reduces
-    /// the search space while keeping relevant moves.
-    ///
-    /// # Arguments
-    ///
-    /// * `board` - Current board state
-    /// * `color` - Color to move
-    ///
-    /// # Returns
-    ///
-    /// Vector of valid candidate moves.
     #[must_use]
     #[cfg(test)]
     fn generate_moves(&self, board: &Board, color: Stone) -> Vec<Pos> {
         let mut moves = Vec::with_capacity(50);
         let mut seen = [[false; BOARD_SIZE]; BOARD_SIZE];
 
-        // If board is empty, return center
         if board.is_board_empty() {
             return vec![Pos::new(9, 9)];
         }
 
-        // Find moves near existing stones within radius
         let radius = 2i32;
 
-        // Iterate over all stones (both colors)
         for pos in board.black.iter_ones().chain(board.white.iter_ones()) {
             for dr in -radius..=radius {
                 for dc in -radius..=radius {
@@ -691,7 +645,6 @@ impl Searcher {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let new_pos = Pos::new(r as u8, c as u8);
 
-                    // Check validity (empty and not forbidden double-three)
                     if is_valid_move(board, new_pos, color) {
                         moves.push(new_pos);
                     }
@@ -699,15 +652,10 @@ impl Searcher {
             }
         }
 
-        // TODO: Add move ordering (TT move first, killer moves, etc.)
         moves
     }
 
     /// Score a move for ordering purposes (defense-first philosophy).
-    ///
-    /// Combined single-pass: scans 4 directions once for each color (8 total scans)
-    /// instead of 10 separate function calls with ~40 direction scans each.
-    /// Defense-first ordering: blocking opponent's threats is prioritized.
     fn score_move(
         &self,
         board: &Board,
@@ -718,12 +666,10 @@ impl Searcher {
     ) -> i32 {
         let opponent = color.opponent();
 
-        // TT best move: highest priority
         if tt_move == Some(mov) {
             return 1_000_000;
         }
 
-        // Combined direction scan: detect all patterns in one pass (8 scans instead of 40+)
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         let mut my_five = false;
         let mut opp_five = false;
@@ -733,40 +679,62 @@ impl Searcher {
         let mut opp_four = false;
         let mut my_open_three = false;
         let mut opp_open_three = false;
-        // Two-level detection: critical for early game where no threes exist yet.
-        // Without this, move ordering was essentially random for non-tactical moves.
         let mut my_two_score = 0i32;
 
         for (dr, dc) in dirs {
             let (mc, mo, _, mc_consec) = Self::count_line_with_gap(board, mov, dr, dc, color);
-            let (oc, oo, _, oc_consec) = Self::count_line_with_gap(board, mov, dr, dc, opponent);
+            let (oc, oo, _, oc_consec) =
+                Self::count_line_with_gap(board, mov, dr, dc, opponent);
 
-            // Five-in-a-row uses consecutive count (no gaps allowed)
-            if mc_consec >= 5 { my_five = true; }
-            if oc_consec >= 5 { opp_five = true; }
+            if mc_consec >= 5 {
+                my_five = true;
+            }
+            if oc_consec >= 5 {
+                opp_five = true;
+            }
             if mc == 4 {
-                if mo == 2 { my_open_four = true; }
-                if mo >= 1 { my_four = true; }
+                if mo == 2 {
+                    my_open_four = true;
+                }
+                if mo >= 1 {
+                    my_four = true;
+                }
             }
             if oc == 4 {
-                if oo == 2 { opp_open_four = true; }
-                if oo >= 1 { opp_four = true; }
+                if oo == 2 {
+                    opp_open_four = true;
+                }
+                if oo >= 1 {
+                    opp_four = true;
+                }
             }
-            if mc == 3 && mo == 2 { my_open_three = true; }
-            if oc == 3 && oo == 2 { opp_open_three = true; }
-            // Twos: prefer connected development over scattered play
+            if mc == 3 && mo == 2 {
+                my_open_three = true;
+            }
+            if oc == 3 && oo == 2 {
+                opp_open_three = true;
+            }
             if mc == 2 {
-                my_two_score += if mo == 2 { 500 } else if mo == 1 { 150 } else { 0 };
+                my_two_score += if mo == 2 {
+                    500
+                } else if mo == 1 {
+                    150
+                } else {
+                    0
+                };
             }
-            // Blocking opponent twos also has some value
-            if oc == 2 && oo == 2 { my_two_score += 200; }
+            if oc == 2 && oo == 2 {
+                my_two_score += 200;
+            }
         }
 
-        // === Winning / Blocking wins ===
-        if my_five { return 900_000; }
-        if opp_five { return 895_000; }
+        if my_five {
+            return 900_000;
+        }
+        if opp_five {
+            return 895_000;
+        }
 
-        // Capture win / block capture win (no-alloc count)
         let capture_count = i32::from(count_captures_fast(board, mov, color));
         if capture_count > 0 && i32::from(board.captures(color)) + capture_count >= 5 {
             return 890_000;
@@ -776,22 +744,34 @@ impl Searcher {
             return 885_000;
         }
 
-        // === Forcing threats (interleaved offense/defense) ===
-        if my_open_four { return 870_000; }   // Unstoppable - wins next move
-        if opp_open_four { return 860_000; }  // Must block or lose
+        if my_open_four {
+            return 870_000;
+        }
+        if opp_open_four {
+            return 860_000;
+        }
 
-        // === Capture defense (near win) ===
         let opp_caps = board.captures(opponent);
-        if opp_capture > 0 && opp_caps >= 3 { return 855_000; }
-        if opp_capture > 0 && opp_caps >= 2 { return 845_000; }
+        if opp_capture > 0 && opp_caps >= 3 {
+            return 855_000;
+        }
+        if opp_capture > 0 && opp_caps >= 2 {
+            return 845_000;
+        }
 
-        // === Strong threats: OWN forcing moves above passive blocking ===
-        if my_four { return 830_000; }        // Forcing - opponent MUST respond
-        if opp_four { return 820_000; }       // Block their forcing move
-        if my_open_three { return 810_000; }  // Creates future open-four
-        if opp_open_three { return 800_000; } // Block their future open-four
+        if my_four {
+            return 830_000;
+        }
+        if opp_four {
+            return 820_000;
+        }
+        if my_open_three {
+            return 810_000;
+        }
+        if opp_open_three {
+            return 800_000;
+        }
 
-        // === Captures (non-winning) ===
         if capture_count > 0 {
             let my_caps = i32::from(board.captures(color));
             let cap_urgency = if my_caps + capture_count >= 4 {
@@ -808,12 +788,8 @@ impl Searcher {
             return 550_000 + i32::from(opp_caps) * 30_000;
         }
 
-        // === Capture vulnerability penalty ===
-        // Check if placing our stone here creates a pair the opponent can capture.
-        // Pattern: opp-ME-ally-opp or opp-ally-ME-opp (we become part of a capturable pair)
         let capture_penalty = self.capture_vulnerability(board, mov, color);
 
-        // === Killer moves ===
         #[allow(clippy::cast_sign_loss)]
         let ply = (self.max_depth - depth).max(0) as usize;
         if ply < 64 {
@@ -825,7 +801,6 @@ impl Searcher {
             }
         }
 
-        // History heuristic + center proximity + connection bonus
         let cidx = if color == Stone::Black { 0 } else { 1 };
         let hist = self.history[cidx][mov.row as usize][mov.col as usize];
 
@@ -837,21 +812,7 @@ impl Searcher {
         hist + center_bonus + my_two_score - capture_penalty
     }
 
-    /// Generate candidate moves ordered by priority for better alpha-beta pruning.
-    ///
-    /// Uses TT move, killer moves, history heuristic, and center proximity
-    /// to order moves for maximum cutoff efficiency.
-    ///
-    /// # Arguments
-    ///
-    /// * `board` - Current board state
-    /// * `color` - Color to move
-    /// * `tt_move` - Best move from transposition table, if any
-    /// * `depth` - Current search depth
-    ///
-    /// # Returns
-    ///
-    /// Vector of valid candidate moves sorted by descending priority score.
+    /// Generate candidate moves ordered by priority.
     fn generate_moves_ordered(
         &self,
         board: &Board,
@@ -865,9 +826,6 @@ impl Searcher {
             return vec![Pos::new(9, 9)];
         }
 
-        // Always use radius 2 to ensure critical moves are never missed.
-        // Radius 1 at shallow depths caused the AI to miss opponent winning moves
-        // that were 2 cells away, leading to false "winning" scores.
         let radius = 2i32;
         let mut scored: Vec<(Pos, i32)> = Vec::with_capacity(50);
 
@@ -902,41 +860,18 @@ impl Searcher {
             }
         }
 
-        // Sort descending by score
         scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         scored.into_iter().map(|(m, _)| m).collect()
     }
 
-    /// Clear history heuristic and killer moves.
-    ///
-    /// Call this when starting a new game to reset learned move ordering data.
-    pub fn clear_history(&mut self) {
-        self.history = [[[0; BOARD_SIZE]; BOARD_SIZE]; 2];
-        self.killer_moves = [[None; 2]; 64];
-    }
-
-    /// Get statistics about the transposition table.
-    ///
-    /// # Returns
-    ///
-    /// `TTStats` containing size, usage count, and percentage.
-    #[must_use]
-    pub fn tt_stats(&self) -> TTStats {
-        self.tt.stats()
-    }
-
-    /// Clear the transposition table.
-    ///
-    /// Call this when starting a new game to avoid stale cached positions.
-    pub fn clear_tt(&mut self) {
-        self.tt.clear();
-    }
-
     /// Scan a line from `pos` in both directions.
-    /// Returns (total_count, open_ends, has_gap, consecutive_count).
-    /// - total_count: stones with at most one gap
-    /// - consecutive_count: strict consecutive stones (no gap), for five-in-a-row detection
-    fn count_line_with_gap(board: &Board, pos: Pos, dr: i8, dc: i8, color: Stone) -> (i32, i32, bool, i32) {
+    fn count_line_with_gap(
+        board: &Board,
+        pos: Pos,
+        dr: i8,
+        dc: i8,
+        color: Stone,
+    ) -> (i32, i32, bool, i32) {
         let sz = BOARD_SIZE as i8;
         let mut count = 1i32;
         let mut open_ends = 0;
@@ -952,14 +887,19 @@ impl Searcher {
             let cell = board.get(Pos::new(r as u8, c as u8));
             if cell == color {
                 count += 1;
-                if counting_consecutive { consec_pos += 1; }
+                if counting_consecutive {
+                    consec_pos += 1;
+                }
                 r += dr;
                 c += dc;
             } else if cell == Stone::Empty && !has_gap {
                 counting_consecutive = false;
                 let nr = r + dr;
                 let nc = c + dc;
-                if nr >= 0 && nr < sz && nc >= 0 && nc < sz
+                if nr >= 0
+                    && nr < sz
+                    && nc >= 0
+                    && nc < sz
                     && board.get(Pos::new(nr as u8, nc as u8)) == color
                 {
                     has_gap = true;
@@ -985,14 +925,19 @@ impl Searcher {
             let cell = board.get(Pos::new(r as u8, c as u8));
             if cell == color {
                 count += 1;
-                if counting_consecutive { consec_neg += 1; }
+                if counting_consecutive {
+                    consec_neg += 1;
+                }
                 r -= dr;
                 c -= dc;
             } else if cell == Stone::Empty && !has_gap {
                 counting_consecutive = false;
                 let nr = r - dr;
                 let nc = c - dc;
-                if nr >= 0 && nr < sz && nc >= 0 && nc < sz
+                if nr >= 0
+                    && nr < sz
+                    && nc >= 0
+                    && nc < sz
                     && board.get(Pos::new(nr as u8, nc as u8)) == color
                 {
                     has_gap = true;
@@ -1015,12 +960,6 @@ impl Searcher {
     }
 
     /// Check if placing our stone at `mov` makes it part of a capturable pair.
-    ///
-    /// After we place at `mov`, we check all 8 directions for the pattern:
-    ///   opp - US(mov) - ally - opp   (we are pos1 in a capture)
-    ///   opp - ally - US(mov) - opp   (we are pos2 in a capture)
-    ///
-    /// Returns a penalty score (higher = more vulnerable).
     fn capture_vulnerability(&self, board: &Board, mov: Pos, color: Stone) -> i32 {
         let opponent = color.opponent();
         let sz = BOARD_SIZE as i8;
@@ -1032,8 +971,6 @@ impl Searcher {
                 let sdr = dr * sign;
                 let sdc = dc * sign;
 
-                // Pattern 1: opp - US - ally - opp  (US is at mov)
-                // Check: mov-1 == opp, mov+1 == ally, mov+2 == opp
                 let rm1 = mov.row as i8 - sdr;
                 let cm1 = mov.col as i8 - sdc;
                 let rp1 = mov.row as i8 + sdr;
@@ -1041,44 +978,54 @@ impl Searcher {
                 let rp2 = mov.row as i8 + sdr * 2;
                 let cp2 = mov.col as i8 + sdc * 2;
 
-                if rm1 >= 0 && rm1 < sz && cm1 >= 0 && cm1 < sz
-                    && rp1 >= 0 && rp1 < sz && cp1 >= 0 && cp1 < sz
-                    && rp2 >= 0 && rp2 < sz && cp2 >= 0 && cp2 < sz
+                if rm1 >= 0
+                    && rm1 < sz
+                    && cm1 >= 0
+                    && cm1 < sz
+                    && rp1 >= 0
+                    && rp1 < sz
+                    && cp1 >= 0
+                    && cp1 < sz
+                    && rp2 >= 0
+                    && rp2 < sz
+                    && cp2 >= 0
+                    && cp2 < sz
                 {
                     let before = board.get(Pos::new(rm1 as u8, cm1 as u8));
                     let after1 = board.get(Pos::new(rp1 as u8, cp1 as u8));
                     let after2 = board.get(Pos::new(rp2 as u8, cp2 as u8));
 
-                    // opp - [mov] - ally - opp: opponent captures at rm1
                     if before == opponent && after1 == color && after2 == opponent {
                         vuln_count += 1;
                     }
-                    // We also need: opp at rm1 could be empty (opponent plays there to capture)
-                    // Actually the pattern is: X captures O-O-X by placing at the far end
-                    // So: empty - US - ally - opp → opp plays at empty to capture
                     if before == Stone::Empty && after1 == color && after2 == opponent {
                         vuln_count += 1;
                     }
                 }
 
-                // Pattern 2: opp - ally - US - opp  (US is at mov, we complete the pair)
-                // Check: mov-2 == opp, mov-1 == ally, mov+1 == opp
                 let rm2 = mov.row as i8 - sdr * 2;
                 let cm2 = mov.col as i8 - sdc * 2;
 
-                if rm2 >= 0 && rm2 < sz && cm2 >= 0 && cm2 < sz
-                    && rm1 >= 0 && rm1 < sz && cm1 >= 0 && cm1 < sz
-                    && rp1 >= 0 && rp1 < sz && cp1 >= 0 && cp1 < sz
+                if rm2 >= 0
+                    && rm2 < sz
+                    && cm2 >= 0
+                    && cm2 < sz
+                    && rm1 >= 0
+                    && rm1 < sz
+                    && cm1 >= 0
+                    && cm1 < sz
+                    && rp1 >= 0
+                    && rp1 < sz
+                    && cp1 >= 0
+                    && cp1 < sz
                 {
                     let before2 = board.get(Pos::new(rm2 as u8, cm2 as u8));
                     let before1 = board.get(Pos::new(rm1 as u8, cm1 as u8));
                     let after = board.get(Pos::new(rp1 as u8, cp1 as u8));
 
-                    // opp - ally - [mov] - opp: opponent already flanks both sides
                     if before2 == opponent && before1 == color && after == opponent {
                         vuln_count += 1;
                     }
-                    // empty - ally - [mov] - opp: opponent can play at empty to capture
                     if before2 == Stone::Empty && before1 == color && after == opponent {
                         vuln_count += 1;
                     }
@@ -1086,18 +1033,209 @@ impl Searcher {
             }
         }
 
-        // Each vulnerability makes this move worse, but penalty must be proportional.
-        // Old 100K penalty was catastrophic: it pushed ALL moves near opponent stones
-        // to the bottom, causing scattered disconnected play. 8K is proportional to
-        // the heuristic's 4K/pair vulnerability penalty.
         if vuln_count > 0 {
             let opp_caps = i32::from(board.captures(color.opponent()));
             let base_penalty = 8_000;
-            let urgency = if opp_caps >= 3 { 4 } else if opp_caps >= 2 { 2 } else { 1 };
+            let urgency = if opp_caps >= 3 {
+                4
+            } else if opp_caps >= 2 {
+                2
+            } else {
+                1
+            };
             vuln_count * base_penalty * urgency
         } else {
             0
         }
+    }
+}
+
+// =============================================================================
+// Searcher: public API wrapper (backward-compatible)
+// =============================================================================
+
+/// Alpha-Beta search engine with iterative deepening and transposition table.
+///
+/// Internally uses Lazy SMP for parallel search when `num_threads > 1`.
+/// The searcher maintains a transposition table across searches for efficiency.
+/// For a new game, call `clear_tt()` to reset the cached positions.
+pub struct Searcher {
+    shared: Arc<SharedState>,
+    max_depth: i8,
+    num_threads: usize,
+    // Per-search state for single-threaded `search()` API
+    history: [[[i32; BOARD_SIZE]; BOARD_SIZE]; 2],
+}
+
+impl Searcher {
+    /// Create a new searcher with the specified transposition table size.
+    ///
+    /// Uses all available CPU cores for parallel search (Lazy SMP).
+    ///
+    /// # Arguments
+    ///
+    /// * `tt_size_mb` - Size of transposition table in megabytes
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gomoku::search::Searcher;
+    ///
+    /// let searcher = Searcher::new(32); // 32 MB table
+    /// ```
+    #[must_use]
+    pub fn new(tt_size_mb: usize) -> Self {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        Self::with_threads(tt_size_mb, num_threads)
+    }
+
+    /// Create a new searcher with explicit thread count.
+    #[must_use]
+    pub fn with_threads(tt_size_mb: usize, num_threads: usize) -> Self {
+        let num_threads = num_threads.max(1);
+        Self {
+            shared: Arc::new(SharedState {
+                zobrist: ZobristTable::new(),
+                tt: AtomicTT::new(tt_size_mb),
+                stopped: AtomicBool::new(false),
+            }),
+            max_depth: 10,
+            num_threads,
+            history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+        }
+    }
+
+    /// Search for the best move using iterative deepening (single-threaded).
+    ///
+    /// Used by tests and when precise deterministic behavior is needed.
+    #[must_use]
+    pub fn search(&mut self, board: &Board, color: Stone, max_depth: i8) -> SearchResult {
+        self.shared.stopped.store(false, Ordering::Relaxed);
+        self.max_depth = max_depth;
+
+        let mut worker = WorkerSearcher {
+            shared: Arc::clone(&self.shared),
+            nodes: 0,
+            max_depth,
+            killer_moves: [[None; 2]; 64],
+            history: self.history,
+            start_time: None,
+            time_limit: None,
+        };
+
+        let mut best_result = SearchResult {
+            best_move: None,
+            score: 0,
+            depth: 0,
+            nodes: 0,
+        };
+
+        let mut work_board = board.clone();
+
+        for depth in 1..=max_depth {
+            let result = worker.search_root(&mut work_board, color, depth, -INF, INF);
+            best_result = result;
+            best_result.depth = depth;
+
+            if best_result.score >= PatternScore::FIVE - 100 && depth >= 10 {
+                break;
+            }
+            if best_result.score <= -(PatternScore::FIVE - 100) && depth >= 8 {
+                break;
+            }
+        }
+
+        best_result.nodes = worker.nodes;
+        // Persist history for future searches
+        self.history = worker.history;
+        best_result
+    }
+
+    /// Search with smart time management using Lazy SMP parallel search.
+    ///
+    /// Two hard constraints (project requirements):
+    /// 1. **Minimum depth 10** — always reached regardless of time
+    /// 2. **Average < 500ms** — time prediction prevents over-runs beyond depth 10
+    #[must_use]
+    pub fn search_timed(
+        &mut self,
+        board: &Board,
+        color: Stone,
+        max_depth: i8,
+        time_limit_ms: u64,
+    ) -> SearchResult {
+        self.shared.stopped.store(false, Ordering::Relaxed);
+        self.max_depth = max_depth;
+        let start = Instant::now();
+        let time_limit = Duration::from_millis((time_limit_ms + 300).max(800));
+
+        // Spawn helper threads (workers 1..N)
+        let handles: Vec<_> = (1..self.num_threads)
+            .map(|thread_id| {
+                let shared = Arc::clone(&self.shared);
+                let board_clone = board.clone();
+                let start_depth_offset = thread_id as i8;
+
+                std::thread::spawn(move || {
+                    let mut worker =
+                        WorkerSearcher::new(shared, max_depth, start, time_limit);
+                    worker.search_iterative(&board_clone, color, max_depth, start_depth_offset)
+                })
+            })
+            .collect();
+
+        // Main thread = worker 0
+        let mut main_worker = WorkerSearcher {
+            shared: Arc::clone(&self.shared),
+            nodes: 0,
+            max_depth,
+            killer_moves: [[None; 2]; 64],
+            history: self.history,
+            start_time: Some(start),
+            time_limit: Some(time_limit),
+        };
+        let main_result = main_worker.search_iterative(board, color, max_depth, 0);
+
+        // Signal all workers to stop
+        self.shared.stopped.store(true, Ordering::Relaxed);
+
+        // Collect results — pick best (deepest search, then highest score)
+        let mut best = main_result;
+        let mut total_nodes = best.nodes;
+
+        for handle in handles {
+            if let Ok(result) = handle.join() {
+                total_nodes += result.nodes;
+                if result.depth > best.depth
+                    || (result.depth == best.depth && result.score > best.score)
+                {
+                    best = result;
+                }
+            }
+        }
+
+        best.nodes = total_nodes;
+        // Persist history from main worker
+        self.history = main_worker.history;
+        best
+    }
+
+    /// Clear history heuristic and killer moves.
+    pub fn clear_history(&mut self) {
+        self.history = [[[0; BOARD_SIZE]; BOARD_SIZE]; 2];
+    }
+
+    /// Get statistics about the transposition table.
+    #[must_use]
+    pub fn tt_stats(&self) -> TTStats {
+        self.shared.tt.stats()
+    }
+
+    /// Clear the transposition table.
+    pub fn clear_tt(&self) {
+        self.shared.tt.clear();
     }
 }
 
@@ -1112,7 +1250,6 @@ mod tests {
 
         let result = searcher.search(&board, Stone::Black, 4);
         assert!(result.best_move.is_some());
-        // Empty board should play center
         assert_eq!(result.best_move, Some(Pos::new(9, 9)));
     }
 
@@ -1121,13 +1258,11 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // Black has 4 in a row - should find the winning 5th
         for i in 0..4 {
             board.place_stone(Pos::new(9, i), Stone::Black);
         }
 
         let result = searcher.search(&board, Stone::Black, 2);
-        // Should extend to make 5 in a row
         assert_eq!(result.best_move, Some(Pos::new(9, 4)));
     }
 
@@ -1136,15 +1271,12 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // White has 4 in a row - Black must block
         for i in 0..4 {
             board.place_stone(Pos::new(9, i), Stone::White);
         }
-        // Add a black stone nearby so it's not empty board
         board.place_stone(Pos::new(10, 0), Stone::Black);
 
         let result = searcher.search(&board, Stone::Black, 4);
-        // Black should block at (9,4)
         assert_eq!(result.best_move, Some(Pos::new(9, 4)));
     }
 
@@ -1153,14 +1285,12 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // Add more stones to constrain search space (faster in debug mode)
         board.place_stone(Pos::new(9, 9), Stone::Black);
         board.place_stone(Pos::new(9, 10), Stone::White);
         board.place_stone(Pos::new(9, 8), Stone::Black);
         board.place_stone(Pos::new(10, 9), Stone::White);
         board.place_stone(Pos::new(8, 9), Stone::Black);
 
-        // Use depth 2 for fast test in debug mode
         let result = searcher.search(&board, Stone::White, 2);
         assert!(result.depth >= 1);
         assert!(result.nodes > 0);
@@ -1168,17 +1298,25 @@ mod tests {
 
     #[test]
     fn test_generate_moves_radius() {
-        let searcher = Searcher::new(1);
+        let shared = Arc::new(SharedState {
+            zobrist: ZobristTable::new(),
+            tt: AtomicTT::new(1),
+            stopped: AtomicBool::new(false),
+        });
+        let worker = WorkerSearcher {
+            shared,
+            nodes: 0,
+            max_depth: 10,
+            killer_moves: [[None; 2]; 64],
+            history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+            start_time: None,
+            time_limit: None,
+        };
         let mut board = Board::new();
-
         board.place_stone(Pos::new(9, 9), Stone::Black);
 
-        let moves = searcher.generate_moves(&board, Stone::White);
-
-        // Should generate moves within radius 2 of (9,9)
-        // Excluding (9,9) which is occupied
+        let moves = worker.generate_moves(&board, Stone::White);
         assert!(!moves.is_empty());
-        // 5x5 grid = 25 positions, minus 1 occupied = 24 max
         assert!(moves.len() <= 24);
     }
 
@@ -1187,18 +1325,14 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // Setup capture opportunity: B _ W W B
-        // Black at (9,5), White at (9,7) and (9,8), Black at (9,9)
         board.place_stone(Pos::new(9, 5), Stone::Black);
         board.place_stone(Pos::new(9, 7), Stone::White);
         board.place_stone(Pos::new(9, 8), Stone::White);
         board.place_stone(Pos::new(9, 9), Stone::Black);
 
         let result = searcher.search(&board, Stone::Black, 4);
-        // Should find a valid move (capture at (9,6) or a strategically better move)
         assert!(result.best_move.is_some(), "Should find a move");
         let mov = result.best_move.unwrap();
-        // Move should be near existing stones
         assert!(
             mov.row >= 7 && mov.row <= 11 && mov.col >= 3 && mov.col <= 11,
             "Move {:?} should be near existing stones",
@@ -1216,7 +1350,6 @@ mod tests {
         let _ = searcher.search(&board, Stone::White, 4);
 
         let stats = searcher.tt_stats();
-        // Should have stored some entries
         assert!(stats.used > 0);
     }
 
@@ -1242,13 +1375,11 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // Black has 4 in a row and can win
         for i in 0..4 {
             board.place_stone(Pos::new(9, i), Stone::Black);
         }
 
         let result = searcher.search(&board, Stone::Black, 2);
-        // Score should be very high (winning)
         assert!(
             result.score >= PatternScore::FIVE - 100,
             "Should detect winning position"
@@ -1260,35 +1391,39 @@ mod tests {
         let mut searcher = Searcher::new(16);
         let mut board = Board::new();
 
-        // White has 4 in a row and will win
         for i in 0..4 {
             board.place_stone(Pos::new(9, i), Stone::White);
         }
-        // Black is far away
         board.place_stone(Pos::new(0, 0), Stone::Black);
 
         let result = searcher.search(&board, Stone::Black, 2);
-        // Best move should be blocking
         assert_eq!(result.best_move, Some(Pos::new(9, 4)));
     }
 
     #[test]
     fn test_generate_moves_excludes_forbidden() {
-        let searcher = Searcher::new(1);
+        let shared = Arc::new(SharedState {
+            zobrist: ZobristTable::new(),
+            tt: AtomicTT::new(1),
+            stopped: AtomicBool::new(false),
+        });
+        let worker = WorkerSearcher {
+            shared,
+            nodes: 0,
+            max_depth: 10,
+            killer_moves: [[None; 2]; 64],
+            history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+            start_time: None,
+            time_limit: None,
+        };
         let mut board = Board::new();
 
-        // Create a double-three setup at (9,9)
-        // Horizontal: _ B _ B _ (place at 9 creates _ B B B _)
         board.place_stone(Pos::new(9, 8), Stone::Black);
         board.place_stone(Pos::new(9, 10), Stone::Black);
-
-        // Vertical: _ B _ B _
         board.place_stone(Pos::new(8, 9), Stone::Black);
         board.place_stone(Pos::new(10, 9), Stone::Black);
 
-        let moves = searcher.generate_moves(&board, Stone::Black);
-
-        // (9,9) should be excluded due to double-three rule
+        let moves = worker.generate_moves(&board, Stone::Black);
         assert!(
             !moves.contains(&Pos::new(9, 9)),
             "Should exclude forbidden double-three move"
@@ -1301,7 +1436,6 @@ mod tests {
         let board = Board::new();
 
         let result = searcher.search(&board, Stone::Black, 2);
-        // Should have searched at least a few nodes
         assert!(result.nodes >= 1);
     }
 
@@ -1312,21 +1446,33 @@ mod tests {
 
         board.place_stone(Pos::new(9, 9), Stone::Black);
 
-        // First search
         let result1 = searcher.search(&board, Stone::White, 4);
         assert!(result1.best_move.is_some());
 
-        // Second search should also find a valid move (may differ due to history heuristic)
         let result2 = searcher.search(&board, Stone::White, 4);
         assert!(result2.best_move.is_some());
 
-        // Second search should use fewer nodes (TT helps prune)
         assert!(result2.nodes <= result1.nodes || result2.nodes < result1.nodes + 500);
 
-        // Both moves should be adjacent to the existing stone
         let m1 = result1.best_move.unwrap();
         let m2 = result2.best_move.unwrap();
         assert!(m1.row.abs_diff(9) <= 2 && m1.col.abs_diff(9) <= 2);
         assert!(m2.row.abs_diff(9) <= 2 && m2.col.abs_diff(9) <= 2);
+    }
+
+    #[test]
+    fn test_parallel_search_timed() {
+        let mut searcher = Searcher::with_threads(16, 4);
+        let mut board = Board::new();
+
+        board.place_stone(Pos::new(9, 9), Stone::Black);
+        board.place_stone(Pos::new(9, 10), Stone::White);
+        board.place_stone(Pos::new(10, 9), Stone::Black);
+        board.place_stone(Pos::new(8, 10), Stone::White);
+
+        let result = searcher.search_timed(&board, Stone::Black, 12, 500);
+        assert!(result.best_move.is_some(), "Should find a move");
+        assert!(result.depth >= 4, "Should reach reasonable depth, got {}", result.depth);
+        assert!(result.nodes > 0, "Should search some nodes");
     }
 }

@@ -143,6 +143,7 @@ impl MoveResult {
 
     /// Create a result for a VCT win
     #[inline]
+    #[cfg(test)]
     fn vct_win(pos: Pos, time_ms: u64, nodes: u64) -> Self {
         Self {
             best_move: Some(pos),
@@ -451,39 +452,10 @@ impl AIEngine {
         }
         ai_log(&format!("  Stage 4 Opponent VCF: not found ({}nodes)", self.threat_searcher.nodes()));
 
-        // 4.5. VCT search (mid-game only, when enough stones for meaningful threats)
-        if board.stone_count() >= 8 {
-            // Our VCT
-            let vct_result = self.threat_searcher.search_vct(board, color);
-            if vct_result.found && !vct_result.winning_sequence.is_empty() {
-                let seq: Vec<String> = vct_result.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
-                ai_log(&format!("  Stage 4.5 OUR VCT FOUND: sequence=[{}]", seq.join(" -> ")));
-                return MoveResult::vct_win(
-                    vct_result.winning_sequence[0],
-                    start.elapsed().as_millis() as u64,
-                    self.threat_searcher.nodes(),
-                );
-            }
-            ai_log(&format!("  Stage 4.5 Our VCT: not found ({}nodes)", self.threat_searcher.nodes()));
-
-            // Opponent VCT - block first move
-            let opp_vct = self.threat_searcher.search_vct(board, opponent);
-            if opp_vct.found && !opp_vct.winning_sequence.is_empty() {
-                let seq: Vec<String> = opp_vct.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
-                ai_log(&format!("  Stage 4.6 OPPONENT VCT FOUND: sequence=[{}]", seq.join(" -> ")));
-                let block_pos = opp_vct.winning_sequence[0];
-                if is_valid_move(board, block_pos, color) {
-                    ai_log(&format!("  >>> DEFENSE (block VCT): {}", pos_to_notation(block_pos)));
-                    return MoveResult::defense(
-                        block_pos,
-                        -700_000,
-                        start.elapsed().as_millis() as u64,
-                        self.threat_searcher.nodes(),
-                    );
-                }
-            }
-            ai_log(&format!("  Stage 4.6 Opponent VCT: not found ({}nodes)", self.threat_searcher.nodes()));
-        }
+        // NOTE: VCT removed from authoritative pipeline.
+        // Open-three threats are NOT forcing — opponent can ignore and counter-attack.
+        // Alpha-beta with threat extensions handles tactical sequences correctly.
+        // VCF remains: fours ARE forcing and VCF is sound.
 
         // 5. Alpha-Beta search handles ALL strategy
         let result = self.searcher.search_timed(board, color, self.max_depth, self.time_limit_ms);
@@ -1005,7 +977,7 @@ mod tests {
         // If the AI found a forced win/threat (VCF/VCT/immediate), early exit is correct.
         // Otherwise, depth 10+ is the project requirement.
         let found_forced_result = result.score.abs() >= 799_900
-            || matches!(result.search_type, SearchType::VCF | SearchType::VCT | SearchType::ImmediateWin);
+            || matches!(result.search_type, SearchType::VCF | SearchType::ImmediateWin);
         assert!(
             result.depth >= 10 || found_forced_result,
             "AI should reach depth 10+ or find forced result within 500ms, got depth {} score {} type {:?}",
@@ -1046,7 +1018,7 @@ mod tests {
 
         // Should find a reasonable move - via alpha-beta depth 8+ or VCF/VCT forced win
         assert!(result.best_move.is_some(), "Should find a move");
-        let found_forced = matches!(result.search_type, SearchType::VCF | SearchType::VCT | SearchType::ImmediateWin);
+        let found_forced = matches!(result.search_type, SearchType::VCF | SearchType::ImmediateWin);
         assert!(result.depth >= 8 || found_forced,
             "Should reach depth 8+ or find forced win, got depth {} type {:?}", result.depth, result.search_type);
         // Time should be under hard limit (700ms + margin)
