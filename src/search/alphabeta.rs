@@ -180,9 +180,11 @@ impl WorkerSearcher {
                     break result;
                 }
                 if result.score <= asp_alpha {
-                    asp_alpha = (result.score - ASP_WINDOW * 4).max(-INF);
+                    // On fail-low, immediately open to -INF (no second re-search)
+                    asp_alpha = -INF;
                 } else if result.score >= asp_beta {
-                    asp_beta = (result.score + ASP_WINDOW * 4).min(INF);
+                    // On fail-high, immediately open to INF
+                    asp_beta = INF;
                 } else {
                     break result;
                 }
@@ -247,10 +249,10 @@ impl WorkerSearcher {
 
         let hash = self.shared.zobrist.hash(board, color);
         let tt_move = self.shared.tt.get_best_move(hash);
-        let mut moves = self.generate_moves_ordered(board, color, tt_move, depth);
+        let (mut moves, _top_score) = self.generate_moves_ordered(board, color, tt_move, depth);
         moves.truncate(MAX_ROOT_MOVES);
 
-        for (i, mov) in moves.iter().enumerate() {
+        for (i, (mov, _move_score)) in moves.iter().enumerate() {
             board.place_stone(*mov, color);
             let cap_info = execute_captures_fast(board, *mov, color);
 
@@ -271,11 +273,15 @@ impl WorkerSearcher {
                         .update_capture_count(child_hash, color, old_count, new_count);
             }
 
+            // Threat extension: forcing moves (creating a four) get +1 ply.
+            // Forcing moves have only 1-2 legal responses, so the subtree stays narrow.
+            let extension = if Self::move_creates_four(board, *mov, color) { 1i8 } else { 0i8 };
+
             let score = if i == 0 {
                 -self.alpha_beta(
                     board,
                     color.opponent(),
-                    depth - 1,
+                    depth - 1 + extension,
                     -beta,
                     -alpha,
                     *mov,
@@ -286,7 +292,7 @@ impl WorkerSearcher {
                 let mut s = -self.alpha_beta(
                     board,
                     color.opponent(),
-                    depth - 1,
+                    depth - 1 + extension,
                     -(alpha + 1),
                     -alpha,
                     *mov,
@@ -297,7 +303,7 @@ impl WorkerSearcher {
                     s = -self.alpha_beta(
                         board,
                         color.opponent(),
-                        depth - 1,
+                        depth - 1 + extension,
                         -beta,
                         -alpha,
                         *mov,
@@ -331,6 +337,51 @@ impl WorkerSearcher {
         }
     }
 
+    /// Check if the stone just placed at pos creates a four (4 in a row with ≥1 open end).
+    /// Used for threat extensions: forcing moves deserve deeper search because
+    /// the opponent has only 1-2 legal responses, keeping the subtree narrow.
+    #[inline]
+    fn move_creates_four(board: &Board, pos: Pos, color: Stone) -> bool {
+        let sz = BOARD_SIZE as i8;
+        let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+        for (dr, dc) in dirs {
+            let mut count = 1i32;
+            let mut open_ends = 0;
+            let mut r = pos.row as i8 + dr;
+            let mut c = pos.col as i8 + dc;
+            while r >= 0 && r < sz && c >= 0 && c < sz {
+                if board.get(Pos::new(r as u8, c as u8)) == color {
+                    count += 1;
+                    r += dr;
+                    c += dc;
+                } else {
+                    if board.get(Pos::new(r as u8, c as u8)) == Stone::Empty {
+                        open_ends += 1;
+                    }
+                    break;
+                }
+            }
+            r = pos.row as i8 - dr;
+            c = pos.col as i8 - dc;
+            while r >= 0 && r < sz && c >= 0 && c < sz {
+                if board.get(Pos::new(r as u8, c as u8)) == color {
+                    count += 1;
+                    r -= dr;
+                    c -= dc;
+                } else {
+                    if board.get(Pos::new(r as u8, c as u8)) == Stone::Empty {
+                        open_ends += 1;
+                    }
+                    break;
+                }
+            }
+            if count == 4 && open_ends >= 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if the side to move faces an immediate tactical threat.
     fn is_threatened(board: &Board, color: Stone, last_move: Pos) -> bool {
         let opp = color.opponent();
@@ -341,6 +392,7 @@ impl WorkerSearcher {
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         for (dr, dc) in dirs {
             let mut count = 1i32;
+            let mut open_ends = 0i32;
             let mut r = last_move.row as i8 + dr;
             let mut c = last_move.col as i8 + dc;
             while r >= 0 && r < sz && c >= 0 && c < sz {
@@ -349,8 +401,14 @@ impl WorkerSearcher {
                     r += dr;
                     c += dc;
                 } else {
+                    if board.get(Pos::new(r as u8, c as u8)) == Stone::Empty {
+                        open_ends += 1;
+                    }
                     break;
                 }
+            }
+            if r < 0 || r >= sz || c < 0 || c >= sz {
+                // Out of bounds = blocked end
             }
             r = last_move.row as i8 - dr;
             c = last_move.col as i8 - dc;
@@ -360,14 +418,289 @@ impl WorkerSearcher {
                     r -= dr;
                     c -= dc;
                 } else {
+                    if board.get(Pos::new(r as u8, c as u8)) == Stone::Empty {
+                        open_ends += 1;
+                    }
                     break;
                 }
             }
-            if count >= 4 {
+            // Threatened by: 4+ in a row, OR open three (3 with 2 open ends)
+            if count >= 4 || (count >= 3 && open_ends >= 2) {
                 return true;
             }
         }
+        // Capture setup: opponent's last_move brackets our pair on one side
+        // Pattern: last_move(opp) - us - us - empty → opponent places at empty to capture
+        let us = color;
+        for (dr, dc) in dirs {
+            for sign in [-1i8, 1] {
+                let sdr = dr * sign;
+                let sdc = dc * sign;
+                let r1 = last_move.row as i8 + sdr;
+                let c1 = last_move.col as i8 + sdc;
+                let r2 = r1 + sdr;
+                let c2 = c1 + sdc;
+                let r3 = r2 + sdr;
+                let c3 = c2 + sdc;
+                if r1 >= 0 && r1 < sz && c1 >= 0 && c1 < sz
+                    && r2 >= 0 && r2 < sz && c2 >= 0 && c2 < sz
+                    && r3 >= 0 && r3 < sz && c3 >= 0 && c3 < sz
+                {
+                    let s1 = board.get(Pos::new(r1 as u8, c1 as u8));
+                    let s2 = board.get(Pos::new(r2 as u8, c2 as u8));
+                    let s3 = board.get(Pos::new(r3 as u8, c3 as u8));
+                    if s1 == us && s2 == us && s3 == Stone::Empty {
+                        return true;
+                    }
+                }
+            }
+        }
         false
+    }
+
+    /// Maximum quiescence search depth (plies of forcing moves).
+    /// VCF-style fours are fully forcing, so we can search deep without explosion.
+    const MAX_QS_DEPTH: i8 = 16;
+
+    /// Quiescence search at leaf nodes of alpha-beta.
+    ///
+    /// Instead of returning a static evaluation immediately, we extend the search
+    /// for forcing moves only (fives, fours, capture-wins). This eliminates the
+    /// horizon effect where the AI fails to see forced wins/losses just beyond
+    /// the regular search depth.
+    ///
+    /// Design:
+    /// - **Stand-pat**: If no forcing move improves alpha, return static eval
+    /// - **Forcing moves**: Only fives, four-threats, and capture-wins are searched
+    /// - **Alpha-beta pruning**: Standard cutoffs apply to keep it efficient
+    /// - **Depth-limited**: MAX_QS_DEPTH prevents runaway in complex positions
+    fn quiescence(
+        &mut self,
+        board: &mut Board,
+        color: Stone,
+        mut alpha: i32,
+        beta: i32,
+        last_move: Pos,
+        qs_depth: i8,
+        hash: u64,
+    ) -> i32 {
+        self.nodes += 1;
+
+        // Time check (less frequent in QS — every 4096 nodes)
+        if self.nodes & 4095 == 0 && self.check_time() {
+            return 0;
+        }
+        if self.is_stopped() {
+            return 0;
+        }
+
+        // Terminal: opponent just won
+        let last_player = color.opponent();
+        if board.captures(last_player) >= 5 {
+            return -PatternScore::FIVE;
+        }
+        if has_five_at_pos(board, last_move, last_player) {
+            return -PatternScore::FIVE;
+        }
+
+        // TT probe: reuse results from previous searches or other QS nodes.
+        // Use depth 0 — any entry (depth >= 0) can satisfy QS queries.
+        if let Some((score, _)) = self.shared.tt.probe(hash, 0, alpha, beta) {
+            if score != 0 {
+                return score;
+            }
+        }
+
+        // Stand-pat: static evaluation as lower bound
+        let stand_pat = evaluate(board, color);
+
+        // Beta cutoff: position is already too good (fail high)
+        if stand_pat >= beta {
+            return stand_pat;
+        }
+
+        let original_alpha = alpha;
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        // Depth limit for quiescence
+        if qs_depth >= Self::MAX_QS_DEPTH {
+            return stand_pat;
+        }
+
+        // After depth 4 in QS, only search fives (no more fours)
+        // This prevents QS from exploding in complex midgame positions.
+        let fours_allowed = qs_depth < 6;
+
+        let opponent = color.opponent();
+        let sz = BOARD_SIZE as i8;
+        let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+
+        // Generate forcing moves only: fives, fours, capture-wins.
+        // Use proximity scan (radius 2 from existing stones) instead of full-board.
+        let mut forcing_moves: Vec<(Pos, i32)> = Vec::with_capacity(16);
+        let mut seen = [[false; BOARD_SIZE]; BOARD_SIZE];
+
+        for stone_pos in board.black.iter_ones().chain(board.white.iter_ones()) {
+            for dr in -2i32..=2 {
+                for dc in -2i32..=2 {
+                    let r = i32::from(stone_pos.row) + dr;
+                    let c = i32::from(stone_pos.col) + dc;
+                    if !Pos::is_valid(r, c) { continue; }
+                    #[allow(clippy::cast_sign_loss)]
+                    let (ru, cu) = (r as usize, c as usize);
+                    if seen[ru][cu] { continue; }
+                    seen[ru][cu] = true;
+
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let pos = Pos::new(r as u8, c as u8);
+                    if board.get(pos) != Stone::Empty { continue; }
+                    if !is_valid_move(board, pos, color) { continue; }
+
+                    let mut priority = 0i32;
+
+                    // Check five creation / block opponent five / four creation
+                    for &(ddr, ddc) in &dirs {
+                        // Our line
+                        let mut mc = 1i32;
+                        let mut rr = pos.row as i8 + ddr;
+                        let mut cc = pos.col as i8 + ddc;
+                        while rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == color
+                        { mc += 1; rr += ddr; cc += ddc; }
+                        let mut mo_p = if rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == Stone::Empty { 1 } else { 0 };
+                        rr = pos.row as i8 - ddr;
+                        cc = pos.col as i8 - ddc;
+                        while rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == color
+                        { mc += 1; rr -= ddr; cc -= ddc; }
+                        mo_p += if rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == Stone::Empty { 1 } else { 0 };
+
+                        if mc >= 5 { priority = 900; break; }
+                        if fours_allowed && mc == 4 && mo_p >= 1 {
+                            priority = priority.max(if mo_p == 2 { 800 } else { 700 });
+                        }
+
+                        // Opponent line
+                        let mut oc = 1i32;
+                        rr = pos.row as i8 + ddr;
+                        cc = pos.col as i8 + ddc;
+                        while rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == opponent
+                        { oc += 1; rr += ddr; cc += ddc; }
+                        rr = pos.row as i8 - ddr;
+                        cc = pos.col as i8 - ddc;
+                        while rr >= 0 && rr < sz && cc >= 0 && cc < sz
+                            && board.get(Pos::new(rr as u8, cc as u8)) == opponent
+                        { oc += 1; rr -= ddr; cc -= ddc; }
+
+                        if oc >= 5 { priority = priority.max(850); }
+                    }
+
+                    // Capture-win check
+                    if priority == 0 {
+                        let cap_count = count_captures_fast(board, pos, color);
+                        if cap_count > 0 && board.captures(color) + cap_count >= 5 {
+                            priority = 890;
+                        }
+                    }
+
+                    if priority > 0 {
+                        forcing_moves.push((pos, priority));
+                    }
+                }
+            }
+        }
+
+        if forcing_moves.is_empty() {
+            return stand_pat;
+        }
+
+        // Sort by priority (highest first)
+        forcing_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        // Move count pruning (PentaZen-style): limit forcing moves per QS node.
+        // Fives (900) are always searched. Fours limited to top candidates.
+        let max_qs_moves: usize = if qs_depth <= 2 { 8 } else { 4 };
+
+        let mut best_score = stand_pat;
+        let mut best_move: Option<Pos> = None;
+        let mut moves_searched = 0usize;
+
+        for (mov, priority) in &forcing_moves {
+            // Always search fives (priority >= 850), limit fours
+            if *priority < 850 {
+                if moves_searched >= max_qs_moves {
+                    break;
+                }
+            }
+            moves_searched += 1;
+            board.place_stone(*mov, color);
+            let cap_info = execute_captures_fast(board, *mov, color);
+
+            // Compute child hash for TT
+            let mut child_hash = self.shared.zobrist.update_place(hash, *mov, color);
+            for j in 0..cap_info.count as usize {
+                child_hash = self.shared.zobrist.update_capture(
+                    child_hash,
+                    cap_info.positions[j],
+                    color.opponent(),
+                );
+            }
+            if cap_info.pairs > 0 {
+                let new_count = board.captures(color);
+                let old_count = new_count - cap_info.pairs;
+                child_hash =
+                    self.shared
+                        .zobrist
+                        .update_capture_count(child_hash, color, old_count, new_count);
+            }
+
+            let score = -self.quiescence(
+                board,
+                color.opponent(),
+                -beta,
+                -alpha,
+                *mov,
+                qs_depth + 1,
+                child_hash,
+            );
+
+            undo_captures(board, color, &cap_info);
+            board.remove_stone(*mov);
+
+            if self.is_stopped() {
+                return 0;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(*mov);
+            }
+            if score > alpha {
+                alpha = score;
+            }
+            if score >= beta {
+                break; // Beta cutoff
+            }
+        }
+
+        // TT store: cache QS result at depth 0
+        if !self.is_stopped() && best_move.is_some() {
+            let entry_type = if best_score >= beta {
+                EntryType::LowerBound
+            } else if best_score > original_alpha {
+                EntryType::Exact
+            } else {
+                EntryType::UpperBound
+            };
+            self.shared.tt.store(hash, 0, best_score, entry_type, best_move);
+        }
+
+        best_score
     }
 
     /// Recursive alpha-beta search with negamax formulation.
@@ -405,13 +738,49 @@ impl WorkerSearcher {
         }
 
         if depth <= 0 {
-            return evaluate(board, color);
+            return self.quiescence(board, color, alpha, beta, last_move, 0, hash);
         }
 
         // TT probe
         if let Some((score, _best_move)) = self.shared.tt.probe(hash, depth, alpha, beta) {
             if score != 0 {
                 return score;
+            }
+        }
+
+        // Pre-compute static eval for shallow pruning decisions (depth 1-2).
+        // Shared by razoring, reverse futility pruning, and per-move futility.
+        // Not computed at depth 3+ to avoid evaluate() overhead at interior nodes.
+        let non_terminal = alpha.abs() < PatternScore::FIVE - 100
+            && beta.abs() < PatternScore::FIVE - 100;
+        let static_eval = if depth <= 2 && non_terminal {
+            evaluate(board, color)
+        } else {
+            0
+        };
+
+        // Reverse futility pruning (static null move pruning):
+        // At shallow depths, if position is far above beta, even losing
+        // margin won't drop below. Cut immediately.
+        // Uses OPEN_THREE (10K) per depth as margin — in Gomoku a single
+        // quiet move can swing eval by up to OPEN_THREE (creating a new threat).
+        if depth <= 2
+            && non_terminal
+            && static_eval - PatternScore::OPEN_THREE * i32::from(depth) >= beta
+        {
+            return static_eval;
+        }
+
+        // Razoring: at shallow depths, if static eval is far below alpha,
+        // verify with quiescence search. If QS confirms the position is bad, cut.
+        // Complementary to RFP (which cuts when eval >> beta).
+        if depth <= 2
+            && non_terminal
+            && static_eval + PatternScore::OPEN_THREE * i32::from(depth) <= alpha
+        {
+            let qs_score = self.quiescence(board, color, alpha, beta, last_move, 0, hash);
+            if qs_score <= alpha {
+                return qs_score;
             }
         }
 
@@ -444,23 +813,48 @@ impl WorkerSearcher {
             }
         }
 
-        let tt_move = self.shared.tt.get_best_move(hash);
-        let mut moves = self.generate_moves_ordered(board, color, tt_move, depth);
+        let mut tt_move = self.shared.tt.get_best_move(hash);
+
+        // Internal Iterative Deepening (IID): when no TT entry exists at depth >= 6,
+        // run a shallow search to find a good first move for ordering.
+        // Threshold raised from 4 to 6 to eliminate IID cascade at low-depth nodes.
+        if tt_move.is_none() && depth >= 6 {
+            let iid_depth = (depth - 4).max(1);
+            self.alpha_beta(board, color, iid_depth, alpha, beta, last_move, hash, false);
+            if !self.is_stopped() {
+                tt_move = self.shared.tt.get_best_move(hash);
+            }
+        }
+
+        let (mut moves, top_score) = self.generate_moves_ordered(board, color, tt_move, depth);
         if moves.is_empty() {
             return evaluate(board, color);
         }
 
-        let max_moves = match depth {
-            0..=1 => 7,
-            2..=3 => 9,
-            4..=5 => 12,
-            _ => 15,
+        // Adaptive move limit: reduce in quiet positions (no tactical patterns).
+        // Tactical threshold: 850K+ means real fork/four-level threats.
+        // 800K (single block) is NOT tactical enough to warrant more candidates.
+        let is_tactical = top_score >= 850_000;
+
+        let max_moves = if is_tactical {
+            match depth {
+                0..=1 => 5,
+                2..=3 => 7,
+                4..=5 => 9,
+                _ => 12,
+            }
+        } else {
+            match depth {
+                0..=1 => 3,
+                2..=3 => 5,
+                4..=5 => 7,
+                _ => 9,
+            }
         };
         moves.truncate(max_moves);
 
-        // Futility pruning setup
-        let futility_ok = depth <= 2 && alpha.abs() < PatternScore::FIVE - 100;
-        let static_eval = if futility_ok { evaluate(board, color) } else { 0 };
+        // Futility pruning setup (reuses static_eval from shallow pruning block)
+        let futility_ok = depth <= 2 && non_terminal;
         let futility_margin = if depth == 1 {
             PatternScore::CLOSED_FOUR
         } else {
@@ -471,13 +865,18 @@ impl WorkerSearcher {
         let mut best_move = None;
         let mut entry_type = EntryType::UpperBound;
 
-        for (i, mov) in moves.iter().enumerate() {
-            // Futility pruning
+        for (i, (mov, move_score)) in moves.iter().enumerate() {
+            // Futility pruning (uses pre-computed move score — no redundant score_move call)
             if futility_ok && i > 0 && static_eval + futility_margin <= alpha {
-                let move_score = self.score_move(board, *mov, color, tt_move, depth);
-                if move_score < 800_000 {
+                if *move_score < 800_000 {
                     continue;
                 }
+            }
+
+            // Late Move Pruning (LMP): at shallow depths, skip quiet moves entirely
+            // after trying the first few. Done BEFORE make_move to avoid overhead.
+            if i > 0 && depth <= 3 && i >= (3 + depth as usize * 2) && *move_score < 800_000 {
+                continue;
             }
 
             board.place_stone(*mov, color);
@@ -502,12 +901,17 @@ impl WorkerSearcher {
 
             let is_capture = cap_info.pairs > 0;
 
+            // Threat extension: forcing moves (creating a four) get +1 ply.
+            // Fours have only 1-2 legal responses → narrow subtree, minimal cost.
+            // Only extend at depth >= 2: at depth 1, quiescence already handles threats.
+            let extension = if depth >= 2 && Self::move_creates_four(board, *mov, color) { 1i8 } else { 0i8 };
+
             // PVS + LMR
             let score = if i == 0 {
                 -self.alpha_beta(
                     board,
                     color.opponent(),
-                    depth - 1,
+                    depth - 1 + extension,
                     -beta,
                     -alpha,
                     *mov,
@@ -515,18 +919,20 @@ impl WorkerSearcher {
                     true,
                 )
             } else {
-                let reduction = if is_capture || depth < 3 {
+                // LMR: logarithmic reduction + score-aware adjustment (Stockfish-inspired).
+                // Captures, extensions, shallow depths, and PV move get no reduction.
+                // Quiet moves (score < 500K) get +1 extra reduction — they rarely refute.
+                let reduction = if is_capture || extension > 0 || depth < 2 || i < 1 {
                     0i8
-                } else if i >= 8 && depth >= 5 {
-                    3i8
-                } else if i >= 5 && depth >= 4 {
-                    2i8
-                } else if i >= 3 && depth >= 3 {
-                    1i8
                 } else {
-                    0i8
+                    let d = depth as f32;
+                    let m = i as f32;
+                    let mut r = (d.sqrt() * m.sqrt() / 2.0) as i8;
+                    // Score-aware: quiet moves with no tactical value get more reduction
+                    if *move_score < 500_000 { r += 1; }
+                    r.max(1).min(depth - 2)
                 };
-                let search_depth = (depth - 1 - reduction).max(0);
+                let search_depth = (depth - 1 + extension - reduction).max(0);
 
                 let mut s = -self.alpha_beta(
                     board,
@@ -543,7 +949,7 @@ impl WorkerSearcher {
                     s = -self.alpha_beta(
                         board,
                         color.opponent(),
-                        depth - 1,
+                        depth - 1 + extension,
                         -(alpha + 1),
                         -alpha,
                         *mov,
@@ -556,7 +962,7 @@ impl WorkerSearcher {
                     s = -self.alpha_beta(
                         board,
                         color.opponent(),
-                        depth - 1,
+                        depth - 1 + extension,
                         -beta,
                         -alpha,
                         *mov,
@@ -673,46 +1079,52 @@ impl WorkerSearcher {
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         let mut my_five = false;
         let mut opp_five = false;
-        let mut my_open_four = false;
-        let mut opp_open_four = false;
-        let mut my_four = false;
-        let mut opp_four = false;
-        let mut my_open_three = false;
-        let mut opp_open_three = false;
+        // Use counts (not booleans) to detect forks — a single move creating
+        // multiple threats in different directions is far more dangerous.
+        let mut my_open_four_count = 0i32;
+        let mut opp_open_four_count = 0i32;
+        let mut my_closed_four_count = 0i32;
+        let mut opp_closed_four_count = 0i32;
+        let mut my_open_three_count = 0i32;
+        let mut opp_open_three_count = 0i32;
         let mut my_two_score = 0i32;
 
         for (dr, dc) in dirs {
-            let (mc, mo, _, mc_consec) = Self::count_line_with_gap(board, mov, dr, dc, color);
-            let (oc, oo, _, oc_consec) =
+            let (mc, mo, mc_gap, mc_consec) = Self::count_line_with_gap(board, mov, dr, dc, color);
+            let (oc, oo, oc_gap, oc_consec) =
                 Self::count_line_with_gap(board, mov, dr, dc, opponent);
 
             if mc_consec >= 5 {
                 my_five = true;
+            } else if mc >= 5 && mc_gap {
+                // Gap-five: e.g. OO_OO — filling the gap creates five-in-a-row.
+                // Treat as open four (one move away from winning).
+                my_open_four_count += 1;
             }
             if oc_consec >= 5 {
                 opp_five = true;
+            } else if oc >= 5 && oc_gap {
+                opp_open_four_count += 1;
             }
             if mc == 4 {
                 if mo == 2 {
-                    my_open_four = true;
-                }
-                if mo >= 1 {
-                    my_four = true;
+                    my_open_four_count += 1;
+                } else if mo == 1 {
+                    my_closed_four_count += 1;
                 }
             }
             if oc == 4 {
                 if oo == 2 {
-                    opp_open_four = true;
-                }
-                if oo >= 1 {
-                    opp_four = true;
+                    opp_open_four_count += 1;
+                } else if oo == 1 {
+                    opp_closed_four_count += 1;
                 }
             }
             if mc == 3 && mo == 2 {
-                my_open_three = true;
+                my_open_three_count += 1;
             }
             if oc == 3 && oo == 2 {
-                opp_open_three = true;
+                opp_open_three_count += 1;
             }
             if mc == 2 {
                 my_two_score += if mo == 2 {
@@ -728,6 +1140,12 @@ impl WorkerSearcher {
             }
         }
 
+        // Derived totals for fork detection
+        let my_total_fours = my_open_four_count + my_closed_four_count;
+        let opp_total_fours = opp_open_four_count + opp_closed_four_count;
+
+        // === Priority ladder with fork detection ===
+        // Immediate wins
         if my_five {
             return 900_000;
         }
@@ -744,13 +1162,33 @@ impl WorkerSearcher {
             return 885_000;
         }
 
-        if my_open_four {
+        // MY FORKS: a single move creating multiple forcing threats
+        // Two fours (any type): opponent can only block one → win
+        if my_total_fours >= 2 {
+            return 880_000;
+        }
+        // Four + open three: must block four, three promotes to open four → win
+        if my_total_fours >= 1 && my_open_three_count >= 1 {
+            return 878_000;
+        }
+
+        // Single open four (unstoppable without capture)
+        if my_open_four_count >= 1 {
             return 870_000;
         }
-        if opp_open_four {
+
+        // BLOCK OPPONENT FORKS (higher priority than our single threats)
+        if opp_total_fours >= 2 {
+            return 868_000;
+        }
+        if opp_total_fours >= 1 && opp_open_three_count >= 1 {
+            return 866_000;
+        }
+        if opp_open_four_count >= 1 {
             return 860_000;
         }
 
+        // Capture-based urgency (opponent near capture win)
         let opp_caps = board.captures(opponent);
         if opp_capture > 0 && opp_caps >= 3 {
             return 855_000;
@@ -759,16 +1197,25 @@ impl WorkerSearcher {
             return 845_000;
         }
 
-        if my_four {
+        // Double open three fork: both mine and opponent's
+        if my_open_three_count >= 2 {
+            return 840_000;
+        }
+        if opp_open_three_count >= 2 {
+            return 838_000;
+        }
+
+        // Single forcing threats
+        if my_closed_four_count >= 1 {
             return 830_000;
         }
-        if opp_four {
+        if opp_closed_four_count >= 1 {
             return 820_000;
         }
-        if my_open_three {
+        if my_open_three_count >= 1 {
             return 810_000;
         }
-        if opp_open_three {
+        if opp_open_three_count >= 1 {
             return 800_000;
         }
 
@@ -807,23 +1254,41 @@ impl WorkerSearcher {
         #[allow(clippy::cast_possible_wrap)]
         let center = (BOARD_SIZE / 2) as i32;
         let dist = (i32::from(mov.row) - center).abs() + (i32::from(mov.col) - center).abs();
-        let center_bonus = (18 - dist) * 10;
+        let center_bonus = (18 - dist) * 25;
 
-        hist + center_bonus + my_two_score - capture_penalty
+        // Proximity bonus: strongly prefer moves adjacent to existing friendly stones.
+        // This prevents scattered placement and ensures pattern-building potential.
+        let sz = BOARD_SIZE as i8;
+        let mut proximity = 0i32;
+        for (dr, dc) in dirs {
+            for sign in [-1i8, 1i8] {
+                let nr = mov.row as i8 + dr * sign;
+                let nc = mov.col as i8 + dc * sign;
+                if nr >= 0 && nr < sz && nc >= 0 && nc < sz
+                    && board.get(Pos::new(nr as u8, nc as u8)) == color
+                {
+                    proximity += 200;
+                }
+            }
+        }
+
+        hist + center_bonus + my_two_score + proximity - capture_penalty
     }
 
     /// Generate candidate moves ordered by priority.
+    /// Returns (sorted moves with scores, top move score) for adaptive move limiting
+    /// and score-aware pruning decisions (LMR, futility, LMP).
     fn generate_moves_ordered(
         &self,
         board: &Board,
         color: Stone,
         tt_move: Option<Pos>,
         depth: i8,
-    ) -> Vec<Pos> {
+    ) -> (Vec<(Pos, i32)>, i32) {
         let mut seen = [[false; BOARD_SIZE]; BOARD_SIZE];
 
         if board.is_board_empty() {
-            return vec![Pos::new(9, 9)];
+            return (vec![(Pos::new(9, 9), 1_000_000)], 0);
         }
 
         let radius = 2i32;
@@ -861,7 +1326,8 @@ impl WorkerSearcher {
         }
 
         scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        scored.into_iter().map(|(m, _)| m).collect()
+        let top_score = scored.first().map_or(0, |(_, s)| *s);
+        (scored, top_score)
     }
 
     /// Scan a line from `pos` in both directions.
@@ -1001,6 +1467,10 @@ impl WorkerSearcher {
                     if before == Stone::Empty && after1 == color && after2 == opponent {
                         vuln_count += 1;
                     }
+                    // opp-MOV-ally-empty: opponent can place at after2 to capture
+                    if before == opponent && after1 == color && after2 == Stone::Empty {
+                        vuln_count += 1;
+                    }
                 }
 
                 let rm2 = mov.row as i8 - sdr * 2;
@@ -1027,6 +1497,10 @@ impl WorkerSearcher {
                         vuln_count += 1;
                     }
                     if before2 == Stone::Empty && before1 == color && after == opponent {
+                        vuln_count += 1;
+                    }
+                    // opp-ally-MOV-empty: opponent can place at after to capture
+                    if before2 == opponent && before1 == color && after == Stone::Empty {
                         vuln_count += 1;
                     }
                 }
@@ -1148,7 +1622,6 @@ impl Searcher {
         }
 
         best_result.nodes = worker.nodes;
-        // Persist history for future searches
         self.history = worker.history;
         best_result
     }
@@ -1217,7 +1690,6 @@ impl Searcher {
         }
 
         best.nodes = total_nodes;
-        // Persist history from main worker
         self.history = main_worker.history;
         best
     }
@@ -1474,5 +1946,49 @@ mod tests {
         assert!(result.best_move.is_some(), "Should find a move");
         assert!(result.depth >= 4, "Should reach reasonable depth, got {}", result.depth);
         assert!(result.nodes > 0, "Should search some nodes");
+    }
+
+    /// Test that quiescence search detects forced wins beyond the regular search depth.
+    /// Setup: Black has three in a row with both ends open → four → five is forced.
+    /// Even at depth 1, QS should see the winning sequence.
+    #[test]
+    fn test_quiescence_detects_open_four() {
+        let mut searcher = Searcher::with_threads(16, 1);
+        let mut board = Board::new();
+
+        // Black open three: _BBB_ at row 9
+        board.place_stone(Pos::new(9, 8), Stone::Black);
+        board.place_stone(Pos::new(9, 9), Stone::Black);
+        board.place_stone(Pos::new(9, 10), Stone::Black);
+        // White stones far away
+        board.place_stone(Pos::new(0, 0), Stone::White);
+        board.place_stone(Pos::new(0, 1), Stone::White);
+
+        // Shallow search should still find the winning continuation
+        let result = searcher.search(&board, Stone::Black, 2);
+        assert!(result.score > PatternScore::OPEN_FOUR,
+            "QS should evaluate open three position very highly, got {}", result.score);
+    }
+
+    /// Test QS detects forced win via four-threat sequence.
+    #[test]
+    fn test_quiescence_four_threat_win() {
+        let mut searcher = Searcher::with_threads(16, 1);
+        let mut board = Board::new();
+
+        // Black has OOOO_ (closed four) → extending to five is forced
+        board.place_stone(Pos::new(9, 7), Stone::Black);
+        board.place_stone(Pos::new(9, 8), Stone::Black);
+        board.place_stone(Pos::new(9, 9), Stone::Black);
+        board.place_stone(Pos::new(9, 10), Stone::Black);
+        // White blocks one side
+        board.place_stone(Pos::new(9, 6), Stone::White);
+        board.place_stone(Pos::new(0, 0), Stone::White);
+
+        let result = searcher.search(&board, Stone::Black, 1);
+        assert_eq!(result.best_move, Some(Pos::new(9, 11)),
+            "Should find the five-completion move");
+        assert!(result.score >= PatternScore::FIVE - 100,
+            "Should be a winning score, got {}", result.score);
     }
 }
