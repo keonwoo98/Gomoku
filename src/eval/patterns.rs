@@ -24,7 +24,9 @@ impl PatternScore {
     /// Open three: _OOO_ (becomes open four if not blocked)
     pub const OPEN_THREE: i32 = 10_000;
     /// Closed three: XOOO_ or _OOOX (one side blocked)
-    pub const CLOSED_THREE: i32 = 5_000;
+    /// Must be well below OPEN_THREE (10K) — a closed three is half as dangerous
+    /// since the opponent has a clear blocking point.
+    pub const CLOSED_THREE: i32 = 1_500;
 
     // Building patterns
     /// Open two: _OO_ (potential to grow)

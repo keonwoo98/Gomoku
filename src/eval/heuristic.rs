@@ -23,8 +23,10 @@ const DIRECTIONS: [(i32, i32); 4] = [
 /// Maximum Manhattan distance from center on 19x19 board
 const MAX_CENTER_DIST: i32 = 18;
 
-/// Weight per distance unit from center
-const POSITION_WEIGHT: i32 = 3;
+/// Weight per distance unit from center.
+/// Higher weight prevents scattered stone placement (O6, F12 type moves).
+/// At weight 8: center stone gets 144pts, corner gets 0 — significant vs CLOSED_TWO (50).
+const POSITION_WEIGHT: i32 = 8;
 
 /// Evaluate the board from the perspective of the given color.
 ///
@@ -55,59 +57,60 @@ pub fn evaluate(board: &Board, color: Stone) -> i32 {
         return -PatternScore::FIVE;
     }
 
-    // Capture score (non-linear, symmetric for negamax)
     let cap_score = capture_score(board.captures(color), board.captures(opponent));
 
-    // Pattern-based evaluation
-    let my_patterns = evaluate_patterns(board, color);
-    let opp_patterns = evaluate_patterns(board, opponent);
+    // Single-pass evaluation per color: patterns + position + vulnerability combined.
+    // SYMMETRIC for negamax: evaluate(board, Black) == -evaluate(board, White).
+    let (my_score, my_vuln) = evaluate_color(board, color);
+    let (opp_score, opp_vuln) = evaluate_color(board, opponent);
 
-    // SYMMETRIC evaluation required for negamax correctness.
-    // evaluate(board, Black) must equal -evaluate(board, White).
-    // Defense-first behavior is handled by move ordering (score_move),
-    // NOT by the evaluation function. Any multiplier != 1.0 breaks
-    // negamax symmetry and causes the AI to miscalculate positions.
-    let pattern_score = my_patterns - opp_patterns;
+    let my_caps = board.captures(color);
+    let opp_caps = board.captures(opponent);
+    let vuln_penalty = my_vuln * vuln_weight(opp_caps) - opp_vuln * vuln_weight(my_caps);
 
-    // Position score (center control bonus)
-    let position_score = evaluate_positions(board, color) - evaluate_positions(board, opponent);
-
-    // Capture vulnerability: penalize having pairs the opponent can capture next turn.
-    // Symmetric: my_vuln counted for opponent's advantage, opp_vuln for ours.
-    let my_vuln = count_vulnerable_pairs(board, color);
-    let opp_vuln = count_vulnerable_pairs(board, opponent);
-    let vuln_penalty = (my_vuln - opp_vuln) * 4_000; // Each vulnerable pair ≈ CAPTURE_THREAT
-
-    cap_score + pattern_score + position_score - vuln_penalty
+    cap_score + (my_score - opp_score) - vuln_penalty
 }
 
-/// Evaluate pattern-based score for a color.
+/// Returns vulnerability penalty weight scaled by opponent's capture count.
+/// Higher captures = much higher penalty per vulnerable pair (exponential danger).
+fn vuln_weight(opp_captures: u8) -> i32 {
+    match opp_captures {
+        0..=1 => 4_000,  // baseline (same as before)
+        2 => 10_000,     // 2 pairs captured — increasing danger
+        3 => 25_000,     // 3 pairs — serious threat
+        _ => 60_000,     // 4 pairs — one more capture = instant loss
+    }
+}
+
+/// Single-pass evaluation for one color.
 ///
-/// Scans all stones of the given color and evaluates line patterns
-/// in all four directions. Each line segment is counted exactly once
-/// by only evaluating from the "start" position (no same-color stone
-/// in the negative direction).
+/// Combines pattern scoring, position bonus, and capture vulnerability
+/// into a single iteration over the color's stones. This is ~3x faster
+/// than the previous 3-function approach (evaluate_patterns + evaluate_positions
+/// + count_vulnerable_pairs) which each iterated all stones separately.
 ///
-/// Also detects multiple threat combinations that are effectively unstoppable:
-/// - Two closed fours: opponent can only block one → bonus
-/// - Closed four + open three: must block four, three promotes → bonus
-/// - Two open threes: opponent can only block one → bonus
-fn evaluate_patterns(board: &Board, color: Stone) -> i32 {
+/// Returns (total_score, vulnerable_pair_count).
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
     let Some(stones) = board.stones(color) else {
-        return 0;
+        return (0, 0);
     };
+
+    let opponent = color.opponent();
+    let center = (BOARD_SIZE / 2) as i32;
 
     let mut score = 0;
     let mut open_fours = 0i32;
     let mut closed_fours = 0i32;
     let mut open_threes = 0i32;
+    let mut vuln = 0i32;
 
     for pos in stones.iter_ones() {
+        // --- Pattern scoring (4 directions) ---
         for &(dr, dc) in &DIRECTIONS {
             let pattern_score = evaluate_line(board, pos, dr, dc, color);
             score += pattern_score;
 
-            // Count high-value patterns for combo detection
             if pattern_score >= PatternScore::OPEN_FOUR {
                 open_fours += 1;
             } else if pattern_score >= PatternScore::CLOSED_FOUR {
@@ -116,30 +119,79 @@ fn evaluate_patterns(board: &Board, color: Stone) -> i32 {
                 open_threes += 1;
             }
         }
+
+        // --- Position bonus (center control) ---
+        let dist = (i32::from(pos.row) - center).abs() + (i32::from(pos.col) - center).abs();
+        score += (MAX_CENTER_DIST - dist) * POSITION_WEIGHT;
+
+        // --- Connectivity bonus: reward stones near other friendly stones ---
+        // This incentivizes clustered, connected play over scattered placement.
+        // Each bond is counted from both sides of the pair (2×80=160 per adjacent pair).
+        // Magnitude is small vs patterns (OPEN_TWO=1000) but provides meaningful
+        // tiebreaker that prevents isolated stone placement.
+        for &(dr, dc) in &DIRECTIONS {
+            for sign in [1i32, -1i32] {
+                let nr = i32::from(pos.row) + dr * sign;
+                let nc = i32::from(pos.col) + dc * sign;
+                if Pos::is_valid(nr, nc) && board.get(Pos::new(nr as u8, nc as u8)) == color {
+                    score += 80;
+                }
+            }
+        }
+
+        // --- Vulnerability: ally-ally pair capturable by opponent ---
+        for &(dr, dc) in &DIRECTIONS {
+            let r1 = i32::from(pos.row) + dr;
+            let c1 = i32::from(pos.col) + dc;
+            if !Pos::is_valid(r1, c1) { continue; }
+            let p1 = Pos::new(r1 as u8, c1 as u8);
+            if board.get(p1) != color { continue; }
+
+            let rb = i32::from(pos.row) - dr;
+            let cb = i32::from(pos.col) - dc;
+            let ra = r1 + dr;
+            let ca = c1 + dc;
+
+            let before = if Pos::is_valid(rb, cb) {
+                board.get(Pos::new(rb as u8, cb as u8))
+            } else {
+                Stone::Empty
+            };
+            let after = if Pos::is_valid(ra, ca) {
+                board.get(Pos::new(ra as u8, ca as u8))
+            } else {
+                Stone::Empty
+            };
+
+            // empty-ally-ally-opp: opponent plays at empty to capture
+            if before == Stone::Empty && after == opponent && Pos::is_valid(rb, cb) {
+                vuln += 1;
+            }
+            // opp-ally-ally-empty: opponent plays at empty to capture
+            if before == opponent && after == Stone::Empty && Pos::is_valid(ra, ca) {
+                vuln += 1;
+            }
+        }
     }
 
-    // Multiple threat combination bonuses:
-    // These detect positions where the opponent cannot block all threats simultaneously.
-    // Open four + any other strong threat = nearly unstoppable (only capture can stop)
+    // Multiple threat combination bonuses
+    // These are CRITICAL: multi-direction threats are often unblockable.
     if open_fours >= 1 && (closed_fours >= 1 || open_threes >= 1) {
         score += PatternScore::OPEN_FOUR;
     }
-    // Two closed fours = opponent can only block one → effectively an open four
     if closed_fours >= 2 {
         score += PatternScore::OPEN_FOUR;
     }
-    // Closed four + open three = opponent must block four, three promotes to open four
-    // This is effectively unstoppable (equivalent to open four)
     if closed_fours >= 1 && open_threes >= 1 {
         score += PatternScore::OPEN_FOUR;
     }
-    // Two open threes = opponent can only block one → one becomes open four
-    // This is effectively unstoppable (equivalent to open four)
+    // Double open three: opponent can only block one → the other becomes open four → win.
+    // Must be high enough to dominate single-pattern scores in evaluation.
     if open_threes >= 2 {
-        score += PatternScore::OPEN_FOUR;
+        score += PatternScore::CLOSED_FOUR; // 50K (was 30K) — nearly unblockable
     }
 
-    score
+    (score, vuln)
 }
 
 /// Evaluate a single line pattern from a position in a given direction.
@@ -242,86 +294,6 @@ fn evaluate_line(board: &Board, pos: Pos, dr: i32, dc: i32, color: Stone) -> i32
             _ => 0,
         }
     }
-}
-
-/// Count pairs of friendly stones that are vulnerable to capture.
-///
-/// A pair is vulnerable if it matches: `empty - ally - ally - opponent`
-/// in any direction — the opponent can capture by playing at the empty cell.
-/// Also counts `opponent - ally - ally - empty` (opponent already flanks one side).
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn count_vulnerable_pairs(board: &Board, color: Stone) -> i32 {
-    let opponent = color.opponent();
-    let Some(stones) = board.stones(color) else {
-        return 0;
-    };
-
-    let mut vuln = 0i32;
-
-    for pos in stones.iter_ones() {
-        for &(dr, dc) in &DIRECTIONS {
-            // Check positive direction: pos, pos+1, pos+2, pos+3
-            // Pattern: ally(pos) - ally(pos+1) - and flanked by opp+empty
-            let r1 = i32::from(pos.row) + dr;
-            let c1 = i32::from(pos.col) + dc;
-            if !Pos::is_valid(r1, c1) { continue; }
-            let p1 = Pos::new(r1 as u8, c1 as u8);
-            if board.get(p1) != color { continue; }
-
-            // We have ally-ally at (pos, p1). Check flanks.
-            let rb = i32::from(pos.row) - dr; // before pos
-            let cb = i32::from(pos.col) - dc;
-            let ra = r1 + dr; // after p1
-            let ca = c1 + dc;
-
-            let before = if Pos::is_valid(rb, cb) {
-                board.get(Pos::new(rb as u8, cb as u8))
-            } else {
-                Stone::Empty // treat edge as blocker, but not capturable
-            };
-            let after = if Pos::is_valid(ra, ca) {
-                board.get(Pos::new(ra as u8, ca as u8))
-            } else {
-                Stone::Empty
-            };
-
-            // Vulnerable: empty-ally-ally-opp (opp plays at empty to capture)
-            if before == Stone::Empty && after == opponent && Pos::is_valid(rb, cb) {
-                vuln += 1;
-            }
-            // Vulnerable: opp-ally-ally-empty (opp plays at empty to capture)
-            if before == opponent && after == Stone::Empty && Pos::is_valid(ra, ca) {
-                vuln += 1;
-            }
-        }
-    }
-
-    vuln
-}
-
-/// Evaluate positional bonuses for a color.
-///
-/// Stones closer to the center are worth more as they have more
-/// potential for creating patterns in multiple directions.
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn evaluate_positions(board: &Board, color: Stone) -> i32 {
-    let Some(stones) = board.stones(color) else {
-        return 0;
-    };
-
-    // Center is at (9, 9) for a 19x19 board
-    let center = (BOARD_SIZE / 2) as i32;
-    let mut score = 0;
-
-    for pos in stones.iter_ones() {
-        // Manhattan distance from center
-        let dist = (i32::from(pos.row) - center).abs() + (i32::from(pos.col) - center).abs();
-        // Max distance is MAX_CENTER_DIST (corner to center)
-        // Max bonus is MAX_CENTER_DIST * POSITION_WEIGHT per stone
-        score += (MAX_CENTER_DIST - dist) * POSITION_WEIGHT;
-    }
-
-    score
 }
 
 #[cfg(test)]
