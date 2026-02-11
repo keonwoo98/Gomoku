@@ -31,6 +31,11 @@ pub enum AiState {
         receiver: Receiver<(MoveResult, AIEngine)>,
         start_time: Instant,
     },
+    /// Timed out but still waiting for the thread to finish so we can reclaim the engine.
+    /// This prevents losing the 64MB TT cache on timeout.
+    Reclaiming {
+        receiver: Receiver<(MoveResult, AIEngine)>,
+    },
 }
 
 /// Capture animation state
@@ -307,16 +312,19 @@ impl GameState {
         let captured_positions = rules::execute_captures(&mut self.board, pos, color);
         let capture_count = captured_positions.len() / 2; // Each capture is a pair
 
-        // Log human moves for game reconstruction
+        // Log moves for game reconstruction
+        let color_str = if color == Stone::Black { "Black" } else { "White" };
+        let cap_str = if capture_count > 0 {
+            format!(" +{}cap [{}]", capture_count,
+                captured_positions.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>().join(", "))
+        } else {
+            String::new()
+        };
         if is_human {
-            let color_str = if color == Stone::Black { "Black" } else { "White" };
-            let cap_str = if capture_count > 0 {
-                format!(" +{}cap [{}]", capture_count,
-                    captured_positions.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>().join(", "))
-            } else {
-                String::new()
-            };
             ai_log(&format!("  >> Human #{}: {} plays {}{}",
+                move_num, color_str, pos_to_notation(pos), cap_str));
+        } else {
+            ai_log(&format!("  >> AI #{}: {} plays {}{}",
                 move_num, color_str, pos_to_notation(pos), cap_str));
         }
 
@@ -338,6 +346,13 @@ impl GameState {
 
         // Check for win
         if let Some(result) = self.check_win(pos, color, capture_count) {
+            let winner_str = if result.winner == Stone::Black { "BLACK" } else { "WHITE" };
+            let win_type_str = match result.win_type {
+                WinType::FiveInRow => "5-in-a-row",
+                WinType::Capture => "capture",
+            };
+            ai_log(&format!("\n*** GAME OVER: {} WINS by {} (move #{}) ***",
+                winner_str, win_type_str, move_num));
             self.game_over = Some(result);
             return;
         }
@@ -367,13 +382,16 @@ impl GameState {
             });
         }
 
-        // Check five-in-a-row
+        // Check five-in-a-row (must verify opponent can't break it by capture)
         if let Some(line) = self.find_winning_line(pos, color) {
-            return Some(GameResult {
-                winner: color,
-                win_type: WinType::FiveInRow,
-                winning_line: Some(line),
-            });
+            let line_vec: Vec<Pos> = line.to_vec();
+            if !rules::can_break_five_by_capture(&self.board, &line_vec, color) {
+                return Some(GameResult {
+                    winner: color,
+                    win_type: WinType::FiveInRow,
+                    winning_line: Some(line),
+                });
+            }
         }
 
         None
@@ -428,6 +446,15 @@ impl GameState {
             return;
         }
 
+        // If still reclaiming engine from a timed-out search, try once more before proceeding
+        if matches!(self.ai_state, AiState::Reclaiming { .. }) {
+            self.try_reclaim_engine();
+            if matches!(self.ai_state, AiState::Reclaiming { .. }) {
+                // Still waiting — skip this frame, will retry next frame
+                return;
+            }
+        }
+
         let board = self.board.clone();
         let color = self.current_turn;
 
@@ -452,24 +479,27 @@ impl GameState {
 
     /// Check if AI has finished thinking
     pub fn check_ai_result(&mut self) {
-        // First, check if AI has timed out (5 seconds)
+        // Try to reclaim engine from a previously timed-out search.
+        // This runs every frame and recovers the engine + TT cache once the thread finishes.
+        self.try_reclaim_engine();
+
+        // Check if AI has timed out (5 seconds)
         let should_force_move = match &self.ai_state {
             AiState::Thinking { start_time, .. } => {
                 start_time.elapsed() > Duration::from_secs(5)
             }
-            AiState::Idle => false,
+            _ => false,
         };
 
-        // If timed out, force a quick fallback move
+        // If timed out, transition to Reclaiming (keep receiver!) and play fallback
         if should_force_move {
-            // Engine is lost in the thread; create a fresh one
-            if self.ai_engine.is_none() {
-                self.ai_engine = Some(AIEngine::with_config(64, self.ai_depth, self.ai_time_limit_ms));
+            // Take the current state and extract the receiver for background reclamation
+            let old_state = std::mem::replace(&mut self.ai_state, AiState::Idle);
+            if let AiState::Thinking { receiver, .. } = old_state {
+                self.ai_state = AiState::Reclaiming { receiver };
             }
-            self.ai_state = AiState::Idle;
             self.message = Some("AI timeout - quick move".to_string());
 
-            // Find any valid move quickly
             if let Some(fallback) = self.find_fallback_move() {
                 self.execute_move(fallback);
             }
@@ -488,7 +518,7 @@ impl GameState {
                     }
                 }
             }
-            AiState::Idle => None,
+            _ => None,
         };
 
         if let Some((move_result, engine, elapsed)) = result {
@@ -502,6 +532,32 @@ impl GameState {
                 self.execute_move(pos);
             } else {
                 self.message = Some("AI could not find a move".to_string());
+            }
+        }
+    }
+
+    /// Try to reclaim the AI engine from a timed-out search thread.
+    /// Called every frame — once the thread finishes, we get the engine back
+    /// with its full TT cache intact, avoiding expensive re-creation.
+    fn try_reclaim_engine(&mut self) {
+        if let AiState::Reclaiming { receiver } = &self.ai_state {
+            match receiver.try_recv() {
+                Ok((_result, engine)) => {
+                    self.ai_engine = Some(engine);
+                    self.ai_state = AiState::Idle;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Thread still running — will try again next frame
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread panicked or dropped sender — give up gracefully
+                    if self.ai_engine.is_none() {
+                        self.ai_engine = Some(AIEngine::with_config(
+                            64, self.ai_depth, self.ai_time_limit_ms,
+                        ));
+                    }
+                    self.ai_state = AiState::Idle;
+                }
             }
         }
     }
@@ -577,7 +633,7 @@ impl GameState {
     pub fn ai_thinking_elapsed(&self) -> Option<Duration> {
         match &self.ai_state {
             AiState::Thinking { start_time, .. } => Some(start_time.elapsed()),
-            AiState::Idle => None,
+            AiState::Idle | AiState::Reclaiming { .. } => None,
         }
     }
 
@@ -697,5 +753,73 @@ impl GameState {
     /// Check if currently reviewing a past position
     pub fn is_reviewing(&self) -> bool {
         self.review_index.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduce the exact game position where the UI incorrectly declared a win.
+    /// F13-G12-H11-J10-K9 diagonal five is breakable because White can capture
+    /// J10+H10 by placing at K10 (pattern: K10(W)-J10(B)-H10(B)-G10(W)).
+    #[test]
+    fn test_five_in_row_breakable_by_capture() {
+        let mut state = GameState::new(GameMode::PvP { show_suggestions: false });
+
+        // Build the exact board position from the game:
+        // Black stones: J10, H10, K9, K11, J9, M9, K12, H11, G12
+        // White stones: H12, L10, G10, K8, M8, H9, N9, K13, J11, L8
+        // (K10 and L9 were captured by J11, freeing those positions)
+
+        let moves: Vec<(u8, u8, Stone)> = vec![
+            // White at G10 (9,6) — key flanking stone for capture
+            (9, 6, Stone::White),
+            // Black stones forming the diagonal
+            (8, 9, Stone::Black),  // K9
+            (9, 8, Stone::Black),  // J10
+            (9, 7, Stone::Black),  // H10 (captured with J10 if White places K10)
+            (10, 7, Stone::Black), // H11
+            (11, 6, Stone::Black), // G12
+            // White stones to make position realistic
+            (10, 8, Stone::White), // J11
+            (11, 7, Stone::White), // H12
+        ];
+
+        for (r, c, color) in moves {
+            state.board.place_stone(Pos::new(r, c), color);
+        }
+
+        // Now Black plays F13 = Pos(12, 5) completing diagonal five
+        state.current_turn = Stone::Black;
+        // Place the stone manually to test check_win
+        let f13 = Pos::new(12, 5);
+        state.board.place_stone(f13, Stone::Black);
+
+        // The five F13-G12-H11-J10-K9 should NOT be declared a win
+        // because White can capture J10+H10 by placing at K10(9,9):
+        // K10(W,9,9) - J10(B,9,8) - H10(B,9,7) - G10(W,9,6) = X-O-O-X
+        let result = state.check_win(f13, Stone::Black, 0);
+        assert!(
+            result.is_none(),
+            "Five F13-G12-H11-J10-K9 should NOT be a win: White can break it by capturing J10+H10"
+        );
+    }
+
+    /// Verify that a genuine unbreakable five IS declared as a win.
+    #[test]
+    fn test_five_in_row_unbreakable_wins() {
+        let mut state = GameState::new(GameMode::PvP { show_suggestions: false });
+
+        // Simple horizontal five with no White stones nearby to capture
+        for i in 5..10 {
+            state.board.place_stone(Pos::new(9, i), Stone::Black);
+        }
+        // Add a distant White stone
+        state.board.place_stone(Pos::new(0, 0), Stone::White);
+
+        let result = state.check_win(Pos::new(9, 7), Stone::Black, 0);
+        assert!(result.is_some(), "Unbreakable five should be declared a win");
+        assert_eq!(result.unwrap().win_type, WinType::FiveInRow);
     }
 }

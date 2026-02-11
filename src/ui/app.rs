@@ -479,7 +479,9 @@ impl GomokuApp {
 
     /// Render game over section
     fn render_game_over_section(&mut self, ui: &mut egui::Ui) {
-        let result = self.state.game_over.clone().unwrap();
+        let Some(result) = self.state.game_over.clone() else {
+            return;
+        };
         let is_black = result.winner == Stone::Black;
         let winner = if is_black { "BLACK" } else { "WHITE" };
         let win_type = match result.win_type {
