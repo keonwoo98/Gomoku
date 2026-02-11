@@ -371,7 +371,9 @@ impl AIEngine {
     #[must_use]
     pub fn get_move_with_stats(&mut self, board: &Board, color: Stone) -> MoveResult {
         let start = Instant::now();
-        let move_num = board.stone_count() + 1;
+        // Actual game move number: stones on board + captured stones (removed) + 1
+        let total_captured = 2 * (board.captures(Stone::Black) as u32 + board.captures(Stone::White) as u32);
+        let move_num = board.stone_count() + total_captured + 1;
         let color_str = if color == Stone::Black { "Black" } else { "White" };
 
         let separator = "=".repeat(60);
@@ -604,15 +606,47 @@ impl AIEngine {
         self.searcher.tt_stats()
     }
 
-    /// Get an opening move for the very first move only.
+    /// Get an opening book move for the first 1-2 moves.
     ///
-    /// Only used when the board is completely empty — play center (9,9).
-    /// All other positions use the full search pipeline to avoid capture traps
-    /// and properly evaluate threats from the start.
-    fn get_opening_move(&self, board: &Board, _color: Stone) -> Option<Pos> {
-        // Only use book for empty board — center is universally optimal
+    /// - Empty board: play center (9,9)
+    /// - One opponent stone: play diagonally adjacent, preferring center-ward
+    ///
+    /// Standard Gomoku opening theory: the second move should be placed
+    /// adjacent to the opponent's stone to contest territory and start
+    /// building connected patterns. Diagonal placement is strongest because
+    /// it creates potential in two diagonal directions simultaneously.
+    fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
+        // Empty board → center is universally optimal
         if board.stone_count() == 0 {
             return Some(Pos::new(9, 9));
+        }
+        // Second move: play diagonally adjacent to opponent's only stone
+        if board.stone_count() == 1 {
+            let opponent = color.opponent();
+            // Find the opponent's stone
+            if let Some(stones) = board.stones(opponent) {
+                if let Some(opp_pos) = stones.iter_ones().next() {
+                    let center = (BOARD_SIZE / 2) as i32;
+                    let diagonals: [(i32, i32); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+                    let mut best: Option<Pos> = None;
+                    let mut best_dist = i32::MAX;
+                    for (dr, dc) in diagonals {
+                        let nr = i32::from(opp_pos.row) + dr;
+                        let nc = i32::from(opp_pos.col) + dc;
+                        if Pos::is_valid(nr, nc) {
+                            let dist = (nr - center).abs() + (nc - center).abs();
+                            if dist < best_dist {
+                                best_dist = dist;
+                                #[allow(clippy::cast_sign_loss)]
+                                {
+                                    best = Some(Pos::new(nr as u8, nc as u8));
+                                }
+                            }
+                        }
+                    }
+                    return best;
+                }
+            }
         }
         // Everything else goes through full search pipeline
         None
@@ -1023,5 +1057,44 @@ mod tests {
             "Should reach depth 8+ or find forced win, got depth {} type {:?}", result.depth, result.search_type);
         // Time should be under hard limit (700ms + margin)
         assert!(result.time_ms < 2000, "Should complete in reasonable time, took {}ms", result.time_ms);
+    }
+
+    /// Reproduce the exact position from game log where depth collapse occurred.
+    /// Game 1, Move #8: K10(B), K8(W), J11(B), M8(W), L10(B), O6(W), J10(B).
+    /// Previously collapsed to depth 4 with 2.3M nodes. Target: depth 8+.
+    #[test]
+    fn test_depth_collapse_regression() {
+        let mut board = Board::new();
+        // Game 1 position from gomoku_ai.log
+        // Notation: K10 = col K (10), row 10 (9 in 0-indexed)
+        let moves = [
+            (9, 10, Stone::Black),  // K10
+            (7, 10, Stone::White),  // K8
+            (10, 9, Stone::Black),  // J11
+            (7, 12, Stone::White),  // M8
+            (9, 11, Stone::Black),  // L10
+            (5, 14, Stone::White),  // O6
+            (9, 9, Stone::Black),   // J10
+        ];
+        for (r, c, s) in moves {
+            board.place_stone(Pos::new(r, c), s);
+        }
+
+        let mut engine = AIEngine::new();
+        let result = engine.get_move_with_stats(&board, Stone::White);
+
+        eprintln!(
+            "DEPTH-COLLAPSE-REGRESSION: depth={}, nodes={}, time={}ms, nps={}k, score={}, type={:?}",
+            result.depth, result.nodes, result.time_ms, result.nps, result.score, result.search_type
+        );
+
+        assert!(result.best_move.is_some(), "Should find a move");
+        let found_forced = result.score.abs() >= 799_900
+            || matches!(result.search_type, SearchType::VCF | SearchType::ImmediateWin);
+        assert!(
+            result.depth >= 8 || found_forced,
+            "Depth collapse regression: expected depth 8+, got depth {} score {} ({:?})",
+            result.depth, result.score, result.search_type
+        );
     }
 }
