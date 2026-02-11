@@ -193,6 +193,73 @@ fn is_free_three(pattern: &LinePattern) -> bool {
     true
 }
 
+/// Scan a line from the given position without allowing any gaps.
+/// Only collects consecutive friendly stones in each direction.
+fn scan_line_consecutive(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePattern {
+    let opponent = stone.opponent();
+    let mut stones = vec![0i32]; // The placed stone at position 0
+    let mut open_ends = 0u8;
+
+    // Scan positive direction - consecutive only
+    let mut found_open_end_pos = false;
+    for i in 1..=5 {
+        let r = pos.row as i32 + dr * i;
+        let c = pos.col as i32 + dc * i;
+        if !Pos::is_valid(r, c) {
+            break;
+        }
+        let check_pos = Pos::new(r as u8, c as u8);
+        let cell = board.get(check_pos);
+        if cell == stone {
+            stones.push(i);
+        } else if cell == opponent {
+            break;
+        } else {
+            found_open_end_pos = true;
+            break;
+        }
+    }
+    if found_open_end_pos {
+        open_ends += 1;
+    }
+
+    // Scan negative direction - consecutive only
+    let mut found_open_end_neg = false;
+    for i in 1..=5 {
+        let r = pos.row as i32 - dr * i;
+        let c = pos.col as i32 - dc * i;
+        if !Pos::is_valid(r, c) {
+            break;
+        }
+        let check_pos = Pos::new(r as u8, c as u8);
+        let cell = board.get(check_pos);
+        if cell == stone {
+            stones.push(-i);
+        } else if cell == opponent {
+            break;
+        } else {
+            found_open_end_neg = true;
+            break;
+        }
+    }
+    if found_open_end_neg {
+        open_ends += 1;
+    }
+
+    stones.sort();
+    let span = if stones.is_empty() {
+        0
+    } else {
+        (stones[stones.len() - 1] - stones[0] + 1) as u8
+    };
+
+    LinePattern {
+        stones,
+        open_ends,
+        span,
+    }
+}
+
 /// Check if placing stone at pos creates a free-three in the given direction
 /// This simulates placing the stone and then checks the pattern
 fn creates_free_three_in_direction(
@@ -206,7 +273,19 @@ fn creates_free_three_in_direction(
     // cells at distance 1-5 from pos. It never reads board.get(pos).
     // So we can safely analyze the original board without cloning.
     let pattern = scan_line(board, pos, stone, dr, dc);
-    is_free_three(&pattern)
+    if is_free_three(&pattern) {
+        return true;
+    }
+    // When gap-inclusive scan finds >3 stones, a consecutive subset might form
+    // a free-three that gets hidden by the extra stone(s). Fallback to
+    // consecutive-only scan to catch patterns like _BBB_ alongside a gap-connected 4th.
+    if pattern.stones.len() > 3 {
+        let consec = scan_line_consecutive(board, pos, stone, dr, dc);
+        if is_free_three(&consec) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Count how many free-threes would be created by placing stone at pos
@@ -610,6 +689,68 @@ mod tests {
             span: 6,
         };
         assert!(!is_free_three(&spread), "Too spread should not be free-three");
+    }
+
+    /// Regression test: Game 1 Move #23 (H10) was a double-three that wasn't detected.
+    /// Horizontal: F10-G10-H10 = _BBB_ (free-three) — BUT K10 exists at +2 via gap,
+    /// making scan_line see 4 stones [-2,-1,0,2] instead of 3.
+    /// Vertical: H10-H11-H12 = _BBB_ (free-three, correctly detected).
+    /// With the consecutive fallback, both free-threes are now detected.
+    #[test]
+    fn test_double_three_with_gap_connected_stone() {
+        let mut board = Board::new();
+        // Reconstruct Game 1 state at move #23 (before placing H10)
+        // Black stones (7 total):
+        // K10 = Pos(9,9), H12 = Pos(11,7), G10 = Pos(9,6), F10 = Pos(9,5)
+        // J7 = Pos(6,8), H11 = Pos(10,7), L8 = Pos(7,10)
+        board.place_stone(Pos::new(9, 9), Stone::Black);  // K10
+        board.place_stone(Pos::new(11, 7), Stone::Black); // H12
+        board.place_stone(Pos::new(9, 6), Stone::Black);  // G10
+        board.place_stone(Pos::new(9, 5), Stone::Black);  // F10
+        board.place_stone(Pos::new(6, 8), Stone::Black);  // J7
+        board.place_stone(Pos::new(10, 7), Stone::Black); // H11
+        board.place_stone(Pos::new(7, 10), Stone::Black); // L8
+
+        // White stones (5 total):
+        // M11 = Pos(10,11), K14 = Pos(13,9), G9 = Pos(8,6)
+        // J12 = Pos(11,8), K11 = Pos(10,9)
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(13, 9), Stone::White);  // K14
+        board.place_stone(Pos::new(8, 6), Stone::White);   // G9
+        board.place_stone(Pos::new(11, 8), Stone::White);  // J12
+        board.place_stone(Pos::new(10, 9), Stone::White);  // K11
+
+        // H10 = Pos(9, 7) — should be forbidden double-three
+        let pos = Pos::new(9, 7);
+        let free_threes = count_free_threes(&board, pos, Stone::Black);
+        assert_eq!(
+            free_threes, 2,
+            "H10 should create 2 free-threes (horizontal F10-G10-H10, vertical H10-H11-H12)"
+        );
+        assert!(
+            is_double_three(&board, pos, Stone::Black),
+            "H10 should be a forbidden double-three"
+        );
+        assert!(
+            !is_valid_move(&board, pos, Stone::Black),
+            "H10 should be an invalid move"
+        );
+    }
+
+    /// Test that consecutive fallback doesn't falsely detect free-threes
+    /// when the consecutive subset is blocked or has only 2 stones.
+    #[test]
+    fn test_consecutive_fallback_no_false_positive() {
+        let mut board = Board::new();
+        // Setup: W B B _ B _ (left end blocked by opponent)
+        // Gap-inclusive scan: 3 stones [-1, 0, 2] but left blocked by W → open_ends=1
+        // Consecutive scan: 2 stones [-1, 0] → not free-three (only 2)
+        board.place_stone(Pos::new(9, 4), Stone::White); // blocker
+        board.place_stone(Pos::new(9, 5), Stone::Black);
+        board.place_stone(Pos::new(9, 7), Stone::Black);
+
+        let free_threes = count_free_threes(&board, Pos::new(9, 6), Stone::Black);
+        assert_eq!(free_threes, 0, "Blocked pattern should not be free-three");
     }
 
     #[test]
