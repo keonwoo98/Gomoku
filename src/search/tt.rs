@@ -251,7 +251,10 @@ pub struct TTStats {
 /// ```
 fn pack_entry(depth: i8, score: i32, entry_type: EntryType, best_move: Option<Pos>) -> u64 {
     let d = (depth as i16 + 128) as u64 & 0xFF;
-    let s = (score as i64 + 1_048_576) as u64 & 0x1F_FFFF; // 21 bits
+    // Clamp score to 21-bit range [-1_048_575, 1_048_575] to prevent silent overflow.
+    // In practice scores rarely exceed FIVE (1M), but this is cheap insurance.
+    let clamped = score.clamp(-1_048_575, 1_048_575);
+    let s = (clamped as i64 + 1_048_576) as u64 & 0x1F_FFFF; // 21 bits
     let t = match entry_type {
         EntryType::Exact => 0u64,
         EntryType::LowerBound => 1u64,
@@ -301,9 +304,8 @@ pub struct AtomicTT {
     size: usize,
 }
 
-// Safety: AtomicTT only contains AtomicU64 + usize, all thread-safe.
-unsafe impl Sync for AtomicTT {}
-unsafe impl Send for AtomicTT {}
+// AtomicTT is Send+Sync automatically because all its fields (Vec<AtomicU64>, usize)
+// are Send+Sync. No manual unsafe impl needed.
 
 impl AtomicTT {
     /// Create a new atomic transposition table with the given size in megabytes.
