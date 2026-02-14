@@ -65,6 +65,47 @@ pub fn has_five_at_pos(board: &Board, pos: Pos, color: Stone) -> bool {
     false
 }
 
+/// Fast five-in-a-row position finder at a specific position.
+///
+/// Like `has_five_at_pos` but returns the positions forming the five.
+/// Only checks 4 directions from the given position. Only call when
+/// `has_five_at_pos` already returned true (rare path, no perf concern).
+pub fn find_five_line_at_pos(board: &Board, pos: Pos, color: Stone) -> Option<Vec<Pos>> {
+    let sz = 19i8;
+    let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+    for (dr, dc) in dirs {
+        let mut line = vec![pos];
+        // Positive direction
+        let mut r = pos.row as i8 + dr;
+        let mut c = pos.col as i8 + dc;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            if board.get(Pos::new(r as u8, c as u8)) == color {
+                line.push(Pos::new(r as u8, c as u8));
+                r += dr;
+                c += dc;
+            } else {
+                break;
+            }
+        }
+        // Negative direction
+        r = pos.row as i8 - dr;
+        c = pos.col as i8 - dc;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            if board.get(Pos::new(r as u8, c as u8)) == color {
+                line.push(Pos::new(r as u8, c as u8));
+                r -= dr;
+                c -= dc;
+            } else {
+                break;
+            }
+        }
+        if line.len() >= 5 {
+            return Some(line);
+        }
+    }
+    None
+}
+
 /// Find the positions of a 5-in-a-row if exists
 ///
 /// Returns Some(Vec<Pos>) with at least 5 positions if a winning line exists,
@@ -121,10 +162,13 @@ pub fn find_five_positions(board: &Board, stone: Stone) -> Option<Vec<Pos>> {
 pub fn can_break_five_by_capture(board: &Board, five_positions: &[Pos], five_color: Stone) -> bool {
     let opponent = five_color.opponent();
 
-    // For each empty position adjacent to the five
+    // For each empty position within radius 2 of the five stones.
+    // Radius 2 is needed because capture pattern X-O-O-X means the
+    // capturing stone can be up to 2 steps away from the nearest
+    // five-stone (e.g., placing at distance 2 captures the pair in between).
     for &pos in five_positions {
-        for dr in -1i32..=1 {
-            for dc in -1i32..=1 {
+        for dr in -2i32..=2 {
+            for dc in -2i32..=2 {
                 if dr == 0 && dc == 0 {
                     continue;
                 }
@@ -153,6 +197,51 @@ pub fn can_break_five_by_capture(board: &Board, five_positions: &[Pos], five_col
     }
 
     false
+}
+
+/// Find all positions where opponent can break the five by capture.
+///
+/// Like `can_break_five_by_capture` but returns the actual positions
+/// where the opponent could place a stone to break the five.
+/// Used by the engine to force a break move when the opponent has a
+/// breakable five on the board.
+pub fn find_five_break_moves(board: &Board, five_positions: &[Pos], five_color: Stone) -> Vec<Pos> {
+    let opponent = five_color.opponent();
+    let mut break_moves = Vec::new();
+
+    for &pos in five_positions {
+        for dr in -2i32..=2 {
+            for dc in -2i32..=2 {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+
+                let r = pos.row as i32 + dr;
+                let c = pos.col as i32 + dc;
+
+                if !Pos::is_valid(r, c) {
+                    continue;
+                }
+
+                let adj_pos = Pos::new(r as u8, c as u8);
+                if !board.is_empty(adj_pos) {
+                    continue;
+                }
+                if break_moves.contains(&adj_pos) {
+                    continue;
+                }
+
+                let would_capture = get_captured_positions(board, adj_pos, opponent);
+                for cap in would_capture {
+                    if five_positions.contains(&cap) {
+                        break_moves.push(adj_pos);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    break_moves
 }
 
 /// Check for a winner

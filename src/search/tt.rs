@@ -356,8 +356,8 @@ impl AtomicTT {
             }
         }
 
-        // Return best move for ordering even if score not usable
-        Some((0, best_move))
+        // Score not usable at this depth/window — callers use get_best_move() for ordering
+        None
     }
 
     /// Get best move from the table for move ordering.
@@ -732,10 +732,7 @@ mod tests {
         tt.store(hash, 3, 100, EntryType::Exact, Some(Pos::new(5, 5)));
 
         let result = tt.probe(hash, 5, -1000, 1000);
-        assert!(result.is_some());
-        let (score, best_move) = result.unwrap();
-        assert_eq!(score, 0); // Depth insufficient
-        assert_eq!(best_move, Some(Pos::new(5, 5))); // Move still returned
+        assert!(result.is_none()); // Depth insufficient → None (use get_best_move for ordering)
     }
 
     #[test]
@@ -746,13 +743,13 @@ mod tests {
         let hash_lb = 0x111;
         tt.store(hash_lb, 5, 200, EntryType::LowerBound, None);
         assert_eq!(tt.probe(hash_lb, 5, -1000, 150).unwrap().0, 200); // 200 >= 150
-        assert_eq!(tt.probe(hash_lb, 5, -1000, 300).unwrap().0, 0); // 200 < 300
+        assert!(tt.probe(hash_lb, 5, -1000, 300).is_none()); // 200 < 300 → not usable
 
         // UpperBound
         let hash_ub = 0x222;
         tt.store(hash_ub, 5, 50, EntryType::UpperBound, None);
         assert_eq!(tt.probe(hash_ub, 5, 100, 1000).unwrap().0, 50); // 50 <= 100
-        assert_eq!(tt.probe(hash_ub, 5, 30, 1000).unwrap().0, 0); // 50 > 30
+        assert!(tt.probe(hash_ub, 5, 30, 1000).is_none()); // 50 > 30 → not usable
     }
 
     #[test]
@@ -762,11 +759,7 @@ mod tests {
 
         // Different hash should return None (XOR check fails)
         let result = tt.probe(0xFFEEDDCC_44332211, 5, -1000, 1000);
-        // Either None or (0, _) since hash verification fails
-        match result {
-            None => {} // expected
-            Some((score, _)) => assert_eq!(score, 0),
-        }
+        assert!(result.is_none());
     }
 
     #[test]

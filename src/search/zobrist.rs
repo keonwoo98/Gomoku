@@ -159,6 +159,15 @@ impl ZobristTable {
         hash ^ stone_hash
     }
 
+    /// Toggle the side-to-move component of the hash.
+    ///
+    /// Used for null move pruning where the side changes without placing a stone.
+    #[inline]
+    #[must_use]
+    pub fn toggle_side(&self, hash: u64) -> u64 {
+        hash ^ self.black_to_move
+    }
+
     /// Update hash when capture count changes for a color.
     ///
     /// XORs out the old capture count hash and XORs in the new one.

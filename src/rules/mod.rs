@@ -16,5 +16,6 @@ pub use capture::{
 };
 pub use forbidden::{count_free_threes, is_double_three, is_valid_move};
 pub use win::{
-    can_break_five_by_capture, check_winner, find_five_positions, has_five_at_pos, has_five_in_row,
+    can_break_five_by_capture, check_winner, find_five_break_moves, find_five_line_at_pos,
+    find_five_positions, has_five_at_pos, has_five_in_row,
 };

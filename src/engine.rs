@@ -28,8 +28,8 @@
 
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
 use crate::rules::{
-    can_break_five_by_capture, execute_captures_fast, find_five_positions,
-    has_five_at_pos, is_valid_move, undo_captures,
+    can_break_five_by_capture, execute_captures_fast, find_five_break_moves,
+    find_five_positions, has_five_at_pos, is_valid_move, undo_captures,
 };
 use crate::search::{SearchResult, Searcher, ThreatSearcher};
 use std::fs::OpenOptions;
@@ -265,7 +265,7 @@ impl AIEngine {
     /// Default configuration:
     /// - 64 MB transposition table
     /// - Maximum depth of 20 (iterative deepening stops at time limit)
-    /// - 500ms time limit
+    /// - 1000ms time limit
     ///
     /// # Example
     ///
@@ -280,7 +280,7 @@ impl AIEngine {
             searcher: Searcher::new(64),
             threat_searcher: ThreatSearcher::with_depths(30, 12),
             max_depth: 20,
-            time_limit_ms: 500,
+            time_limit_ms: 1000,
         }
     }
 
@@ -394,6 +394,72 @@ impl AIEngine {
             );
         }
 
+        // 0.5: Check if opponent has an existing breakable five — MUST break it NOW
+        // In Ninuki-renju, a breakable five gives opponent ONE chance to capture.
+        // If they fail, the five-holder wins. This is a forced response.
+        let opponent = color.opponent();
+        if let Some(opp_five) = find_five_positions(board, opponent) {
+            if can_break_five_by_capture(board, &opp_five, opponent) {
+                let break_moves = find_five_break_moves(board, &opp_five, opponent);
+                let valid_breaks: Vec<Pos> = break_moves
+                    .into_iter()
+                    .filter(|&p| is_valid_move(board, p, color))
+                    .collect();
+                let break_strs: Vec<String> =
+                    valid_breaks.iter().map(|p| pos_to_notation(*p)).collect();
+                ai_log(&format!(
+                    "  Stage 0.5 BREAK FIVE: opponent five exists! Break moves: [{}]",
+                    break_strs.join(", ")
+                ));
+                if valid_breaks.len() == 1 {
+                    ai_log(&format!(
+                        "  >>> FORCED BREAK: {}",
+                        pos_to_notation(valid_breaks[0])
+                    ));
+                    return MoveResult::defense(
+                        valid_breaks[0],
+                        -900_000,
+                        start.elapsed().as_millis() as u64,
+                        1,
+                    );
+                } else if valid_breaks.is_empty() {
+                    ai_log("  Stage 0.5 BREAK FIVE: NO valid break moves — opponent wins!");
+                    // Fall through to alpha-beta for best losing move
+                } else {
+                    // Multiple break moves: evaluate each with quick search
+                    // to pick the best position after breaking
+                    let mut best_move = valid_breaks[0];
+                    let mut best_score = i32::MIN;
+                    let mut test_board = board.clone();
+                    for &brk in &valid_breaks {
+                        test_board.place_stone(brk, color);
+                        let cap_info = execute_captures_fast(&mut test_board, brk, color);
+                        let score = crate::eval::evaluate(&test_board, color);
+                        if score > best_score {
+                            best_score = score;
+                            best_move = brk;
+                        }
+                        undo_captures(&mut test_board, color, &cap_info);
+                        test_board.remove_stone(brk);
+                    }
+                    ai_log(&format!(
+                        "  >>> BEST BREAK: {} (eval={})",
+                        pos_to_notation(best_move),
+                        best_score
+                    ));
+                    return MoveResult::defense(
+                        best_move,
+                        -900_000,
+                        start.elapsed().as_millis() as u64,
+                        valid_breaks.len() as u64,
+                    );
+                }
+            } else {
+                // Opponent's five is unbreakable — game should have already ended
+                ai_log("  Stage 0.5 WARNING: Opponent has UNBREAKABLE five!");
+            }
+        }
+
         // 1. Check for immediate winning move (5-in-a-row or capture win)
         if let Some(win_move) = self.find_immediate_win(board, color) {
             ai_log(&format!("  Stage 1 IMMEDIATE WIN: {}", pos_to_notation(win_move)));
@@ -402,7 +468,6 @@ impl AIEngine {
         ai_log("  Stage 1 Immediate win: none");
 
         // 2. Check if opponent can win immediately - MUST block
-        let opponent = color.opponent();
         let opponent_threats = self.find_winning_moves(board, opponent);
         ai_log(&format!("  Stage 2 Opponent threats: {} positions{}", opponent_threats.len(),
             if opponent_threats.is_empty() { String::new() }
@@ -424,40 +489,57 @@ impl AIEngine {
         }
 
         // 3. Search VCF (Victory by Continuous Fours) - our forced win
-        let vcf_result = self.threat_searcher.search_vcf(board, color);
-        if vcf_result.found && !vcf_result.winning_sequence.is_empty() {
-            let seq: Vec<String> = vcf_result.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
-            ai_log(&format!("  Stage 3 OUR VCF FOUND: sequence=[{}]", seq.join(" -> ")));
-            return MoveResult::vcf_win(
-                vcf_result.winning_sequence[0],
-                start.elapsed().as_millis() as u64,
-                self.threat_searcher.nodes(),
-            );
-        }
-        ai_log(&format!("  Stage 3 Our VCF: not found ({}nodes)", self.threat_searcher.nodes()));
-
-        // 4. Check opponent VCF - if opponent has a forced win, we must block
-        let opp_vcf = self.threat_searcher.search_vcf(board, opponent);
-        if opp_vcf.found && !opp_vcf.winning_sequence.is_empty() {
-            let seq: Vec<String> = opp_vcf.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
-            ai_log(&format!("  Stage 4 OPPONENT VCF FOUND: sequence=[{}]", seq.join(" -> ")));
-            let block_pos = opp_vcf.winning_sequence[0];
-            if is_valid_move(board, block_pos, color) {
-                ai_log(&format!("  >>> DEFENSE (block VCF): {}", pos_to_notation(block_pos)));
-                return MoveResult::defense(
-                    block_pos,
-                    -800_000,
+        // Skip VCF when opponent has 4+ captures: one more capture = instant win,
+        // so VCF is unreliable (opponent can ignore fours and capture instead).
+        // At 3 captures, find_defense_moves includes strategic captures as defenses,
+        // so VCF is still usable. At 4, too dangerous — let alpha-beta handle it.
+        let opp_captures = board.captures(opponent);
+        let vcf_reliable = opp_captures < 4;
+        if vcf_reliable {
+            let vcf_result = self.threat_searcher.search_vcf(board, color);
+            if vcf_result.found && !vcf_result.winning_sequence.is_empty() {
+                let seq: Vec<String> = vcf_result.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+                ai_log(&format!("  Stage 3 OUR VCF FOUND: sequence=[{}]", seq.join(" -> ")));
+                return MoveResult::vcf_win(
+                    vcf_result.winning_sequence[0],
                     start.elapsed().as_millis() as u64,
                     self.threat_searcher.nodes(),
                 );
             }
+            ai_log(&format!("  Stage 3 Our VCF: not found ({}nodes)", self.threat_searcher.nodes()));
+        } else {
+            ai_log(&format!("  Stage 3 VCF SKIPPED: opponent has {} captures (unreliable)", opp_captures));
         }
-        ai_log(&format!("  Stage 4 Opponent VCF: not found ({}nodes)", self.threat_searcher.nodes()));
+
+        // 4. Check opponent VCF - if opponent has a forced win, we must block
+        // Skip when WE have 4+ captures (opponent's VCF is unreliable — we can capture)
+        let our_captures = board.captures(color);
+        let opp_vcf_reliable = our_captures < 4;
+        if opp_vcf_reliable {
+            let opp_vcf = self.threat_searcher.search_vcf(board, opponent);
+            if opp_vcf.found && !opp_vcf.winning_sequence.is_empty() {
+                let seq: Vec<String> = opp_vcf.winning_sequence.iter().map(|p| pos_to_notation(*p)).collect();
+                ai_log(&format!("  Stage 4 OPPONENT VCF FOUND: sequence=[{}]", seq.join(" -> ")));
+                let block_pos = opp_vcf.winning_sequence[0];
+                if is_valid_move(board, block_pos, color) {
+                    ai_log(&format!("  >>> DEFENSE (block VCF): {}", pos_to_notation(block_pos)));
+                    return MoveResult::defense(
+                        block_pos,
+                        -800_000,
+                        start.elapsed().as_millis() as u64,
+                        self.threat_searcher.nodes(),
+                    );
+                }
+            }
+            ai_log(&format!("  Stage 4 Opponent VCF: not found ({}nodes)", self.threat_searcher.nodes()));
+        } else {
+            ai_log(&format!("  Stage 4 Opponent VCF SKIPPED: we have {} captures (can counter)", our_captures));
+        }
 
         // NOTE: VCT removed from authoritative pipeline.
         // Open-three threats are NOT forcing — opponent can ignore and counter-attack.
         // Alpha-beta with threat extensions handles tactical sequences correctly.
-        // VCF remains: fours ARE forcing and VCF is sound.
+        // VCF remains sound when capture counts are low.
 
         // 5. Alpha-Beta search handles ALL strategy
         let result = self.searcher.search_timed(board, color, self.max_depth, self.time_limit_ms);
@@ -469,6 +551,14 @@ impl AIEngine {
             result.best_move.map(|p| pos_to_notation(p)).unwrap_or("none".to_string()),
             result.score, result.depth, result.nodes, elapsed,
             MoveResult::compute_nps(result.nodes, elapsed), tt_usage
+        ));
+        ai_log(&format!(
+            "    Stats: beta_cutoffs={} first_move_rate={:.1}% tt_probes={} tt_score_rate={:.1}% tt_move_hits={}",
+            result.stats.beta_cutoffs,
+            result.stats.first_move_rate(),
+            result.stats.tt_probes,
+            result.stats.tt_score_rate(),
+            result.stats.tt_move_hits
         ));
 
         MoveResult::from_alphabeta(result, elapsed, tt_usage)
@@ -615,7 +705,7 @@ impl AIEngine {
     /// adjacent to the opponent's stone to contest territory and start
     /// building connected patterns. Diagonal placement is strongest because
     /// it creates potential in two diagonal directions simultaneously.
-    fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
+    pub(crate) fn get_opening_move(&self, board: &Board, color: Stone) -> Option<Pos> {
         // Empty board → center is universally optimal
         if board.stone_count() == 0 {
             return Some(Pos::new(9, 9));
@@ -645,6 +735,68 @@ impl AIEngine {
                         }
                     }
                     return best;
+                }
+            }
+        }
+        // Third move: our 2nd stone as second player (opponent has 2 stones)
+        // Only use book for same-row or same-column opponent pairs (well-tested).
+        // Diagonal pairs and other patterns fall through to alpha-beta search.
+        if board.stone_count() == 3 {
+            let opponent = color.opponent();
+            if let (Some(my_bb), Some(opp_bb)) = (board.stones(color), board.stones(opponent)) {
+                let mut my_iter = my_bb.iter_ones();
+                let mut opp_iter = opp_bb.iter_ones();
+                if let (Some(my_pos), Some(opp1), Some(opp2)) =
+                    (my_iter.next(), opp_iter.next(), opp_iter.next())
+                {
+                    let same_row = opp1.row == opp2.row;
+                    let same_col = opp1.col == opp2.col;
+                    if my_iter.next().is_none()
+                        && opp_iter.next().is_none()
+                        && (same_row || same_col)
+                    {
+                        let center = (BOARD_SIZE / 2) as i32;
+                        let diags: [(i32, i32); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+                        let opp_stones = [opp1, opp2];
+
+                        let mut best: Option<Pos> = None;
+                        let mut best_score = i32::MIN;
+
+                        for &opp_pos in &opp_stones {
+                            for &(dr, dc) in &diags {
+                                let nr = i32::from(opp_pos.row) + dr;
+                                let nc = i32::from(opp_pos.col) + dc;
+                                if !Pos::is_valid(nr, nc) { continue; }
+                                #[allow(clippy::cast_sign_loss)]
+                                let p = Pos::new(nr as u8, nc as u8);
+                                if board.get(p) != Stone::Empty { continue; }
+
+                                let center_dist =
+                                    (nr - center).abs() + (nc - center).abs();
+                                // Bonus: on same row/column as our stone (connectivity)
+                                let connectivity = if nr == i32::from(my_pos.row)
+                                    || nc == i32::from(my_pos.col)
+                                { 10 } else { 0 };
+                                // Bonus: diagonal-adjacent to BOTH opponent stones
+                                let multi_disrupt = opp_stones
+                                    .iter()
+                                    .filter(|op| {
+                                        (i32::from(op.row) - nr).abs() == 1
+                                            && (i32::from(op.col) - nc).abs() == 1
+                                    })
+                                    .count() as i32
+                                    * 5;
+
+                                let score = 100 - center_dist * 15
+                                    + connectivity + multi_disrupt;
+                                if score > best_score {
+                                    best_score = score;
+                                    best = Some(p);
+                                }
+                            }
+                        }
+                        return best;
+                    }
                 }
             }
         }
@@ -715,6 +867,44 @@ mod tests {
 
         // Should play center
         assert_eq!(result, Some(Pos::new(9, 9)));
+    }
+
+    #[test]
+    fn test_opening_book_disrupts_diagonal() {
+        // Reproduce the losing game pattern: K10(B), J9(W), K8(B)
+        // AI (White) should NOT play K9 (blocks column but ignores diagonal)
+        // Should play L9 or similar to disrupt K8's diagonal expansion
+        let mut board = Board::new();
+        board.place_stone(Pos::new(9, 9), Stone::Black);  // K10
+        board.place_stone(Pos::new(8, 8), Stone::White);   // J9
+        board.place_stone(Pos::new(7, 9), Stone::Black);   // K8
+
+        let engine = AIEngine::new();
+        let result = engine.get_opening_move(&board, Stone::White);
+
+        // L9 (8,10) disrupts K8's diagonal toward M10 and connects to J9 via row
+        assert_eq!(result, Some(Pos::new(8, 10)), "Expected L9 to disrupt diagonal");
+
+        // Also verify through the full pipeline
+        let mut engine2 = AIEngine::new();
+        let move_result = engine2.get_move_with_stats(&board, Stone::White);
+        assert_eq!(move_result.best_move, Some(Pos::new(8, 10)));
+    }
+
+    #[test]
+    fn test_opening_book_skips_diagonal_pair() {
+        // K10(B) + L9(B) = diagonal pair → book should NOT apply
+        // Alpha-beta should handle this instead of a rigid book response
+        let mut board = Board::new();
+        board.place_stone(Pos::new(9, 9), Stone::Black);   // K10
+        board.place_stone(Pos::new(8, 8), Stone::White);    // J9
+        board.place_stone(Pos::new(8, 10), Stone::Black);   // L9
+
+        let engine = AIEngine::new();
+        let result = engine.get_opening_move(&board, Stone::White);
+
+        // Diagonal pair → no book move, fall through to search
+        assert_eq!(result, None, "Diagonal pair should not trigger opening book");
     }
 
     #[test]
@@ -1062,6 +1252,88 @@ mod tests {
     /// Reproduce the exact position from game log where depth collapse occurred.
     /// Game 1, Move #8: K10(B), K8(W), J11(B), M8(W), L10(B), O6(W), J10(B).
     /// Previously collapsed to depth 4 with 2.3M nodes. Target: depth 8+.
+    /// Test that AI detects and breaks opponent's existing breakable five.
+    ///
+    /// Reproduces the exact game log scenario where Black has a diagonal five
+    /// H9-J10-K11-L12-M13 that is breakable (White can place at H8 to capture
+    /// H9+H10). The AI MUST play the break move, not something else.
+    #[test]
+    fn test_engine_breaks_existing_five() {
+        let mut board = Board::new();
+        // Reconstruct the exact board state from game log at move #26
+        // Notation: col letters skip I (A=0..H=7, J=8, K=9, L=10, M=11, N=12)
+        // Row numbers: 1=row0, n=row(n-1)
+
+        // Black stones (13 total):
+        board.place_stone(Pos::new(7, 9), Stone::Black);   // K8
+        board.place_stone(Pos::new(6, 8), Stone::Black);   // J7
+        board.place_stone(Pos::new(8, 10), Stone::Black);  // L9
+        board.place_stone(Pos::new(9, 9), Stone::Black);   // K10
+        board.place_stone(Pos::new(10, 8), Stone::Black);  // J11
+        board.place_stone(Pos::new(8, 7), Stone::Black);   // H9  (part of five)
+        board.place_stone(Pos::new(11, 7), Stone::Black);  // H12
+        board.place_stone(Pos::new(9, 7), Stone::Black);   // H10
+        board.place_stone(Pos::new(9, 8), Stone::Black);   // J10 (part of five)
+        board.place_stone(Pos::new(9, 6), Stone::Black);   // G10
+        board.place_stone(Pos::new(10, 9), Stone::Black);  // K11 (part of five)
+        board.place_stone(Pos::new(11, 10), Stone::Black); // L12 (part of five)
+        board.place_stone(Pos::new(12, 11), Stone::Black); // M13 (part of five)
+        // Black captures: 1 pair
+        board.add_captures(Stone::Black, 1);
+
+        // White stones (10 total):
+        board.place_stone(Pos::new(5, 7), Stone::White);   // H6
+        board.place_stone(Pos::new(10, 12), Stone::White);  // N11
+        board.place_stone(Pos::new(7, 11), Stone::White);  // M8
+        board.place_stone(Pos::new(8, 9), Stone::White);   // K9 (replayed)
+        board.place_stone(Pos::new(12, 6), Stone::White);  // G13
+        board.place_stone(Pos::new(10, 7), Stone::White);  // H11
+        board.place_stone(Pos::new(9, 10), Stone::White);  // L10
+        board.place_stone(Pos::new(9, 5), Stone::White);   // F10
+        board.place_stone(Pos::new(7, 8), Stone::White);   // J8
+        board.place_stone(Pos::new(7, 6), Stone::White);   // G8
+
+        // Verify Black has a five
+        let five = find_five_positions(&board, Stone::Black);
+        assert!(five.is_some(), "Black should have a five-in-a-row");
+        let five_positions = five.unwrap();
+        assert!(five_positions.len() >= 5);
+
+        // Verify the five is breakable
+        assert!(
+            can_break_five_by_capture(&board, &five_positions, Stone::Black),
+            "Black's five should be breakable by White"
+        );
+
+        // AI (White) MUST break the five
+        let mut engine = AIEngine::new();
+        let result = engine.get_move_with_stats(&board, Stone::White);
+
+        assert!(result.best_move.is_some(), "AI should find a move");
+        let ai_move = result.best_move.unwrap();
+
+        // Verify the AI's move actually breaks the five:
+        // Place the stone and check if a capture removes part of the five
+        let mut test = board.clone();
+        test.place_stone(ai_move, Stone::White);
+        let caps = crate::rules::get_captured_positions(&test, ai_move, Stone::White);
+        let breaks_five = caps.iter().any(|cap| five_positions.contains(cap));
+        assert!(
+            breaks_five,
+            "AI move {} must break Black's five, but it doesn't! Captured: {:?}",
+            pos_to_notation(ai_move),
+            caps.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>()
+        );
+
+        // Should be detected as a defense move
+        assert_eq!(
+            result.search_type,
+            SearchType::Defense,
+            "Should be classified as defense, got {:?}",
+            result.search_type
+        );
+    }
+
     #[test]
     fn test_depth_collapse_regression() {
         let mut board = Board::new();

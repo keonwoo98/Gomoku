@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
 use crate::eval::{evaluate, PatternScore};
 use crate::rules::{
-    count_captures_fast, execute_captures_fast, has_five_at_pos, is_valid_move, undo_captures,
+    can_break_five_by_capture, count_captures_fast, execute_captures_fast, find_five_line_at_pos,
+    has_five_at_pos, has_five_in_row, is_valid_move, undo_captures,
 };
 
 use super::{AtomicTT, EntryType, TTStats, ZobristTable};
@@ -52,6 +53,50 @@ const MAX_ROOT_MOVES: usize = 30;
 #[allow(dead_code)]
 const MAX_INTERNAL_MOVES: usize = 15;
 
+/// Search statistics for diagnostics and tuning.
+#[derive(Debug, Clone, Default)]
+pub struct SearchStats {
+    /// Total beta cutoffs (fail-high)
+    pub beta_cutoffs: u64,
+    /// Beta cutoffs on the first move tried (measures move ordering quality)
+    pub first_move_cutoffs: u64,
+    /// Total TT probes
+    pub tt_probes: u64,
+    /// TT probes that returned a usable score (exact/bound hit)
+    pub tt_score_hits: u64,
+    /// TT probes that provided a best move for ordering
+    pub tt_move_hits: u64,
+}
+
+impl SearchStats {
+    /// First-move cutoff rate (target: ~90% for good move ordering)
+    pub fn first_move_rate(&self) -> f64 {
+        if self.beta_cutoffs == 0 {
+            0.0
+        } else {
+            self.first_move_cutoffs as f64 / self.beta_cutoffs as f64 * 100.0
+        }
+    }
+
+    /// TT score hit rate
+    pub fn tt_score_rate(&self) -> f64 {
+        if self.tt_probes == 0 {
+            0.0
+        } else {
+            self.tt_score_hits as f64 / self.tt_probes as f64 * 100.0
+        }
+    }
+
+    /// Merge another stats into this one (for combining worker stats)
+    fn merge(&mut self, other: &SearchStats) {
+        self.beta_cutoffs += other.beta_cutoffs;
+        self.first_move_cutoffs += other.first_move_cutoffs;
+        self.tt_probes += other.tt_probes;
+        self.tt_score_hits += other.tt_score_hits;
+        self.tt_move_hits += other.tt_move_hits;
+    }
+}
+
 /// Search result containing the best move found and associated statistics.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -63,6 +108,8 @@ pub struct SearchResult {
     pub depth: i8,
     /// Total nodes searched
     pub nodes: u64,
+    /// Search diagnostics
+    pub stats: SearchStats,
 }
 
 // =============================================================================
@@ -91,6 +138,7 @@ struct WorkerSearcher {
     history: [[[i32; BOARD_SIZE]; BOARD_SIZE]; 2],
     start_time: Option<Instant>,
     time_limit: Option<Duration>,
+    stats: SearchStats,
 }
 
 impl WorkerSearcher {
@@ -108,6 +156,7 @@ impl WorkerSearcher {
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
             start_time: Some(start_time),
             time_limit: Some(time_limit),
+            stats: SearchStats::default(),
         }
     }
 
@@ -146,6 +195,7 @@ impl WorkerSearcher {
             score: 0,
             depth: 0,
             nodes: 0,
+            stats: SearchStats::default(),
         };
 
         let mut work_board = board.clone();
@@ -153,8 +203,14 @@ impl WorkerSearcher {
         let soft_limit = self.time_limit.unwrap_or(Duration::from_millis(500));
         let mut prev_depth_time = Duration::ZERO;
 
-        let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 10 };
+        let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 12 };
         const ASP_WINDOW: i32 = 100;
+
+        // Win/loss confirmation: require TWO consecutive depths to agree on a
+        // terminal score before early exit. Prevents illusory wins where depth d
+        // sees a forced win but depth d+1 finds the refutation.
+        let mut prev_was_winning = false;
+        let mut prev_was_losing = false;
 
         // Workers with offset skip early depths (they're cheap anyway and TT handles it)
         let first_depth = (1 + start_depth_offset).max(1);
@@ -199,13 +255,21 @@ impl WorkerSearcher {
             let depth_time = depth_start.elapsed();
             let total_elapsed = search_start.elapsed();
 
-            // Early exit: winning or confirmed loss
-            if best_result.score >= PatternScore::FIVE - 100 && depth >= 6 {
+            // Early exit: winning or confirmed loss — only after reaching min_depth
+            // AND confirmed over two consecutive depths. This prevents illusory wins
+            // where depth d sees FIVE but depth d+1 finds the refutation.
+            let is_winning = best_result.score >= PatternScore::FIVE - 100;
+            let is_losing = best_result.score <= -(PatternScore::FIVE - 100);
+
+            if is_winning && prev_was_winning && depth >= min_depth {
                 break;
             }
-            if best_result.score <= -(PatternScore::FIVE - 100) && depth >= 6 {
+            if is_losing && prev_was_losing && depth >= min_depth {
                 break;
             }
+
+            prev_was_winning = is_winning;
+            prev_was_losing = is_losing;
 
             if depth < min_depth {
                 if depth >= 8 && total_elapsed > soft_limit {
@@ -232,6 +296,7 @@ impl WorkerSearcher {
         }
 
         best_result.nodes = self.nodes;
+        best_result.stats = self.stats.clone();
         best_result
     }
 
@@ -326,7 +391,20 @@ impl WorkerSearcher {
                 best_move = Some(*mov);
             }
 
+            if score >= beta {
+                break;
+            }
             alpha = alpha.max(score);
+        }
+
+        // Store root result in TT for reuse by other workers (Lazy SMP) and next iteration
+        if !self.is_stopped() {
+            let entry_type = if best_score >= beta {
+                EntryType::LowerBound
+            } else {
+                EntryType::Exact // Root always starts with full window
+            };
+            self.shared.tt.store(hash, depth, best_score, entry_type, best_move);
         }
 
         SearchResult {
@@ -334,6 +412,7 @@ impl WorkerSearcher {
             score: best_score,
             depth,
             nodes: self.nodes,
+            stats: self.stats.clone(),
         }
     }
 
@@ -500,15 +579,22 @@ impl WorkerSearcher {
             return -PatternScore::FIVE;
         }
         if has_five_at_pos(board, last_move, last_player) {
+            // Check breakable five (endgame capture rule)
+            if let Some(five_line) = find_five_line_at_pos(board, last_move, last_player) {
+                if can_break_five_by_capture(board, &five_line, last_player) {
+                    // Breakable five: forcing but NOT terminal. Opponent can capture
+                    // a pair from the line to destroy it. Equivalent to a closed four
+                    // (one specific defense exists).
+                    return -(PatternScore::CLOSED_FOUR);
+                }
+            }
             return -PatternScore::FIVE;
         }
 
         // TT probe: reuse results from previous searches or other QS nodes.
         // Use depth 0 — any entry (depth >= 0) can satisfy QS queries.
         if let Some((score, _)) = self.shared.tt.probe(hash, 0, alpha, beta) {
-            if score != 0 {
-                return score;
-            }
+            return score;
         }
 
         // Stand-pat: static evaluation as lower bound
@@ -688,8 +774,11 @@ impl WorkerSearcher {
             }
         }
 
-        // TT store: cache QS result at depth 0
-        if !self.is_stopped() && best_move.is_some() {
+        // TT store: cache QS result at depth 0.
+        // Store even when no forcing move improved alpha (stand-pat dominant):
+        // best_score == stand_pat with UpperBound tells future probes "this position
+        // scores at most stand_pat", avoiding redundant QS re-evaluation.
+        if !self.is_stopped() {
             let entry_type = if best_score >= beta {
                 EntryType::LowerBound
             } else if best_score > original_alpha {
@@ -734,7 +823,26 @@ impl WorkerSearcher {
             return -PatternScore::FIVE;
         }
         if has_five_at_pos(board, last_move, last_player) {
+            // Check if the five is breakable by capture (endgame rule).
+            // Only called when five exists (rare), so the extra cost is negligible.
+            if let Some(five_line) = find_five_line_at_pos(board, last_move, last_player) {
+                if can_break_five_by_capture(board, &five_line, last_player) {
+                    // Breakable five: forcing but NOT terminal.
+                    // Opponent can capture a pair to destroy it. Equivalent to
+                    // a closed four — one specific defense exists.
+                    return -(PatternScore::CLOSED_FOUR);
+                }
+            }
             return -PatternScore::FIVE;
+        }
+
+        // Check if the side to move already has an existing five on the board.
+        // This handles the case where a breakable five was created earlier in the
+        // search tree, but the opponent (last_player) played a non-breaking move.
+        // Per game rules, the five-holder wins because the opponent had their
+        // chance to break it and didn't take it.
+        if board.stone_count() >= 10 && has_five_in_row(board, color) {
+            return PatternScore::FIVE;
         }
 
         if depth <= 0 {
@@ -742,10 +850,10 @@ impl WorkerSearcher {
         }
 
         // TT probe
+        self.stats.tt_probes += 1;
         if let Some((score, _best_move)) = self.shared.tt.probe(hash, depth, alpha, beta) {
-            if score != 0 {
-                return score;
-            }
+            self.stats.tt_score_hits += 1;
+            return score;
         }
 
         // Pre-compute static eval for shallow pruning decisions (depth 1-2).
@@ -789,6 +897,7 @@ impl WorkerSearcher {
             let r = if depth >= 5 { 3i8 } else { 2i8 };
             let null_depth = (depth - 1 - r).max(0);
 
+            let null_hash = self.shared.zobrist.toggle_side(hash);
             let null_score = -self.alpha_beta(
                 board,
                 color.opponent(),
@@ -796,7 +905,7 @@ impl WorkerSearcher {
                 -beta,
                 -(beta - 1),
                 last_move,
-                hash,
+                null_hash,
                 false,
             );
 
@@ -814,6 +923,9 @@ impl WorkerSearcher {
         }
 
         let mut tt_move = self.shared.tt.get_best_move(hash);
+        if tt_move.is_some() {
+            self.stats.tt_move_hits += 1;
+        }
 
         // Internal Iterative Deepening (IID): when no TT entry exists at depth >= 6,
         // run a shallow search to find a good first move for ordering.
@@ -986,6 +1098,10 @@ impl WorkerSearcher {
             }
 
             if score >= beta {
+                self.stats.beta_cutoffs += 1;
+                if i == 0 {
+                    self.stats.first_move_cutoffs += 1;
+                }
                 #[allow(clippy::cast_sign_loss)]
                 let ply = (self.max_depth - depth).max(0) as usize;
                 if ply < 64 {
@@ -1088,6 +1204,8 @@ impl WorkerSearcher {
         let mut my_open_three_count = 0i32;
         let mut opp_open_three_count = 0i32;
         let mut my_two_score = 0i32;
+        let mut my_developing_dirs = 0i32;
+        let mut opp_developing_dirs = 0i32;
 
         for (dr, dc) in dirs {
             let (mc, mo, mc_gap, mc_consec) = Self::count_line_with_gap(board, mov, dr, dc, color);
@@ -1137,6 +1255,15 @@ impl WorkerSearcher {
             }
             if oc == 2 && oo == 2 {
                 my_two_score += 200;
+            }
+
+            // Multi-directional development detection
+            // "Developing" = 2+ stones in line with at least 1 open end (room to grow)
+            if mc >= 2 && mo >= 1 {
+                my_developing_dirs += 1;
+            }
+            if oc >= 2 && oo >= 1 {
+                opp_developing_dirs += 1;
             }
         }
 
@@ -1272,7 +1399,22 @@ impl WorkerSearcher {
             }
         }
 
-        hist + center_bonus + my_two_score + proximity - capture_penalty
+        // Multi-directional development bonus:
+        // 1 direction = normal (already counted in my_two_score)
+        // 2+ directions = strategic threat that must be searched deeply
+        let development_bonus = match my_developing_dirs {
+            0..=1 => 0,
+            2 => 50_000,
+            _ => 100_000,
+        };
+        let disruption_bonus = match opp_developing_dirs {
+            0..=1 => 0,
+            2 => 30_000,
+            _ => 80_000,
+        };
+
+        hist + center_bonus + my_two_score + proximity
+            + development_bonus + disruption_bonus - capture_penalty
     }
 
     /// Generate candidate moves ordered by priority.
@@ -1461,9 +1603,8 @@ impl WorkerSearcher {
                     let after1 = board.get(Pos::new(rp1 as u8, cp1 as u8));
                     let after2 = board.get(Pos::new(rp2 as u8, cp2 as u8));
 
-                    if before == opponent && after1 == color && after2 == opponent {
-                        vuln_count += 1;
-                    }
+                    // opp-MOV-ally-opp: both sides occupied — opponent can't place,
+                    // so this pair is SAFE. Removed (was over-penalizing).
                     if before == Stone::Empty && after1 == color && after2 == opponent {
                         vuln_count += 1;
                     }
@@ -1493,9 +1634,8 @@ impl WorkerSearcher {
                     let before1 = board.get(Pos::new(rm1 as u8, cm1 as u8));
                     let after = board.get(Pos::new(rp1 as u8, cp1 as u8));
 
-                    if before2 == opponent && before1 == color && after == opponent {
-                        vuln_count += 1;
-                    }
+                    // opp-ally-MOV-opp: both sides occupied — opponent can't place,
+                    // so this pair is SAFE. Removed (was over-penalizing).
                     if before2 == Stone::Empty && before1 == color && after == opponent {
                         vuln_count += 1;
                     }
@@ -1509,7 +1649,7 @@ impl WorkerSearcher {
 
         if vuln_count > 0 {
             let opp_caps = i32::from(board.captures(color.opponent()));
-            let base_penalty = 8_000;
+            let base_penalty = 20_000; // was 8K — must compete with pattern scores
             let urgency = if opp_caps >= 3 {
                 4
             } else if opp_caps >= 2 {
@@ -1597,6 +1737,7 @@ impl Searcher {
             history: self.history,
             start_time: None,
             time_limit: None,
+            stats: SearchStats::default(),
         };
 
         let mut best_result = SearchResult {
@@ -1604,24 +1745,34 @@ impl Searcher {
             score: 0,
             depth: 0,
             nodes: 0,
+            stats: SearchStats::default(),
         };
 
         let mut work_board = board.clone();
+        let mut prev_was_winning = false;
+        let mut prev_was_losing = false;
 
         for depth in 1..=max_depth {
             let result = worker.search_root(&mut work_board, color, depth, -INF, INF);
             best_result = result;
             best_result.depth = depth;
 
-            if best_result.score >= PatternScore::FIVE - 100 && depth >= 10 {
+            let is_winning = best_result.score >= PatternScore::FIVE - 100;
+            let is_losing = best_result.score <= -(PatternScore::FIVE - 100);
+
+            if is_winning && prev_was_winning && depth >= 12 {
                 break;
             }
-            if best_result.score <= -(PatternScore::FIVE - 100) && depth >= 8 {
+            if is_losing && prev_was_losing && depth >= 10 {
                 break;
             }
+
+            prev_was_winning = is_winning;
+            prev_was_losing = is_losing;
         }
 
         best_result.nodes = worker.nodes;
+        best_result.stats = worker.stats.clone();
         self.history = worker.history;
         best_result
     }
@@ -1668,6 +1819,7 @@ impl Searcher {
             history: self.history,
             start_time: Some(start),
             time_limit: Some(time_limit),
+            stats: SearchStats::default(),
         };
         let main_result = main_worker.search_iterative(board, color, max_depth, 0);
 
@@ -1677,10 +1829,12 @@ impl Searcher {
         // Collect results — pick best (deepest search, then highest score)
         let mut best = main_result;
         let mut total_nodes = best.nodes;
+        let mut merged_stats = best.stats.clone();
 
         for handle in handles {
             if let Ok(result) = handle.join() {
                 total_nodes += result.nodes;
+                merged_stats.merge(&result.stats);
                 if result.depth > best.depth
                     || (result.depth == best.depth && result.score > best.score)
                 {
@@ -1690,6 +1844,7 @@ impl Searcher {
         }
 
         best.nodes = total_nodes;
+        best.stats = merged_stats;
         self.history = main_worker.history;
         best
     }
@@ -1783,6 +1938,7 @@ mod tests {
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
             start_time: None,
             time_limit: None,
+            stats: SearchStats::default(),
         };
         let mut board = Board::new();
         board.place_stone(Pos::new(9, 9), Stone::Black);
@@ -1887,6 +2043,7 @@ mod tests {
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
             start_time: None,
             time_limit: None,
+            stats: SearchStats::default(),
         };
         let mut board = Board::new();
 
@@ -1990,5 +2147,59 @@ mod tests {
             "Should find the five-completion move");
         assert!(result.score >= PatternScore::FIVE - 100,
             "Should be a winning score, got {}", result.score);
+    }
+
+    /// Test that the search correctly detects an existing five on the board
+    /// that the opponent failed to break. In the game rules, if a breakable
+    /// five persists because the defender played a non-breaking move, the
+    /// five-holder wins. The search must detect this at intermediate nodes,
+    /// not just at root level.
+    #[test]
+    fn test_search_detects_existing_five() {
+        use crate::rules::find_five_positions;
+
+        let mut searcher = Searcher::new(16);
+        let mut board = Board::new();
+
+        // Set up a position where Black has a five-in-a-row (diagonal)
+        // Black five: (7,7), (8,8), (9,9), (10,10), (11,11)
+        board.place_stone(Pos::new(7, 7), Stone::Black);
+        board.place_stone(Pos::new(8, 8), Stone::Black);
+        board.place_stone(Pos::new(9, 9), Stone::Black);
+        board.place_stone(Pos::new(10, 10), Stone::Black);
+        board.place_stone(Pos::new(11, 11), Stone::Black);
+
+        // White stones forming a capture bracket:
+        // White at (6,6) and (9,7) → can capture (7,7)+(8,8) if White plays at specific spot
+        // Actually, let's set up breakable five: need White to be able to capture a pair
+        // from the five line. Pattern: White(6,6) - Black(7,7) - Black(8,8) - White(9,9)?
+        // No, (9,9) is Black. Let me use a different capture line.
+        // We need: White at some position, then 2 consecutive five-stones, then an empty spot
+        // for White to play and capture.
+        // Capture pattern: White_place - Black - Black - White_existing
+        // Let's put White at (12,12) — then (11,11)-(10,10) are Black, need White at (9,9)?
+        // No (9,9) is Black. Different direction needed.
+
+        // Simpler: make the five NOT breakable for this test.
+        // Put some White stones far away.
+        board.place_stone(Pos::new(0, 0), Stone::White);
+        board.place_stone(Pos::new(0, 1), Stone::White);
+        board.place_stone(Pos::new(0, 2), Stone::White);
+        board.place_stone(Pos::new(1, 0), Stone::White);
+        board.place_stone(Pos::new(1, 1), Stone::White);
+
+        // Verify Black has five
+        let five = find_five_positions(&board, Stone::Black);
+        assert!(five.is_some(), "Black should have five-in-a-row");
+
+        // White to move — Black already has five on the board.
+        // The search should detect Black's existing five and return a very negative score
+        // (losing for White since Black has already won).
+        let result = searcher.search(&board, Stone::White, 4);
+
+        // White should see this as a losing position
+        assert!(result.score <= -(PatternScore::FIVE - 100),
+            "White should detect Black's existing five as a loss, got score {}",
+            result.score);
     }
 }

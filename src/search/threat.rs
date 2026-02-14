@@ -129,10 +129,17 @@ impl ThreatSearcher {
 
             // Check for immediate win by five-in-a-row
             let mut found_win = false;
+            let mut is_breakable_five = false;
             if has_five_at_pos(board, threat_move, color) {
                 if let Some(five) = find_five_positions(board, color) {
                     if !can_break_five_by_capture(board, &five, color) {
                         found_win = true;
+                    } else {
+                        // Breakable five: opponent can capture to destroy it.
+                        // find_defense_moves only handles fours (count==4), not fives,
+                        // so it would return empty defenses and falsely declare a win.
+                        // Mark as breakable and skip find_defense_moves below.
+                        is_breakable_five = true;
                     }
                 }
             }
@@ -147,6 +154,34 @@ impl ThreatSearcher {
                 undo_captures(board, color, &cap_info);
                 board.remove_stone(threat_move);
                 return true;
+            }
+
+            // Breakable five: skip this move — it's not a guaranteed VCF win
+            if is_breakable_five {
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
+                sequence.pop();
+                continue;
+            }
+
+            // Check if captures freed positions that let defender win immediately.
+            // After capturing a pair, the freed positions can be replayed by
+            // the defender to complete a five in a different direction.
+            if cap_info.count > 0 {
+                let mut defender_wins = false;
+                let defender = color.opponent();
+                for i in 0..cap_info.count as usize {
+                    if self.creates_five_or_more(board, cap_info.positions[i], defender) {
+                        defender_wins = true;
+                        break;
+                    }
+                }
+                if defender_wins {
+                    undo_captures(board, color, &cap_info);
+                    board.remove_stone(threat_move);
+                    sequence.pop();
+                    continue;
+                }
             }
 
             // Find opponent's forced defenses against this four
@@ -312,11 +347,13 @@ impl ThreatSearcher {
     ///
     /// Defense includes:
     /// 1. Blocking moves at the ends of the four
-    /// 2. Capture moves that break the four (only captures that remove stones from the four pattern)
+    /// 2. Capture moves that break the four (remove stones from the four pattern)
+    /// 3. ANY capture move when defender has 3+ captures (near capture-win)
     fn find_defense_moves(&self, board: &Board, threat_move: Pos, attacker: Stone) -> Vec<Pos> {
         let defender = attacker.opponent();
         let mut defenses = Vec::new();
         let mut four_positions: Vec<Pos> = Vec::new();
+        let defender_captures = board.captures(defender);
 
         // Find blocking moves at the extension points of the four
         // Also collect the positions of the four-pattern stones
@@ -381,8 +418,11 @@ impl ThreatSearcher {
         four_positions.sort();
         four_positions.dedup();
 
-        // Find capture moves that actually break the four
-        // Only include captures that remove stones that are part of the four pattern
+        // Find capture moves as defenses
+        // In Ninuki-renju, the defender can ignore the four and capture instead:
+        // - Captures that break the four (remove stones from the four pattern)
+        // - ANY capture when defender has 3+ captures (closing in on capture-win)
+        let capture_is_strategic = defender_captures >= 3;
         for r in 0..BOARD_SIZE {
             for c in 0..BOARD_SIZE {
                 let pos = Pos::new(r as u8, c as u8);
@@ -392,8 +432,12 @@ impl ThreatSearcher {
 
                 let captured = get_captured_positions(board, pos, defender);
                 if !captured.is_empty() {
-                    // Only add as defense if any captured stone is part of the four pattern
-                    if captured.iter().any(|cap| four_positions.contains(cap)) {
+                    // Add as defense if:
+                    // 1. Capture breaks the four pattern, OR
+                    // 2. Defender has 3+ captures (any capture is strategically significant)
+                    if capture_is_strategic
+                        || captured.iter().any(|cap| four_positions.contains(cap))
+                    {
                         defenses.push(pos);
                     }
                 }
@@ -461,10 +505,13 @@ impl ThreatSearcher {
 
             // Check for immediate win
             let mut found_win = false;
+            let mut is_breakable_five = false;
             if has_five_at_pos(board, threat_move, color) {
                 if let Some(five) = find_five_positions(board, color) {
                     if !can_break_five_by_capture(board, &five, color) {
                         found_win = true;
+                    } else {
+                        is_breakable_five = true;
                     }
                 }
             }
@@ -477,6 +524,32 @@ impl ThreatSearcher {
                 undo_captures(board, color, &cap_info);
                 board.remove_stone(threat_move);
                 return true;
+            }
+
+            // Breakable five: skip — not a guaranteed win
+            if is_breakable_five {
+                undo_captures(board, color, &cap_info);
+                board.remove_stone(threat_move);
+                sequence.pop();
+                continue;
+            }
+
+            // Check if captures freed positions that let defender win immediately
+            if cap_info.count > 0 {
+                let mut defender_wins = false;
+                let defender = color.opponent();
+                for i in 0..cap_info.count as usize {
+                    if self.creates_five_or_more(board, cap_info.positions[i], defender) {
+                        defender_wins = true;
+                        break;
+                    }
+                }
+                if defender_wins {
+                    undo_captures(board, color, &cap_info);
+                    board.remove_stone(threat_move);
+                    sequence.pop();
+                    continue;
+                }
             }
 
             // Try VCF from this position (faster path to victory)
@@ -1107,5 +1180,190 @@ mod tests {
         // (9, 9) would be a double-three, so it should not appear in threats
         // (because is_valid_move returns false for double-three)
         assert!(!threats.contains(&Pos::new(9, 9)));
+    }
+
+    #[test]
+    fn test_vcf_rejects_capture_enabling_defender_five() {
+        // Reproduce Game 4 bug: VCF captures a pair, freeing a position
+        // where the defender can immediately complete five-in-a-row.
+        //
+        // Setup:
+        //   White has four at row 8: H9-J9-K9 (needs G9 or L9 for four)
+        //   Wait — we need White to have a VCF threat (four-creating move).
+        //
+        // Simplified scenario:
+        //   White creates four by playing at pos X, which also captures
+        //   Black's pair at Y,Z. Black can replay at Y to make five.
+        let mut board = Board::new();
+
+        // Black has 4 stones in column 8 (vertical): rows 5,6,8,9
+        // (gap at row 7 — Black stone at row 7 will be captured)
+        board.place_stone(Pos::new(5, 8), Stone::Black);  // F9
+        board.place_stone(Pos::new(6, 8), Stone::Black);  // G9
+        board.place_stone(Pos::new(7, 8), Stone::Black);  // H9 — will be captured
+        board.place_stone(Pos::new(8, 8), Stone::Black);  // I9
+        board.place_stone(Pos::new(9, 8), Stone::Black);  // J9
+
+        // White has 3 stones in row 7 (horizontal): cols 5,6,9
+        // Playing col 8 (H9 area) would create a four AND capture Black's pair
+        board.place_stone(Pos::new(7, 5), Stone::White);  // H6
+        board.place_stone(Pos::new(7, 6), Stone::White);  // H7
+        board.place_stone(Pos::new(7, 9), Stone::White);  // H10
+
+        // Capture setup: White at (7,10), Black pair at (7,8)+(7,9)
+        // Actually let's set up: W(7,6)-B(7,7)-B(7,8)-W needs to capture
+        // Simpler: make a direct capture pattern
+        // Pattern for capture at (7,10): W(7,10) is already there
+        // We need: W(7,6)-B(7,7)-B(7,8)-W(7,9) → placing (7,6) captures (7,7)+(7,8)
+        // But (7,6) already has White. Let's redesign.
+
+        // Clean setup:
+        let mut board = Board::new();
+
+        // Black vertical line through col 5: rows 4,5,6,7,8 (5 stones)
+        // but row 7 will lose its stone via capture
+        board.place_stone(Pos::new(4, 5), Stone::Black);  // E6
+        board.place_stone(Pos::new(5, 5), Stone::Black);  // F6
+        board.place_stone(Pos::new(6, 5), Stone::Black);  // G6
+        board.place_stone(Pos::new(7, 5), Stone::Black);  // H6 — to be captured
+        board.place_stone(Pos::new(8, 5), Stone::Black);  // I6
+
+        // White horizontal four setup: row 7, cols 2,3,4 + col 6
+        // Playing (7,5) would place in the gap → creates four: (7,2)-(7,3)-(7,4)-(7,5)
+        // AND captures Black pair if capture pattern exists
+        board.place_stone(Pos::new(7, 2), Stone::White);  // H3
+        board.place_stone(Pos::new(7, 3), Stone::White);  // H4
+        board.place_stone(Pos::new(7, 4), Stone::White);  // H5
+
+        // Capture pattern: W(7,4)-B(7,5)-B(7,6)-W(7,7) → White at (7,7) captures B(7,5)+(7,6)
+        // But we want White to play (7,7) as the threat move.
+        // Hmm, (7,5) is Black. For capture: W(pos)-B-B-W(existing) pattern
+        // Let's use: White plays (7,7): pattern W(7,7)-B(7,6)-B(7,5)-W(7,4) → captures B(7,6)+(7,5)
+        board.place_stone(Pos::new(7, 6), Stone::Black);  // H7 — to be captured
+
+        // White also needs: (7,7) to create a four horizontally
+        // Row 7: W(7,2) W(7,3) W(7,4) B(7,5) B(7,6) ?(7,7) ...
+        // If White plays (7,7), horizontal: just (7,7) alone (not four).
+        // Need different setup for four-threat.
+
+        // Let me use a completely clean, minimal setup:
+        let mut board = Board::new();
+
+        // Black has vertical four at col 9: rows 3,4,5,7
+        // (row 6 is where Black's stone will be captured)
+        board.place_stone(Pos::new(3, 9), Stone::Black);
+        board.place_stone(Pos::new(4, 9), Stone::Black);
+        board.place_stone(Pos::new(5, 9), Stone::Black);
+        board.place_stone(Pos::new(6, 9), Stone::Black);  // will be captured
+        board.place_stone(Pos::new(7, 9), Stone::Black);
+
+        // White horizontal three at row 6: cols 6,7,8
+        // Playing (6,10) creates four: (6,7)-(6,8)-(6,9)-(6,10) — wait (6,9) is Black
+        // Playing (6,5) creates four: (6,5)-(6,6)-(6,7)-(6,8) — no, need 3 existing + 1 new = 4
+        board.place_stone(Pos::new(6, 6), Stone::White);
+        board.place_stone(Pos::new(6, 7), Stone::White);
+        board.place_stone(Pos::new(6, 8), Stone::White);
+
+        // Capture pattern: White plays (6,10) → W(6,10)-B(6,9)-B... no, only 1 Black at (6,9)
+        // Need capture: W(existing)-B-B-W(placing) pattern
+        // Place White at (6,5): W(6,5)-B(6,6)?? No, (6,6) is White.
+
+        // Simplest approach: set up capture independently
+        // Capture pattern on row 6: W(6,11)-B(6,10)-B(6,9)-W(placing at 6,8)?
+        // (6,8) is already White. Not useful.
+
+        // Let me think differently.
+        // White plays at position P:
+        //   1. P creates a four for White (horizontal)
+        //   2. P also triggers a capture of Black's stones including one
+        //      that's part of Black's vertical five-setup
+
+        // Setup:
+        //   White: (6,6), (6,7), (6,8) — horizontal three
+        //   White plays (6,5) — creates four: (6,5)-(6,6)-(6,7)-(6,8)
+        //   For capture: need W(6,5)-B(6,4)-B(6,3)-W(6,2) pattern?
+        //   No — capture is: placing stone flanks opponent pair.
+        //   X-O-O-X: the Xs flank the O-O pair.
+        //   If White plays (6,5), and there's B(6,4)-B(6,3) with W(6,2):
+        //   Pattern: W(6,2)...B(6,3)-B(6,4)...W(6,5) → captures B(6,3)+(6,4)
+        //   But these are far from Black's vertical line.
+
+        // Alternative: the capture must remove a stone from Black's vertical line.
+        // Black vertical: col C, rows R1..R5. One of these is at (6, C).
+        // White's four is at row 6. If White plays at (6, C-1) or (6, C+1),
+        // and this triggers capture of (6,C) + neighbor...
+
+        // Let me try: Black vertical at col 9, including (6,9).
+        // Capture of (6,9): need W-B(6,9)-B(adj)-W or W-B(adj)-B(6,9)-W in some direction.
+        // Horizontal capture: W(6,7)-B(6,8)-B(6,9)-W(6,10)
+        // But (6,7) and (6,8) are White — contradiction.
+
+        // The capture must be in a different direction from the four.
+        // Let's use diagonal or vertical capture.
+        // Vertical capture of (6,9): W(4,9)-B(5,9)-B(6,9)-W(7,9)
+        // But (5,9) and (7,9) are Black! Can't capture own stones.
+        // W captures opponent's stones. If White plays somewhere and
+        // pattern is W(pos)-Opp-Opp-W(existing) in some direction.
+
+        // Actually: White's four is horizontal row 6.
+        // Capture is: the PLACING stone (White's threat move) flanks a Black pair.
+        // So White's threat move at position P:
+        //   - Creates four horizontally
+        //   - Also captures Black pair in some other direction
+
+        // Let me set up: White plays (6,10).
+        //   Horizontal four: (6,7)-(6,8)-(6,9)-(6,10)? No, (6,9) is Black.
+
+        // I keep running into conflicts. Let me try a completely different geometry.
+
+        // Setup that works:
+        // Black vertical five potential: col 5, rows 3-7 (5 stones)
+        //   (3,5) (4,5) (5,5) (6,5) (7,5)
+        // White horizontal three: row 6, cols 7,8,9
+        //   (6,7) (6,8) (6,9)
+        // White plays (6,6): creates horizontal four (6,6)-(6,7)-(6,8)-(6,9)
+        // Capture at (6,6): need W(6,6) flanking a Black pair.
+        //   Direction check from (6,6):
+        //   Left: (6,5)=Black. One more left: (6,4)=empty → not a pair capture
+        //   For capture: W(6,6)-B(6,5)-B(6,4)-W(6,3) → need B at (6,4) and W at (6,3)
+        //   If we place B(6,4) and W(6,3): capture of B(6,5)+B(6,4) when White plays (6,6)!
+        //   This removes B(6,5) from the vertical line!
+        //   After capture: Black vertical has (3,5)(4,5)(5,5)___(7,5) — gap at (6,5)
+        //   Black can replay (6,5) → five: (3,5)(4,5)(5,5)(6,5)(7,5) ✓
+
+        // Final clean setup:
+        let mut board = Board::new();
+
+        // Black vertical five setup at col 5: rows 3,4,5,6,7
+        board.place_stone(Pos::new(3, 5), Stone::Black);
+        board.place_stone(Pos::new(4, 5), Stone::Black);
+        board.place_stone(Pos::new(5, 5), Stone::Black);
+        board.place_stone(Pos::new(6, 5), Stone::Black);  // will be captured
+        board.place_stone(Pos::new(7, 5), Stone::Black);
+
+        // Extra Black stone for capture pair: (6,4)
+        board.place_stone(Pos::new(6, 4), Stone::Black);  // will be captured
+
+        // White setup:
+        // Horizontal three at row 6: cols 7,8,9
+        board.place_stone(Pos::new(6, 7), Stone::White);
+        board.place_stone(Pos::new(6, 8), Stone::White);
+        board.place_stone(Pos::new(6, 9), Stone::White);
+        // W at (6,3) for capture bracket
+        board.place_stone(Pos::new(6, 3), Stone::White);
+
+        // White plays (6,6): creates four (6,6)-(6,7)-(6,8)-(6,9)
+        // AND captures B(6,5)+B(6,4) via pattern W(6,3)-B(6,4)-B(6,5)-W(6,6)
+        // After capture, (6,5) is free. Black replays (6,5) → vertical five!
+
+        let mut searcher = ThreatSearcher::new();
+        let result = searcher.search_vcf(&board, Stone::White);
+
+        // VCF should NOT find a win because the capture at (6,6) frees (6,5)
+        // allowing Black to complete vertical five instead of defending.
+        assert!(
+            !result.found,
+            "VCF should reject sequences where capture enables defender five"
+        );
     }
 }

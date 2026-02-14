@@ -73,12 +73,21 @@ pub fn evaluate(board: &Board, color: Stone) -> i32 {
 
 /// Returns vulnerability penalty weight scaled by opponent's capture count.
 /// Higher captures = much higher penalty per vulnerable pair (exponential danger).
+///
+/// A capturable pair gives the opponent a free capture opportunity — destroying
+/// our pattern AND advancing toward capture-win. The penalty must be comparable
+/// to pattern scores to prevent the AI from building "strong but fragile" positions.
+///
+/// At 0-1 caps: 10K = OPEN_THREE level — creating a capturable pair is as bad
+///   as giving the opponent an open three (they gain a strong tactical option).
+/// At 4+ caps: 80K = near OPEN_FOUR — one more capture wins, so any vulnerability
+///   is near-lethal.
 fn vuln_weight(opp_captures: u8) -> i32 {
     match opp_captures {
-        0..=1 => 4_000,  // baseline (same as before)
-        2 => 10_000,     // 2 pairs captured — increasing danger
-        3 => 25_000,     // 3 pairs — serious threat
-        _ => 60_000,     // 4 pairs — one more capture = instant loss
+        0..=1 => 10_000,  // was 4K — vulnerability matters even early game
+        2 => 20_000,      // was 10K — two captures means opponent is actively hunting
+        3 => 40_000,      // was 25K — three captures = serious strategic threat
+        _ => 80_000,      // was 60K — four captures = one more capture = instant loss
     }
 }
 
@@ -104,6 +113,7 @@ fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
     let mut closed_fours = 0i32;
     let mut open_threes = 0i32;
     let mut vuln = 0i32;
+    let mut open_twos = 0i32;
 
     for pos in stones.iter_ones() {
         // --- Pattern scoring (4 directions) ---
@@ -117,6 +127,10 @@ fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
                 closed_fours += 1;
             } else if pattern_score >= PatternScore::OPEN_THREE {
                 open_threes += 1;
+            } else if pattern_score >= PatternScore::OPEN_TWO
+                && pattern_score < PatternScore::CLOSED_THREE
+            {
+                open_twos += 1;
             }
         }
 
@@ -186,9 +200,19 @@ fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
         score += PatternScore::OPEN_FOUR;
     }
     // Double open three: opponent can only block one → the other becomes open four → win.
-    // Must be high enough to dominate single-pattern scores in evaluation.
+    // Equivalent to open four in practice — must be scored at OPEN_FOUR level.
     if open_threes >= 2 {
-        score += PatternScore::CLOSED_FOUR; // 50K (was 30K) — nearly unblockable
+        score += PatternScore::OPEN_FOUR; // 100K — virtually unblockable
+    }
+
+    // Multi-directional development bonus (open twos)
+    // Multiple directions developing simultaneously are hard to block all at once
+    if open_twos >= 4 {
+        score += 8_000;
+    } else if open_twos >= 3 {
+        score += 5_000;
+    } else if open_twos >= 2 {
+        score += 3_000;
     }
 
     (score, vuln)

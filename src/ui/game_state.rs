@@ -221,9 +221,9 @@ impl GameState {
             ai_stats: AiStats::default(),
             review_index: None,
             redo_groups: Vec::new(),
-            ai_engine: Some(AIEngine::with_config(64, 20, 500)),
+            ai_engine: Some(AIEngine::with_config(64, 20, 1000)),
             ai_depth: 20,
-            ai_time_limit_ms: 500,
+            ai_time_limit_ms: 1000,
         }
     }
 
@@ -382,7 +382,24 @@ impl GameState {
             });
         }
 
-        // Check five-in-a-row (must verify opponent can't break it by capture)
+        // Check if the OPPONENT already had a five from a previous turn.
+        // In Ninuki-renju, a breakable five gives the opponent one chance to
+        // capture and break it. If they fail (don't break it), the five-holder wins.
+        let opponent = color.opponent();
+        if let Some(opp_five) = rules::find_five_positions(&self.board, opponent) {
+            let winning_line = if opp_five.len() >= 5 {
+                Some([opp_five[0], opp_five[1], opp_five[2], opp_five[3], opp_five[4]])
+            } else {
+                None
+            };
+            return Some(GameResult {
+                winner: opponent,
+                win_type: WinType::FiveInRow,
+                winning_line,
+            });
+        }
+
+        // Check five-in-a-row by the current player
         if let Some(line) = self.find_winning_line(pos, color) {
             let line_vec: Vec<Pos> = line.to_vec();
             if !rules::can_break_five_by_capture(&self.board, &line_vec, color) {
@@ -392,6 +409,7 @@ impl GameState {
                     winning_line: Some(line),
                 });
             }
+            // Five is breakable — opponent gets one chance to break it
         }
 
         None
@@ -821,5 +839,77 @@ mod tests {
         let result = state.check_win(Pos::new(9, 7), Stone::Black, 0);
         assert!(result.is_some(), "Unbreakable five should be declared a win");
         assert_eq!(result.unwrap().win_type, WinType::FiveInRow);
+    }
+
+    /// When a breakable five exists and the opponent fails to break it,
+    /// the five-holder should win.
+    #[test]
+    fn test_breakable_five_wins_when_not_broken() {
+        let mut state = GameState::new(GameMode::PvP { show_suggestions: false });
+
+        // Same breakable five setup: Black diagonal K9-J10-H11-G12-F13
+        // White at G10 enables capture of J10+H10 via K10
+        state.board.place_stone(Pos::new(9, 6), Stone::White);  // G10
+        state.board.place_stone(Pos::new(8, 9), Stone::Black);  // K9
+        state.board.place_stone(Pos::new(9, 8), Stone::Black);  // J10
+        state.board.place_stone(Pos::new(9, 7), Stone::Black);  // H10 (capture target)
+        state.board.place_stone(Pos::new(10, 7), Stone::Black); // H11
+        state.board.place_stone(Pos::new(11, 6), Stone::Black); // G12
+        state.board.place_stone(Pos::new(12, 5), Stone::Black); // F13 (completes five)
+        state.board.place_stone(Pos::new(10, 8), Stone::White); // J11
+        state.board.place_stone(Pos::new(11, 7), Stone::White); // H12
+
+        // Black's five is breakable — check_win returns None (opponent gets a chance)
+        let f13 = Pos::new(12, 5);
+        let result = state.check_win(f13, Stone::Black, 0);
+        assert!(result.is_none(), "Breakable five should not win immediately");
+
+        // White plays A1 — does NOT break the five
+        let a1 = Pos::new(0, 0);
+        state.board.place_stone(a1, Stone::White);
+
+        // Now check_win should detect Black's surviving five → Black wins
+        let result = state.check_win(a1, Stone::White, 0);
+        assert!(result.is_some(), "Black should win: White failed to break the five");
+        assert_eq!(result.unwrap().winner, Stone::Black);
+        assert_eq!(result.unwrap().win_type, WinType::FiveInRow);
+    }
+
+    /// When a breakable five is successfully broken by capture,
+    /// the game should continue.
+    #[test]
+    fn test_breakable_five_broken_by_capture_continues() {
+        let mut state = GameState::new(GameMode::PvP { show_suggestions: false });
+
+        // Same breakable five setup
+        state.board.place_stone(Pos::new(9, 6), Stone::White);  // G10
+        state.board.place_stone(Pos::new(8, 9), Stone::Black);  // K9
+        state.board.place_stone(Pos::new(9, 8), Stone::Black);  // J10
+        state.board.place_stone(Pos::new(9, 7), Stone::Black);  // H10
+        state.board.place_stone(Pos::new(10, 7), Stone::Black); // H11
+        state.board.place_stone(Pos::new(11, 6), Stone::Black); // G12
+        state.board.place_stone(Pos::new(12, 5), Stone::Black); // F13
+        state.board.place_stone(Pos::new(10, 8), Stone::White); // J11
+        state.board.place_stone(Pos::new(11, 7), Stone::White); // H12
+
+        // Black's five is breakable
+        let result = state.check_win(Pos::new(12, 5), Stone::Black, 0);
+        assert!(result.is_none());
+
+        // White places K10 (9,9) — captures J10(9,8)+H10(9,7) via G10(9,6)
+        // Pattern: K10(W) - J10(B) - H10(B) - G10(W) = X-O-O-X
+        let k10 = Pos::new(9, 9);
+        state.board.place_stone(k10, Stone::White);
+        rules::execute_captures(&mut state.board, k10, Stone::White);
+
+        // Black's five should be broken (J10 removed from the diagonal)
+        assert!(
+            rules::find_five_positions(&state.board, Stone::Black).is_none(),
+            "Black's five should be broken after capture"
+        );
+
+        // check_win should return None — game continues
+        let result = state.check_win(k10, Stone::White, 1);
+        assert!(result.is_none(), "Game should continue after five is broken by capture");
     }
 }
