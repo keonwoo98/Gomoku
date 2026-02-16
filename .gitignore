@@ -15,3 +15,7 @@ Thumbs.db
 # Project
 Gomoku
 Gomoku.pdf
+
+# Local plans and logs
+docs/plans/
+gomoku_ai.log
