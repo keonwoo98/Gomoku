@@ -221,9 +221,9 @@ impl GameState {
             ai_stats: AiStats::default(),
             review_index: None,
             redo_groups: Vec::new(),
-            ai_engine: Some(AIEngine::with_config(64, 20, 1000)),
+            ai_engine: Some(AIEngine::with_config(64, 20, 500)),
             ai_depth: 20,
-            ai_time_limit_ms: 1000,
+            ai_time_limit_ms: 500,
         }
     }
 

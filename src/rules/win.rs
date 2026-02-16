@@ -159,6 +159,7 @@ pub fn find_five_positions(board: &Board, stone: Stone) -> Option<Vec<Pos>> {
 ///
 /// Returns true if the 5-in-row can be broken by the opponent
 /// placing a stone that captures part of the winning line.
+/// This is a STATIC game-rule check (no look-ahead for recreation).
 pub fn can_break_five_by_capture(board: &Board, five_positions: &[Pos], five_color: Stone) -> bool {
     let opponent = five_color.opponent();
 
@@ -339,169 +340,24 @@ mod tests {
 
     #[test]
     fn test_breakable_five() {
+        // Five at row 9, cols 5-9 (Black), with White bracket at (7,7)
+        // and extra Black at (8,7). White can capture (9,7)+(8,7) via (10,7).
+        //
+        //         col: 5 6 7 8 9
+        // row 7:       . . W . .    <- bracket stone
+        // row 8:       . . B . .    <- extra black (captured with five-stone)
+        // row 9:       B B B B B    <- five in a row
+        // row 10:      . . _ . .    <- White places here for break
         let mut board = Board::new();
-        // Setup: 5 blacks in a row, but white can capture 2 of them
-        // Capture pattern: W _ B B W where _ is empty for White to place
-        //
-        // Board setup:
-        // W B B B B B _ W
-        // 0 1 2 3 4 5 6 7
-        //
-        // If White places at position 6, pattern is: W[7] - B[5] - B[4] - W[?]
-        // We need: W[other] - B[x] - B[y] - W[placing]
-        //
-        // Correct setup for breakable five:
-        // _ W B B B B B W _
-        // 0 1 2 3 4 5 6 7 8
-        // White at 1 and 7. If White places at 0: W[0]-B[2]-B[3] needs W at 4? No.
-        //
-        // Actually: X-O-O-X pattern requires:
-        // placing_stone - opponent - opponent - existing_own_stone
-        //
-        // For White to capture B-B from the five:
-        // Need: W(placing) - B - B - W(existing)
-        //
-        // Setup: W _ B B B B B W _
-        //        0 1 2 3 4 5 6 7 8
-        // If White places at 8: W[8] - B[6] - B[5] - W[need at 4]
-        // We need White at position 4 too!
-        //
-        // Correct breakable five setup:
-        // _ _ B B W B B _ _
-        // 0 1 2 3 4 5 6 7 8
-        // This is NOT 5 in a row anymore.
-        //
-        // Let's try a different approach - White can break with capture from the side
-        // W _ B B B B B _ _
-        // 0 1 2 3 4 5 6 7 8
-        // And add another W at distance 3 from position 1:
-        // W _ B B W B B _ _  (W at 0 and 4, but now B's are split)
-        //
-        // Better approach: Make 5 blacks, with setup allowing capture of edge pair
-        // _ W B B B B B W _
-        // 0 1 2 3 4 5 6 7 8
-        // Add White at position 4 (inside the line? No that breaks the 5)
-        //
-        // Working scenario: Create 5-in-row where capture can hit 2 stones
-        // B B B B B with W _ W pattern around 2 of them
-        //
-        // Row 9: B B B B B (cols 5-9)
-        // Row 8, col 7: W (above col 7)
-        // Row 10, col 7: empty (below col 7, for White to place)
-        // Row 11, col 7: W (creates W-B-B-W vertically if place at row 10)
-        //
-        // Vertical capture through horizontal five:
-        //         col: 5 6 7 8 9
-        // row 8:       . . W . .
-        // row 9:       B B B B B  (five in a row)
-        // row 10:      . . _ . .  (White places here)
-        // row 11:      . . W . .
-        //
-        // White places at (10, 7): checks W[10,7] - B[9,7] - B[8,7] - W[need]
-        // Actually capture is: placed - opp+1 - opp+2 - own+3
-        // So: W[10,7] - B[9,7](wrong, need opponent in +1 direction)
-        //
-        // Going upward: dr=-1, so positions are:
-        // placed: (10,7), +1: (9,7)=B, +2: (8,7)=W (not opponent!)
-        //
-        // Need to place White so that two B's are between two W's
-        // Pattern in one direction: W(place) - B - B - W(exist)
-        //
-        // Fix: Put White at row 7, then place at row 10
-        //         col: 5 6 7 8 9
-        // row 7:       . . W . .
-        // row 8:       . . B . .  <- extra black to make the vertical capture work
-        // row 9:       B B B B B  (five in a row, col 7 is part of it)
-        // row 10:      . . _ . .  (White places here)
-        //
-        // Wait, that's only 1 black between the W's, not 2.
-        //
-        // Let me reconsider the capture rule:
-        // Pattern: placed_stone(pos) - opp(+1) - opp(+2) - our_stone(+3)
-        //
-        // For row-based vertical capture going upward (dr=-1):
-        // White places at (10, 7)
-        // Check: (10,7)+(-1,0)*1 = (9,7) should be Black
-        // Check: (10,7)+(-1,0)*2 = (8,7) should be Black
-        // Check: (10,7)+(-1,0)*3 = (7,7) should be White
-        //
-        // So we need:
-        // row 7, col 7: W
-        // row 8, col 7: B
-        // row 9, col 7: B (part of the five)
-        // row 10, col 7: _ (White places here)
-        //
-        // But now the five at row 9 cols 5-9 includes (9,7)
-        // We also need (8,7) to be Black, but that's outside the five
-        //
-        // Actually, the five is: (9,5), (9,6), (9,7), (9,8), (9,9)
-        // The capture would take (9,7) and (8,7), but (8,7) is not in the five!
-        // So this would NOT break the five (only removes 1 stone from it).
-        //
-        // For capture to break the five, BOTH captured stones must be IN the five.
-        // So we need to capture a PAIR within the five (horizontal captures).
-        //
-        // Horizontal capture of pair within the five:
-        // Row 9: W _ B B B B B _ W
-        //        0 1 2 3 4 5 6 7 8
-        //
-        // To capture (9,2) and (9,3), White at (9,1) needs W at (9,4)
-        // But (9,4) is Black in the five!
-        //
-        // This means: A CONTINUOUS five cannot be broken by capture horizontally!
-        // The only way to break is via perpendicular capture through 2 adjacent stones.
-        //
-        // Perpendicular capture setup:
-        // We need to capture 2 ADJACENT blacks that are both in the five.
-        // That means vertical/diagonal capture through 2 horizontally adjacent cells.
-        //
-        // But a vertical capture through row 9 would be:
-        // W at (7, x), B at (8, x), B at (9, x) <- in five, W places at (10, x)
-        // This only captures 1 from the five + 1 outside.
-        //
-        // Actually wait - let me reread. The capture is along a LINE.
-        // So to capture 2 blacks from a horizontal five, the capture must be horizontal too!
-        //
-        // For horizontal capture W-B-B-W, the B-B must be adjacent horizontally.
-        // In a continuous five B-B-B-B-B, every adjacent pair is surrounded by more B's!
-        // B[B-B]B-B -- the brackets show a pair, but it's B-B-B, not W-B-B-W
-        //
-        // Conclusion: A CONTINUOUS five-in-a-row CANNOT be broken by capture!
-        // The test scenario is fundamentally flawed.
-        //
-        // For a breakable five, we need a GAPPED five or specific board setup.
-        // But Gomoku five-in-row means CONSECUTIVE stones, so no gaps.
-        //
-        // Actually re-reading the endgame rule: it says if opponent CAN capture
-        // to break the five. Let me check if this is even possible...
-        //
-        // Alternative interpretation: Maybe the rule applies to "about to complete 5"
-        // rather than "already completed 5"? Or the five is broken by removing
-        // ANY stone from it (not necessarily via a horizontal capture through it).
-        //
-        // Looking at it differently: We capture 2 stones. If either of them is
-        // part of the five, the five is broken (reduced to 4).
-        //
-        // So capturing (9,7) and (8,7) where (9,7) is in the five WOULD break it!
-        //
-        // Let's set up that scenario:
-        // Row 9: B B B B B (cols 5-9, the five)
-        // Row 7, col 7: W
-        // Row 8, col 7: B (additional black for capture)
-        // Row 10, col 7: _ (White places here to capture (8,7) and (9,7))
-        //
-        board.place_stone(Pos::new(7, 7), Stone::White); // W at top
+        board.place_stone(Pos::new(7, 7), Stone::White);
         for i in 5..10 {
-            board.place_stone(Pos::new(9, i), Stone::Black); // Five in a row
+            board.place_stone(Pos::new(9, i), Stone::Black);
         }
-        board.place_stone(Pos::new(8, 7), Stone::Black); // Extra B for capture
-
-        // Now if White places at (10, 7), captures (8,7) and (9,7)
-        // (9,7) is part of the five, so the five would be broken
+        board.place_stone(Pos::new(8, 7), Stone::Black);
 
         let five = find_five_positions(&board, Stone::Black).unwrap();
-        let can_break = can_break_five_by_capture(&board, &five, Stone::Black);
-        assert!(can_break, "White should be able to break the five by capturing (8,7)-(9,7)");
+        // STATIC check: the five IS physically breakable
+        assert!(can_break_five_by_capture(&board, &five, Stone::Black));
     }
 
     #[test]

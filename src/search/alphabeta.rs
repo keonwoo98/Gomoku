@@ -30,11 +30,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, Pos, Stone, BOARD_SIZE};
+use crate::board::{Bitboard, Board, Pos, Stone, BOARD_SIZE};
 use crate::eval::{evaluate, PatternScore};
 use crate::rules::{
-    can_break_five_by_capture, count_captures_fast, execute_captures_fast, find_five_line_at_pos,
-    has_five_at_pos, has_five_in_row, is_valid_move, undo_captures,
+    can_break_five_by_capture, count_captures_fast, execute_captures_fast,
+    find_five_break_moves, find_five_line_at_pos, has_five_at_pos, has_five_in_row, is_valid_move,
+    undo_captures,
 };
 
 use super::{AtomicTT, EntryType, TTStats, ZobristTable};
@@ -136,6 +137,8 @@ struct WorkerSearcher {
     max_depth: i8,
     killer_moves: [[Option<Pos>; 2]; 64],
     history: [[[i32; BOARD_SIZE]; BOARD_SIZE]; 2],
+    countermove: [[[Option<Pos>; BOARD_SIZE]; BOARD_SIZE]; 2],
+    last_move_for_ordering: Option<Pos>,
     start_time: Option<Instant>,
     time_limit: Option<Duration>,
     stats: SearchStats,
@@ -154,6 +157,8 @@ impl WorkerSearcher {
             max_depth,
             killer_moves: [[None; 2]; 64],
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+            countermove: [[[None; BOARD_SIZE]; BOARD_SIZE]; 2],
+            last_move_for_ordering: None,
             start_time: Some(start_time),
             time_limit: Some(time_limit),
             stats: SearchStats::default(),
@@ -203,7 +208,7 @@ impl WorkerSearcher {
         let soft_limit = self.time_limit.unwrap_or(Duration::from_millis(500));
         let mut prev_depth_time = Duration::ZERO;
 
-        let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 12 };
+        let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 10 };
         const ASP_WINDOW: i32 = 100;
 
         // Win/loss confirmation: require TWO consecutive depths to agree on a
@@ -218,6 +223,18 @@ impl WorkerSearcher {
         for depth in first_depth..=max_depth {
             if self.is_stopped() {
                 break;
+            }
+
+            // History gravity: halve all history scores at each new depth.
+            // Ensures recent search results outweigh stale move ordering data.
+            if depth > first_depth {
+                for color_hist in &mut self.history {
+                    for row in color_hist.iter_mut() {
+                        for val in row.iter_mut() {
+                            *val >>= 1;
+                        }
+                    }
+                }
             }
 
             let depth_start = Instant::now();
@@ -314,8 +331,23 @@ impl WorkerSearcher {
 
         let hash = self.shared.zobrist.hash(board, color);
         let tt_move = self.shared.tt.get_best_move(hash);
+        self.last_move_for_ordering = None;
         let (mut moves, _top_score) = self.generate_moves_ordered(board, color, tt_move, depth);
-        moves.truncate(MAX_ROOT_MOVES);
+        // Lazy double-three: keep the first MAX_ROOT_MOVES valid moves.
+        // Forbidden (double-three) moves may score high, so we can't truncate
+        // first — that would displace valid defensive moves from the top-N.
+        let mut valid_count = 0;
+        moves.retain(|(mov, _)| {
+            if valid_count >= MAX_ROOT_MOVES {
+                return false;
+            }
+            if is_valid_move(board, *mov, color) {
+                valid_count += 1;
+                true
+            } else {
+                false
+            }
+        });
 
         for (i, (mov, _move_score)) in moves.iter().enumerate() {
             board.place_stone(*mov, color);
@@ -508,6 +540,61 @@ impl WorkerSearcher {
                 return true;
             }
         }
+        // Gap pattern threat: opponent has 3+ stones with one gap in any direction
+        // from last_move. E.g., O_OO or OO_O — filling gap creates an open four.
+        // This catches threats missed by the consecutive scan above.
+        for (dr, dc) in dirs {
+            for sign in [-1i8, 1] {
+                let sdr = dr * sign;
+                let sdc = dc * sign;
+                let mut gap_count = 1i32; // last_move stone
+                let mut gap_used = false;
+                let mut gap_open_ends = 0i32;
+                // Scan positive direction (from last_move)
+                for i in 1..=4i8 {
+                    let gr = last_move.row as i8 + sdr * i;
+                    let gc = last_move.col as i8 + sdc * i;
+                    if gr < 0 || gr >= sz || gc < 0 || gc >= sz { break; }
+                    let s = board.get(Pos::new(gr as u8, gc as u8));
+                    if s == opp {
+                        gap_count += 1;
+                    } else if s == Stone::Empty && !gap_used {
+                        // Check stone after gap
+                        let nr = gr + sdr;
+                        let nc = gc + sdc;
+                        if nr >= 0 && nr < sz && nc >= 0 && nc < sz
+                            && board.get(Pos::new(nr as u8, nc as u8)) == opp
+                        {
+                            gap_used = true;
+                            continue; // skip gap, next iteration picks up the stone
+                        }
+                        gap_open_ends += 1;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                // Scan negative direction
+                for i in 1..=4i8 {
+                    let gr = last_move.row as i8 - sdr * i;
+                    let gc = last_move.col as i8 - sdc * i;
+                    if gr < 0 || gr >= sz || gc < 0 || gc >= sz { break; }
+                    let s = board.get(Pos::new(gr as u8, gc as u8));
+                    if s == opp {
+                        gap_count += 1;
+                    } else if s == Stone::Empty {
+                        gap_open_ends += 1;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                // Gap pattern: 3+ stones with gap AND open ends → strong threat
+                if gap_used && (gap_count >= 4 || (gap_count >= 3 && gap_open_ends >= 2)) {
+                    return true;
+                }
+            }
+        }
         // Capture setup: opponent's last_move brackets our pair on one side
         // Pattern: last_move(opp) - us - us - empty → opponent places at empty to capture
         let us = color;
@@ -582,10 +669,12 @@ impl WorkerSearcher {
             // Check breakable five (endgame capture rule)
             if let Some(five_line) = find_five_line_at_pos(board, last_move, last_player) {
                 if can_break_five_by_capture(board, &five_line, last_player) {
-                    // Breakable five: forcing but NOT terminal. Opponent can capture
-                    // a pair from the line to destroy it. Equivalent to a closed four
-                    // (one specific defense exists).
-                    return -(PatternScore::CLOSED_FOUR);
+                    // Breakable five: search break moves even in quiescence.
+                    // Uses depth=0 so the break-move search recurses into alpha_beta
+                    // which enters quiescence for the post-break position.
+                    return self.search_five_break(
+                        board, color, 0, alpha, beta, &five_line, last_player, hash,
+                    );
                 }
             }
             return -PatternScore::FIVE;
@@ -792,6 +881,89 @@ impl WorkerSearcher {
         best_score
     }
 
+    /// Search only break moves when opponent has a breakable five.
+    /// Called from both alpha_beta and quiescence when `can_break_five_by_capture` is true.
+    /// The side to move MUST play a capture that removes a stone from the five,
+    /// otherwise they lose (has_five_in_row at next ply returns +FIVE for the five-holder).
+    fn search_five_break(
+        &mut self,
+        board: &mut Board,
+        color: Stone,
+        depth: i8,
+        mut alpha: i32,
+        beta: i32,
+        five_positions: &[Pos],
+        five_color: Stone,
+        hash: u64,
+    ) -> i32 {
+        let break_moves = find_five_break_moves(board, five_positions, five_color);
+        if break_moves.is_empty() {
+            return -PatternScore::FIVE;
+        }
+
+        let mut best = -PatternScore::FIVE;
+        for break_pos in &break_moves {
+            let break_pos = *break_pos;
+            if !board.is_empty(break_pos) {
+                continue;
+            }
+
+            // Make move
+            board.place_stone(break_pos, color);
+            let cap_info = execute_captures_fast(board, break_pos, color);
+
+            // Update Zobrist hash
+            let mut child_hash = self.shared.zobrist.update_place(hash, break_pos, color);
+            for j in 0..cap_info.count as usize {
+                child_hash = self.shared.zobrist.update_capture(
+                    child_hash,
+                    cap_info.positions[j],
+                    color.opponent(),
+                );
+            }
+            if cap_info.pairs > 0 {
+                let new_count = board.captures(color);
+                let old_count = new_count - cap_info.pairs;
+                child_hash =
+                    self.shared
+                        .zobrist
+                        .update_capture_count(child_hash, color, old_count, new_count);
+            }
+
+            // Recurse: depth-1 into normal alpha-beta (handles depth<=0 → quiescence)
+            let search_depth = (depth - 1).max(0);
+            let score = -self.alpha_beta(
+                board,
+                color.opponent(),
+                search_depth,
+                -beta,
+                -alpha,
+                break_pos,
+                child_hash,
+                true,
+            );
+
+            // Unmake move
+            undo_captures(board, color, &cap_info);
+            board.remove_stone(break_pos);
+
+            if score > best {
+                best = score;
+                if score > alpha {
+                    alpha = score;
+                    if score >= beta {
+                        break;
+                    }
+                }
+            }
+
+            if self.is_stopped() {
+                return best;
+            }
+        }
+        best
+    }
+
     /// Recursive alpha-beta search with negamax formulation.
     fn alpha_beta(
         &mut self,
@@ -827,10 +999,12 @@ impl WorkerSearcher {
             // Only called when five exists (rare), so the extra cost is negligible.
             if let Some(five_line) = find_five_line_at_pos(board, last_move, last_player) {
                 if can_break_five_by_capture(board, &five_line, last_player) {
-                    // Breakable five: forcing but NOT terminal.
-                    // Opponent can capture a pair to destroy it. Equivalent to
-                    // a closed four — one specific defense exists.
-                    return -(PatternScore::CLOSED_FOUR);
+                    // Breakable five: search only break moves (captures that destroy the five).
+                    // The old fixed-score return (-CLOSED_FOUR) missed post-break threats,
+                    // causing the AI to play self-destructive captures like K11 in Game 5.
+                    return self.search_five_break(
+                        board, color, depth, alpha, beta, &five_line, last_player, hash,
+                    );
                 }
             }
             return -PatternScore::FIVE;
@@ -856,12 +1030,12 @@ impl WorkerSearcher {
             return score;
         }
 
-        // Pre-compute static eval for shallow pruning decisions (depth 1-2).
-        // Shared by razoring, reverse futility pruning, and per-move futility.
-        // Not computed at depth 3+ to avoid evaluate() overhead at interior nodes.
+        // Pre-compute static eval for pruning decisions.
+        // Used by NMP (all depths), RFP (depth 1-3), razoring (depth 1-3),
+        // and per-move futility (depth 1-3). evaluate() is O(stones*4) ≈ 1-5μs.
         let non_terminal = alpha.abs() < PatternScore::FIVE - 100
             && beta.abs() < PatternScore::FIVE - 100;
-        let static_eval = if depth <= 2 && non_terminal {
+        let static_eval = if non_terminal {
             evaluate(board, color)
         } else {
             0
@@ -872,7 +1046,7 @@ impl WorkerSearcher {
         // margin won't drop below. Cut immediately.
         // Uses OPEN_THREE (10K) per depth as margin — in Gomoku a single
         // quiet move can swing eval by up to OPEN_THREE (creating a new threat).
-        if depth <= 2
+        if depth <= 3
             && non_terminal
             && static_eval - PatternScore::OPEN_THREE * i32::from(depth) >= beta
         {
@@ -882,7 +1056,7 @@ impl WorkerSearcher {
         // Razoring: at shallow depths, if static eval is far below alpha,
         // verify with quiescence search. If QS confirms the position is bad, cut.
         // Complementary to RFP (which cuts when eval >> beta).
-        if depth <= 2
+        if depth <= 3
             && non_terminal
             && static_eval + PatternScore::OPEN_THREE * i32::from(depth) <= alpha
         {
@@ -893,8 +1067,17 @@ impl WorkerSearcher {
         }
 
         // Null Move Pruning
-        if allow_null && depth >= 3 && !Self::is_threatened(board, color, last_move) {
-            let r = if depth >= 5 { 3i8 } else { 2i8 };
+        // Gate: static_eval >= beta ensures we only try NMP when position is good.
+        // This prevents NMP from pruning in positions where opponent has strong
+        // patterns (captures removed our stones, opponent can rebuild threats).
+        // R=2 fixed: R=3 was too aggressive, missing critical opponent responses
+        // (e.g., opponent replaying captured position to create open four).
+        if allow_null && depth >= 3
+            && non_terminal
+            && static_eval >= beta
+            && !Self::is_threatened(board, color, last_move)
+        {
+            let r = 2i8;
             let null_depth = (depth - 1 - r).max(0);
 
             let null_hash = self.shared.zobrist.toggle_side(hash);
@@ -938,6 +1121,7 @@ impl WorkerSearcher {
             }
         }
 
+        self.last_move_for_ordering = Some(last_move);
         let (mut moves, top_score) = self.generate_moves_ordered(board, color, tt_move, depth);
         if moves.is_empty() {
             return evaluate(board, color);
@@ -963,14 +1147,30 @@ impl WorkerSearcher {
                 _ => 9,
             }
         };
-        moves.truncate(max_moves);
+        // Lazy double-three: keep the first max_moves valid moves.
+        // Scan sorted list and accept valid moves until we have enough.
+        // This avoids truncate-then-retain which can displace defensive moves.
+        {
+            let mut valid_count = 0;
+            moves.retain(|(mov, _)| {
+                if valid_count >= max_moves {
+                    return false;
+                }
+                if is_valid_move(board, *mov, color) {
+                    valid_count += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
 
         // Futility pruning setup (reuses static_eval from shallow pruning block)
-        let futility_ok = depth <= 2 && non_terminal;
-        let futility_margin = if depth == 1 {
-            PatternScore::CLOSED_FOUR
-        } else {
-            PatternScore::OPEN_FOUR
+        let futility_ok = depth <= 3 && non_terminal;
+        let futility_margin = match depth {
+            1 => PatternScore::CLOSED_FOUR,
+            2 => PatternScore::OPEN_FOUR,
+            _ => PatternScore::OPEN_FOUR + PatternScore::OPEN_THREE, // depth 3: 110K
         };
 
         let mut best_score = -INF;
@@ -986,7 +1186,9 @@ impl WorkerSearcher {
             }
 
             // Late Move Pruning (LMP): at shallow depths, skip quiet moves entirely
-            // after trying the first few. Done BEFORE make_move to avoid overhead.
+            // after trying the first few. Done BEFORE make_move for zero overhead.
+            // Note: threshold intentionally exceeds move limits at these depths,
+            // so this mainly serves as a safety net for positions with many candidates.
             if i > 0 && depth <= 3 && i >= (3 + depth as usize * 2) && *move_score < 800_000 {
                 continue;
             }
@@ -1114,6 +1316,10 @@ impl WorkerSearcher {
                 self.history[cidx][mov.row as usize][mov.col as usize] +=
                     i32::from(depth) * i32::from(depth);
 
+                // Countermove: record best response to opponent's last move
+                let opp_idx = if color == Stone::Black { 1 } else { 0 };
+                self.countermove[opp_idx][last_move.row as usize][last_move.col as usize] = Some(*mov);
+
                 entry_type = EntryType::LowerBound;
                 break;
             }
@@ -1192,6 +1398,10 @@ impl WorkerSearcher {
             return 1_000_000;
         }
 
+        // Direct bitboard access: 1 lookup per check vs board.get()'s 2.
+        let my_bb = board.stones(color).unwrap();
+        let opp_bb = board.stones(opponent).unwrap();
+
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         let mut my_five = false;
         let mut opp_five = false;
@@ -1208,9 +1418,10 @@ impl WorkerSearcher {
         let mut opp_developing_dirs = 0i32;
 
         for (dr, dc) in dirs {
-            let (mc, mo, mc_gap, mc_consec) = Self::count_line_with_gap(board, mov, dr, dc, color);
-            let (oc, oo, oc_gap, oc_consec) =
-                Self::count_line_with_gap(board, mov, dr, dc, opponent);
+            // Merged scan: single bidirectional pass produces both my and opp patterns.
+            // Halves cell lookups vs two separate count_line_with_gap calls.
+            let (mc, mo, mc_gap, mc_consec, oc, oo, oc_gap, oc_consec) =
+                Self::count_line_both(my_bb, opp_bb, mov, dr, dc);
 
             if mc_consec >= 5 {
                 my_five = true;
@@ -1362,7 +1573,53 @@ impl WorkerSearcher {
             return 550_000 + i32::from(opp_caps) * 30_000;
         }
 
-        let capture_penalty = self.capture_vulnerability(board, mov, color);
+        // Immediate capture penalty: detect if placing here creates a pair
+        // that opponent can capture next turn or set up in 2 moves.
+        // Pattern 1: opp-ME-ally-empty → opponent plays at empty to capture (1-move, 150K)
+        // Pattern 2: empty-ME-ally-empty → both flanks open, capturable in 2 moves (50K, scales w/ caps)
+        let mut immediate_cap_penalty = 0i32;
+        {
+            let r = mov.row as i8;
+            let c = mov.col as i8;
+            let sz = BOARD_SIZE as i8;
+            let opp_caps = i32::from(board.captures(opponent));
+            let setup_weight = if opp_caps >= 3 { 100_000 } else if opp_caps >= 2 { 75_000 } else { 50_000 };
+            for &(dr, dc) in &dirs {
+                for sign in [-1i8, 1i8] {
+                    // Cells relative to mov: -1*sign, 0(mov), +1*sign, +2*sign
+                    let r1 = r - sign * dr;
+                    let c1 = c - sign * dc;
+                    let r2 = r + sign * dr;
+                    let c2 = c + sign * dc;
+                    let r3 = r + 2 * sign * dr;
+                    let c3 = c + 2 * sign * dc;
+
+                    if r1 < 0 || r1 >= sz || c1 < 0 || c1 >= sz { continue; }
+                    if r2 < 0 || r2 >= sz || c2 < 0 || c2 >= sz { continue; }
+                    if r3 < 0 || r3 >= sz || c3 < 0 || c3 >= sz { continue; }
+
+                    let p1 = Pos::new(r1 as u8, c1 as u8);
+                    let p2 = Pos::new(r2 as u8, c2 as u8);
+                    let p3 = Pos::new(r3 as u8, c3 as u8);
+
+                    let p1_empty = !my_bb.get(p1) && !opp_bb.get(p1);
+                    let p3_empty = !my_bb.get(p3) && !opp_bb.get(p3);
+
+                    // opp @ p1, ally @ p2, empty @ p3 → 1-move capture threat
+                    if opp_bb.get(p1) && my_bb.get(p2) && p3_empty {
+                        immediate_cap_penalty += 150_000;
+                    }
+                    // empty @ p1, ally @ p2, empty @ p3 → 2-move setup threat
+                    if p1_empty && my_bb.get(p2) && p3_empty {
+                        immediate_cap_penalty += setup_weight;
+                    }
+                }
+            }
+        }
+
+        let capture_penalty =
+            Self::capture_vulnerability(my_bb, opp_bb, mov, board.captures(opponent))
+            + immediate_cap_penalty;
 
         #[allow(clippy::cast_sign_loss)]
         let ply = (self.max_depth - depth).max(0) as usize;
@@ -1375,6 +1632,14 @@ impl WorkerSearcher {
             }
         }
 
+        // Countermove bonus: if this move is the best recorded response to opponent's last move
+        if let Some(lm) = self.last_move_for_ordering {
+            let opp_idx = if color == Stone::Black { 1 } else { 0 };
+            if self.countermove[opp_idx][lm.row as usize][lm.col as usize] == Some(mov) {
+                return 400_000 - capture_penalty;
+            }
+        }
+
         let cidx = if color == Stone::Black { 0 } else { 1 };
         let hist = self.history[cidx][mov.row as usize][mov.col as usize];
 
@@ -1384,7 +1649,7 @@ impl WorkerSearcher {
         let center_bonus = (18 - dist) * 25;
 
         // Proximity bonus: strongly prefer moves adjacent to existing friendly stones.
-        // This prevents scattered placement and ensures pattern-building potential.
+        // Direct bitboard: 1 lookup per neighbor vs board.get()'s 2.
         let sz = BOARD_SIZE as i8;
         let mut proximity = 0i32;
         for (dr, dc) in dirs {
@@ -1392,7 +1657,7 @@ impl WorkerSearcher {
                 let nr = mov.row as i8 + dr * sign;
                 let nc = mov.col as i8 + dc * sign;
                 if nr >= 0 && nr < sz && nc >= 0 && nc < sz
-                    && board.get(Pos::new(nr as u8, nc as u8)) == color
+                    && my_bb.get(Pos::new(nr as u8, nc as u8))
                 {
                     proximity += 200;
                 }
@@ -1459,7 +1724,10 @@ impl WorkerSearcher {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let new_pos = Pos::new(r as u8, c as u8);
 
-                    if is_valid_move(board, new_pos, color) {
+                    // Lazy double-three: only check is_empty here (2 bb ops).
+                    // Full is_valid_move (80+ bb ops for double-three) deferred to
+                    // the search loop where adaptive limits prune most candidates.
+                    if board.is_empty(new_pos) {
                         let score = self.score_move(board, new_pos, color, tt_move, depth);
                         scored.push((new_pos, score));
                     }
@@ -1472,107 +1740,222 @@ impl WorkerSearcher {
         (scored, top_score)
     }
 
-    /// Scan a line from `pos` in both directions.
-    fn count_line_with_gap(
-        board: &Board,
+    /// Scan a line from `pos` in both directions for both colors simultaneously.
+    ///
+    /// Merges two separate scans into one bidirectional pass, halving cell lookups.
+    /// Uses direct bitboard access (1 op per check) instead of board.get() (2 ops).
+    ///
+    /// Returns (my_count, my_open, my_gap, my_consec, opp_count, opp_open, opp_gap, opp_consec).
+    fn count_line_both(
+        my_bb: &Bitboard,
+        opp_bb: &Bitboard,
         pos: Pos,
         dr: i8,
         dc: i8,
-        color: Stone,
-    ) -> (i32, i32, bool, i32) {
+    ) -> (i32, i32, bool, i32, i32, i32, bool, i32) {
         let sz = BOARD_SIZE as i8;
-        let mut count = 1i32;
-        let mut open_ends = 0;
-        let mut has_gap = false;
-        let mut consec_pos = 0i32;
-        let mut consec_neg = 0i32;
 
-        // Positive direction
-        let mut r = pos.row as i8 + dr;
-        let mut c = pos.col as i8 + dc;
-        let mut counting_consecutive = true;
-        while r >= 0 && r < sz && c >= 0 && c < sz {
-            let cell = board.get(Pos::new(r as u8, c as u8));
-            if cell == color {
-                count += 1;
-                if counting_consecutive {
-                    consec_pos += 1;
+        // My color accumulators
+        let mut mc = 1i32;
+        let mut mo = 0i32;
+        let mut m_gap = false;
+        let mut mc_pos = 0i32;
+        let mut mc_neg = 0i32;
+
+        // Opponent color accumulators
+        let mut oc = 1i32;
+        let mut oo = 0i32;
+        let mut o_gap = false;
+        let mut oc_pos = 0i32;
+        let mut oc_neg = 0i32;
+
+        // === Positive direction ===
+        {
+            let mut r = pos.row as i8 + dr;
+            let mut c = pos.col as i8 + dc;
+            let mut my_active = true;
+            let mut my_consec = true;
+            let mut opp_active = true;
+            let mut opp_consec = true;
+
+            while (my_active || opp_active) && r >= 0 && r < sz && c >= 0 && c < sz {
+                let p = Pos::new(r as u8, c as u8);
+                let is_my = my_bb.get(p);
+                let is_opp = if is_my { false } else { opp_bb.get(p) };
+
+                if is_my {
+                    if my_active {
+                        mc += 1;
+                        if my_consec {
+                            mc_pos += 1;
+                        }
+                    }
+                    if opp_active {
+                        opp_active = false;
+                    }
+                } else if is_opp {
+                    if opp_active {
+                        oc += 1;
+                        if opp_consec {
+                            oc_pos += 1;
+                        }
+                    }
+                    if my_active {
+                        my_active = false;
+                    }
+                } else {
+                    // Empty cell
+                    if my_active {
+                        if !m_gap {
+                            my_consec = false;
+                            let nr = r + dr;
+                            let nc = c + dc;
+                            if nr >= 0
+                                && nr < sz
+                                && nc >= 0
+                                && nc < sz
+                                && my_bb.get(Pos::new(nr as u8, nc as u8))
+                            {
+                                m_gap = true;
+                            } else {
+                                mo += 1;
+                                my_active = false;
+                            }
+                        } else {
+                            mo += 1;
+                            my_active = false;
+                        }
+                    }
+                    if opp_active {
+                        if !o_gap {
+                            opp_consec = false;
+                            let nr = r + dr;
+                            let nc = c + dc;
+                            if nr >= 0
+                                && nr < sz
+                                && nc >= 0
+                                && nc < sz
+                                && opp_bb.get(Pos::new(nr as u8, nc as u8))
+                            {
+                                o_gap = true;
+                            } else {
+                                oo += 1;
+                                opp_active = false;
+                            }
+                        } else {
+                            oo += 1;
+                            opp_active = false;
+                        }
+                    }
                 }
+
                 r += dr;
                 c += dc;
-            } else if cell == Stone::Empty && !has_gap {
-                counting_consecutive = false;
-                let nr = r + dr;
-                let nc = c + dc;
-                if nr >= 0
-                    && nr < sz
-                    && nc >= 0
-                    && nc < sz
-                    && board.get(Pos::new(nr as u8, nc as u8)) == color
-                {
-                    has_gap = true;
-                    r += dr;
-                    c += dc;
-                    continue;
-                }
-                open_ends += 1;
-                break;
-            } else if cell == Stone::Empty {
-                open_ends += 1;
-                break;
-            } else {
-                break;
             }
         }
 
-        // Negative direction
-        r = pos.row as i8 - dr;
-        c = pos.col as i8 - dc;
-        counting_consecutive = true;
-        while r >= 0 && r < sz && c >= 0 && c < sz {
-            let cell = board.get(Pos::new(r as u8, c as u8));
-            if cell == color {
-                count += 1;
-                if counting_consecutive {
-                    consec_neg += 1;
+        // === Negative direction ===
+        {
+            let mut r = pos.row as i8 - dr;
+            let mut c = pos.col as i8 - dc;
+            let mut my_active = true;
+            let mut my_consec = true;
+            let mut opp_active = true;
+            let mut opp_consec = true;
+
+            while (my_active || opp_active) && r >= 0 && r < sz && c >= 0 && c < sz {
+                let p = Pos::new(r as u8, c as u8);
+                let is_my = my_bb.get(p);
+                let is_opp = if is_my { false } else { opp_bb.get(p) };
+
+                if is_my {
+                    if my_active {
+                        mc += 1;
+                        if my_consec {
+                            mc_neg += 1;
+                        }
+                    }
+                    if opp_active {
+                        opp_active = false;
+                    }
+                } else if is_opp {
+                    if opp_active {
+                        oc += 1;
+                        if opp_consec {
+                            oc_neg += 1;
+                        }
+                    }
+                    if my_active {
+                        my_active = false;
+                    }
+                } else {
+                    // Empty cell
+                    if my_active {
+                        if !m_gap {
+                            my_consec = false;
+                            let nr = r - dr;
+                            let nc = c - dc;
+                            if nr >= 0
+                                && nr < sz
+                                && nc >= 0
+                                && nc < sz
+                                && my_bb.get(Pos::new(nr as u8, nc as u8))
+                            {
+                                m_gap = true;
+                            } else {
+                                mo += 1;
+                                my_active = false;
+                            }
+                        } else {
+                            mo += 1;
+                            my_active = false;
+                        }
+                    }
+                    if opp_active {
+                        if !o_gap {
+                            opp_consec = false;
+                            let nr = r - dr;
+                            let nc = c - dc;
+                            if nr >= 0
+                                && nr < sz
+                                && nc >= 0
+                                && nc < sz
+                                && opp_bb.get(Pos::new(nr as u8, nc as u8))
+                            {
+                                o_gap = true;
+                            } else {
+                                oo += 1;
+                                opp_active = false;
+                            }
+                        } else {
+                            oo += 1;
+                            opp_active = false;
+                        }
+                    }
                 }
+
                 r -= dr;
                 c -= dc;
-            } else if cell == Stone::Empty && !has_gap {
-                counting_consecutive = false;
-                let nr = r - dr;
-                let nc = c - dc;
-                if nr >= 0
-                    && nr < sz
-                    && nc >= 0
-                    && nc < sz
-                    && board.get(Pos::new(nr as u8, nc as u8)) == color
-                {
-                    has_gap = true;
-                    r -= dr;
-                    c -= dc;
-                    continue;
-                }
-                open_ends += 1;
-                break;
-            } else if cell == Stone::Empty {
-                open_ends += 1;
-                break;
-            } else {
-                break;
             }
         }
 
-        let consecutive = 1 + consec_pos + consec_neg;
-        (count, open_ends, has_gap, consecutive)
+        let mc_consec = 1 + mc_pos + mc_neg;
+        let oc_consec = 1 + oc_pos + oc_neg;
+        (mc, mo, m_gap, mc_consec, oc, oo, o_gap, oc_consec)
     }
 
     /// Check if placing our stone at `mov` makes it part of a capturable pair.
-    fn capture_vulnerability(&self, board: &Board, mov: Pos, color: Stone) -> i32 {
-        let opponent = color.opponent();
+    /// Uses direct bitboard access (1 lookup) instead of board.get() (2 lookups).
+    fn capture_vulnerability(
+        my_bb: &Bitboard,
+        opp_bb: &Bitboard,
+        mov: Pos,
+        opp_captures: u8,
+    ) -> i32 {
         let sz = BOARD_SIZE as i8;
         let dirs: [(i8, i8); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
         let mut vuln_count = 0i32;
+        let mut setup_vuln_count = 0i32;
 
         for (dr, dc) in dirs {
             for sign in [-1i8, 1i8] {
@@ -1599,18 +1982,24 @@ impl WorkerSearcher {
                     && cp2 >= 0
                     && cp2 < sz
                 {
-                    let before = board.get(Pos::new(rm1 as u8, cm1 as u8));
-                    let after1 = board.get(Pos::new(rp1 as u8, cp1 as u8));
-                    let after2 = board.get(Pos::new(rp2 as u8, cp2 as u8));
+                    let p_rm1 = Pos::new(rm1 as u8, cm1 as u8);
+                    let p_rp1 = Pos::new(rp1 as u8, cp1 as u8);
+                    let p_rp2 = Pos::new(rp2 as u8, cp2 as u8);
 
-                    // opp-MOV-ally-opp: both sides occupied — opponent can't place,
-                    // so this pair is SAFE. Removed (was over-penalizing).
-                    if before == Stone::Empty && after1 == color && after2 == opponent {
+                    let rm1_empty = !my_bb.get(p_rm1) && !opp_bb.get(p_rm1);
+                    let rp2_empty = !my_bb.get(p_rp2) && !opp_bb.get(p_rp2);
+
+                    // empty-MOV-ally-opp: opponent can place at before to capture
+                    if rm1_empty && my_bb.get(p_rp1) && opp_bb.get(p_rp2) {
                         vuln_count += 1;
                     }
                     // opp-MOV-ally-empty: opponent can place at after2 to capture
-                    if before == opponent && after1 == color && after2 == Stone::Empty {
+                    if opp_bb.get(p_rm1) && my_bb.get(p_rp1) && rp2_empty {
                         vuln_count += 1;
+                    }
+                    // empty-MOV-ally-empty: 2-move capturable pair (both flanks open)
+                    if rm1_empty && my_bb.get(p_rp1) && rp2_empty {
+                        setup_vuln_count += 1;
                     }
                 }
 
@@ -1630,26 +2019,33 @@ impl WorkerSearcher {
                     && cp1 >= 0
                     && cp1 < sz
                 {
-                    let before2 = board.get(Pos::new(rm2 as u8, cm2 as u8));
-                    let before1 = board.get(Pos::new(rm1 as u8, cm1 as u8));
-                    let after = board.get(Pos::new(rp1 as u8, cp1 as u8));
+                    let p_rm2 = Pos::new(rm2 as u8, cm2 as u8);
+                    let p_rm1 = Pos::new(rm1 as u8, cm1 as u8);
+                    let p_rp1 = Pos::new(rp1 as u8, cp1 as u8);
 
-                    // opp-ally-MOV-opp: both sides occupied — opponent can't place,
-                    // so this pair is SAFE. Removed (was over-penalizing).
-                    if before2 == Stone::Empty && before1 == color && after == opponent {
+                    let rm2_empty = !my_bb.get(p_rm2) && !opp_bb.get(p_rm2);
+                    let rp1_empty = !my_bb.get(p_rp1) && !opp_bb.get(p_rp1);
+
+                    // empty-ally-MOV-opp: opponent can place at before2 to capture
+                    if rm2_empty && my_bb.get(p_rm1) && opp_bb.get(p_rp1) {
                         vuln_count += 1;
                     }
                     // opp-ally-MOV-empty: opponent can place at after to capture
-                    if before2 == opponent && before1 == color && after == Stone::Empty {
+                    if opp_bb.get(p_rm2) && my_bb.get(p_rm1) && rp1_empty {
                         vuln_count += 1;
+                    }
+                    // empty-ally-MOV-empty: 2-move capturable pair (both flanks open)
+                    if rm2_empty && my_bb.get(p_rm1) && rp1_empty {
+                        setup_vuln_count += 1;
                     }
                 }
             }
         }
 
-        if vuln_count > 0 {
-            let opp_caps = i32::from(board.captures(color.opponent()));
-            let base_penalty = 20_000; // was 8K — must compete with pattern scores
+        let total = vuln_count + setup_vuln_count;
+        if total > 0 {
+            let opp_caps = i32::from(opp_captures);
+            let base_penalty = 20_000;
             let urgency = if opp_caps >= 3 {
                 4
             } else if opp_caps >= 2 {
@@ -1657,7 +2053,8 @@ impl WorkerSearcher {
             } else {
                 1
             };
-            vuln_count * base_penalty * urgency
+            // Immediate threats get full penalty, setup threats get half
+            vuln_count * base_penalty * urgency + setup_vuln_count * (base_penalty / 2) * urgency
         } else {
             0
         }
@@ -1735,6 +2132,8 @@ impl Searcher {
             max_depth,
             killer_moves: [[None; 2]; 64],
             history: self.history,
+            countermove: [[[None; BOARD_SIZE]; BOARD_SIZE]; 2],
+            last_move_for_ordering: None,
             start_time: None,
             time_limit: None,
             stats: SearchStats::default(),
@@ -1793,7 +2192,9 @@ impl Searcher {
         self.shared.stopped.store(false, Ordering::Relaxed);
         self.max_depth = max_depth;
         let start = Instant::now();
-        let time_limit = Duration::from_millis((time_limit_ms + 300).max(800));
+        // Add completion buffer: allows iterative deepening to finish
+        // the current depth after soft limit is reached.
+        let time_limit = Duration::from_millis(time_limit_ms + 150);
 
         // Spawn helper threads (workers 1..N)
         let handles: Vec<_> = (1..self.num_threads)
@@ -1817,6 +2218,8 @@ impl Searcher {
             max_depth,
             killer_moves: [[None; 2]; 64],
             history: self.history,
+            countermove: [[[None; BOARD_SIZE]; BOARD_SIZE]; 2],
+            last_move_for_ordering: None,
             start_time: Some(start),
             time_limit: Some(time_limit),
             stats: SearchStats::default(),
@@ -1936,6 +2339,8 @@ mod tests {
             max_depth: 10,
             killer_moves: [[None; 2]; 64],
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+            countermove: [[[None; BOARD_SIZE]; BOARD_SIZE]; 2],
+            last_move_for_ordering: None,
             start_time: None,
             time_limit: None,
             stats: SearchStats::default(),
@@ -2041,6 +2446,8 @@ mod tests {
             max_depth: 10,
             killer_moves: [[None; 2]; 64],
             history: [[[0; BOARD_SIZE]; BOARD_SIZE]; 2],
+            countermove: [[[None; BOARD_SIZE]; BOARD_SIZE]; 2],
+            last_move_for_ordering: None,
             start_time: None,
             time_limit: None,
             stats: SearchStats::default(),
@@ -2201,5 +2608,195 @@ mod tests {
         assert!(result.score <= -(PatternScore::FIVE - 100),
             "White should detect Black's existing five as a loss, got score {}",
             result.score);
+    }
+
+    /// Reference implementation of count_line_with_gap (original, pre-optimization).
+    /// Used to verify count_line_both produces identical results.
+    fn ref_count_line_with_gap(
+        board: &Board,
+        pos: Pos,
+        dr: i8,
+        dc: i8,
+        color: Stone,
+    ) -> (i32, i32, bool, i32) {
+        let sz = BOARD_SIZE as i8;
+        let mut count = 1i32;
+        let mut open_ends = 0;
+        let mut has_gap = false;
+        let mut consec_pos = 0i32;
+        let mut consec_neg = 0i32;
+
+        // Positive direction
+        let mut r = pos.row as i8 + dr;
+        let mut c = pos.col as i8 + dc;
+        let mut counting_consecutive = true;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            let cell = board.get(Pos::new(r as u8, c as u8));
+            if cell == color {
+                count += 1;
+                if counting_consecutive {
+                    consec_pos += 1;
+                }
+                r += dr;
+                c += dc;
+            } else if cell == Stone::Empty && !has_gap {
+                counting_consecutive = false;
+                let nr = r + dr;
+                let nc = c + dc;
+                if nr >= 0
+                    && nr < sz
+                    && nc >= 0
+                    && nc < sz
+                    && board.get(Pos::new(nr as u8, nc as u8)) == color
+                {
+                    has_gap = true;
+                    r += dr;
+                    c += dc;
+                    continue;
+                }
+                open_ends += 1;
+                break;
+            } else if cell == Stone::Empty {
+                open_ends += 1;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        // Negative direction
+        r = pos.row as i8 - dr;
+        c = pos.col as i8 - dc;
+        counting_consecutive = true;
+        while r >= 0 && r < sz && c >= 0 && c < sz {
+            let cell = board.get(Pos::new(r as u8, c as u8));
+            if cell == color {
+                count += 1;
+                if counting_consecutive {
+                    consec_neg += 1;
+                }
+                r -= dr;
+                c -= dc;
+            } else if cell == Stone::Empty && !has_gap {
+                counting_consecutive = false;
+                let nr = r - dr;
+                let nc = c - dc;
+                if nr >= 0
+                    && nr < sz
+                    && nc >= 0
+                    && nc < sz
+                    && board.get(Pos::new(nr as u8, nc as u8)) == color
+                {
+                    has_gap = true;
+                    r -= dr;
+                    c -= dc;
+                    continue;
+                }
+                open_ends += 1;
+                break;
+            } else if cell == Stone::Empty {
+                open_ends += 1;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        let consecutive = 1 + consec_pos + consec_neg;
+        (count, open_ends, has_gap, consecutive)
+    }
+
+    #[test]
+    fn test_count_line_both_equivalence() {
+        // Test on multiple board configurations
+        let configs: Vec<Vec<(u8, u8, Stone)>> = vec![
+            // Config 1: horizontal line with gap
+            vec![
+                (9, 9, Stone::Black), (9, 10, Stone::Black), (9, 12, Stone::Black),
+                (9, 7, Stone::White), (9, 13, Stone::White),
+            ],
+            // Config 2: diagonal stones
+            vec![
+                (5, 5, Stone::Black), (6, 6, Stone::Black), (8, 8, Stone::Black),
+                (7, 7, Stone::White), (9, 9, Stone::White),
+            ],
+            // Config 3: mixed captures scenario
+            vec![
+                (10, 10, Stone::Black), (10, 11, Stone::Black), (10, 12, Stone::White),
+                (10, 13, Stone::White), (10, 14, Stone::Black),
+                (11, 10, Stone::Black), (12, 10, Stone::Black),
+            ],
+            // Config 4: dense center
+            vec![
+                (9, 8, Stone::Black), (9, 9, Stone::White), (9, 10, Stone::Black),
+                (9, 11, Stone::White), (9, 12, Stone::Black),
+                (8, 9, Stone::Black), (10, 9, Stone::Black),
+                (8, 10, Stone::White), (10, 10, Stone::White),
+            ],
+            // Config 5: edge positions
+            vec![
+                (0, 0, Stone::Black), (0, 1, Stone::Black), (0, 2, Stone::Black),
+                (1, 0, Stone::White), (1, 1, Stone::White),
+            ],
+            // Config 6: corner gap patterns
+            vec![
+                (17, 17, Stone::Black), (17, 16, Stone::Black), (17, 14, Stone::Black),
+                (18, 18, Stone::White), (16, 16, Stone::White),
+            ],
+            // Config 7: empty board (trivial)
+            vec![],
+        ];
+
+        let directions: [(i8, i8); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)];
+        let mut total_checks = 0;
+
+        for (cfg_idx, stones) in configs.iter().enumerate() {
+            let mut board = Board::new();
+            for &(r, c, color) in stones {
+                board.place_stone(Pos::new(r, c), color);
+            }
+
+            let black_bb = board.stones(Stone::Black).unwrap();
+            let white_bb = board.stones(Stone::White).unwrap();
+
+            // Check every empty position in a relevant area
+            for r in 0u8..BOARD_SIZE as u8 {
+                for c in 0u8..BOARD_SIZE as u8 {
+                    let pos = Pos::new(r, c);
+                    if board.get(pos) != Stone::Empty {
+                        continue;
+                    }
+
+                    for &(dr, dc) in &directions {
+                        // Reference: two separate calls
+                        let (bc, bo, bg, bcon) =
+                            ref_count_line_with_gap(&board, pos, dr, dc, Stone::Black);
+                        let (wc, wo, wg, wcon) =
+                            ref_count_line_with_gap(&board, pos, dr, dc, Stone::White);
+
+                        // Optimized: single merged call
+                        let (mc, mo, mg, mcon, oc, oo, og, ocon) =
+                            WorkerSearcher::count_line_both(black_bb, white_bb, pos, dr, dc);
+
+                        assert_eq!(
+                            (bc, bo, bg, bcon), (mc, mo, mg, mcon),
+                            "Black mismatch at cfg={} pos=({},{}) dir=({},{}): \
+                             ref=({},{},{},{}) new=({},{},{},{})",
+                            cfg_idx, r, c, dr, dc,
+                            bc, bo, bg, bcon, mc, mo, mg, mcon
+                        );
+                        assert_eq!(
+                            (wc, wo, wg, wcon), (oc, oo, og, ocon),
+                            "White mismatch at cfg={} pos=({},{}) dir=({},{}): \
+                             ref=({},{},{},{}) new=({},{},{},{})",
+                            cfg_idx, r, c, dr, dc,
+                            wc, wo, wg, wcon, oc, oo, og, ocon
+                        );
+                        total_checks += 1;
+                    }
+                }
+            }
+        }
+        assert!(total_checks > 5000, "Should have checked many positions, got {}", total_checks);
     }
 }

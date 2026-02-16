@@ -29,7 +29,7 @@
 use crate::board::{Board, Pos, Stone, BOARD_SIZE};
 use crate::rules::{
     can_break_five_by_capture, execute_captures_fast, find_five_break_moves,
-    find_five_positions, has_five_at_pos, is_valid_move, undo_captures,
+    find_five_line_at_pos, find_five_positions, has_five_at_pos, is_valid_move, undo_captures,
 };
 use crate::search::{SearchResult, Searcher, ThreatSearcher};
 use std::fs::OpenOptions;
@@ -265,7 +265,7 @@ impl AIEngine {
     /// Default configuration:
     /// - 64 MB transposition table
     /// - Maximum depth of 20 (iterative deepening stops at time limit)
-    /// - 1000ms time limit
+    /// - 500ms time limit
     ///
     /// # Example
     ///
@@ -280,7 +280,7 @@ impl AIEngine {
             searcher: Searcher::new(64),
             threat_searcher: ThreatSearcher::with_depths(30, 12),
             max_depth: 20,
-            time_limit_ms: 1000,
+            time_limit_ms: 500,
         }
     }
 
@@ -298,7 +298,7 @@ impl AIEngine {
     /// use gomoku::AIEngine;
     ///
     /// // High-performance configuration
-    /// let engine = AIEngine::with_config(128, 14, 1000);
+    /// let engine = AIEngine::with_config(128, 14, 500);
     /// ```
     #[must_use]
     pub fn with_config(tt_size_mb: usize, max_depth: i8, time_limit_ms: u64) -> Self {
@@ -412,47 +412,125 @@ impl AIEngine {
                     break_strs.join(", ")
                 ));
                 if valid_breaks.len() == 1 {
-                    ai_log(&format!(
-                        "  >>> FORCED BREAK: {}",
-                        pos_to_notation(valid_breaks[0])
-                    ));
-                    return MoveResult::defense(
-                        valid_breaks[0],
-                        -900_000,
-                        start.elapsed().as_millis() as u64,
-                        1,
-                    );
+                    // Check if the single break allows opponent to recreate an UNBREAKABLE five
+                    let brk = valid_breaks[0];
+                    let mut test_board = board.clone();
+                    test_board.place_stone(brk, color);
+                    let cap_info = execute_captures_fast(&mut test_board, brk, color);
+                    let mut recreates_unbreakable = false;
+                    for i in 0..cap_info.count as usize {
+                        let cap_pos = cap_info.positions[i];
+                        test_board.place_stone(cap_pos, opponent);
+                        if has_five_at_pos(&test_board, cap_pos, opponent) {
+                            // Recreation possible — check if recreated five is unbreakable
+                            if let Some(new_five) =
+                                find_five_line_at_pos(&test_board, cap_pos, opponent)
+                            {
+                                if !can_break_five_by_capture(&test_board, &new_five, opponent) {
+                                    recreates_unbreakable = true;
+                                }
+                            }
+                        }
+                        test_board.remove_stone(cap_pos);
+                        if recreates_unbreakable {
+                            break;
+                        }
+                    }
+                    if recreates_unbreakable {
+                        ai_log(&format!(
+                            "  >>> FORCED BREAK {} rejected: opponent recreates UNBREAKABLE five — falling through to alpha-beta",
+                            pos_to_notation(brk)
+                        ));
+                        // Fall through to alpha-beta for a strategic alternative
+                    } else {
+                        ai_log(&format!(
+                            "  >>> FORCED BREAK: {}",
+                            pos_to_notation(brk)
+                        ));
+                        return MoveResult::defense(
+                            brk,
+                            -900_000,
+                            start.elapsed().as_millis() as u64,
+                            1,
+                        );
+                    }
                 } else if valid_breaks.is_empty() {
                     ai_log("  Stage 0.5 BREAK FIVE: NO valid break moves — opponent wins!");
                     // Fall through to alpha-beta for best losing move
                 } else {
                     // Multiple break moves: evaluate each with quick search
-                    // to pick the best position after breaking
+                    // to pick the best position after breaking.
+                    // IMPORTANT: Check if opponent can recreate the five by replaying
+                    // at a captured position. If so, the break leads to an infinite
+                    // loop (AI breaks → opponent replays → AI breaks → ...).
+                    // Only accept breaks where recreation is impossible.
                     let mut best_move = valid_breaks[0];
                     let mut best_score = i32::MIN;
+                    let mut any_safe_break = false;
                     let mut test_board = board.clone();
                     for &brk in &valid_breaks {
                         test_board.place_stone(brk, color);
                         let cap_info = execute_captures_fast(&mut test_board, brk, color);
-                        let score = crate::eval::evaluate(&test_board, color);
-                        if score > best_score {
-                            best_score = score;
-                            best_move = brk;
+
+                        // Check if opponent can recreate an UNBREAKABLE five
+                        // Breakable recreation (cycle) is acceptable — White must break anyway
+                        let mut recreates_unbreakable = false;
+                        for i in 0..cap_info.count as usize {
+                            let cap_pos = cap_info.positions[i];
+                            test_board.place_stone(cap_pos, opponent);
+                            if has_five_at_pos(&test_board, cap_pos, opponent) {
+                                if let Some(new_five) =
+                                    find_five_line_at_pos(&test_board, cap_pos, opponent)
+                                {
+                                    if !can_break_five_by_capture(
+                                        &test_board,
+                                        &new_five,
+                                        opponent,
+                                    ) {
+                                        recreates_unbreakable = true;
+                                    }
+                                }
+                            }
+                            test_board.remove_stone(cap_pos);
+                            if recreates_unbreakable {
+                                break;
+                            }
                         }
+
+                        if !recreates_unbreakable {
+                            let score = crate::eval::evaluate(&test_board, color);
+                            if score > best_score || !any_safe_break {
+                                best_score = score;
+                                best_move = brk;
+                            }
+                            any_safe_break = true;
+                        } else {
+                            ai_log(&format!(
+                                "    Break {} rejected: opponent recreates UNBREAKABLE five",
+                                pos_to_notation(brk)
+                            ));
+                        }
+
                         undo_captures(&mut test_board, color, &cap_info);
                         test_board.remove_stone(brk);
                     }
-                    ai_log(&format!(
-                        "  >>> BEST BREAK: {} (eval={})",
-                        pos_to_notation(best_move),
-                        best_score
-                    ));
-                    return MoveResult::defense(
-                        best_move,
-                        -900_000,
-                        start.elapsed().as_millis() as u64,
-                        valid_breaks.len() as u64,
+                    if any_safe_break {
+                        ai_log(&format!(
+                            "  >>> BEST BREAK: {} (eval={})",
+                            pos_to_notation(best_move),
+                            best_score
+                        ));
+                        return MoveResult::defense(
+                            best_move,
+                            -900_000,
+                            start.elapsed().as_millis() as u64,
+                            valid_breaks.len() as u64,
+                        );
+                    }
+                    ai_log(
+                        "  Stage 0.5: All breaks lead to UNBREAKABLE recreation — falling through to alpha-beta"
                     );
+                    // Fall through to alpha-beta for best strategic move
                 }
             } else {
                 // Opponent's five is unbreakable — game should have already ended
@@ -542,7 +620,10 @@ impl AIEngine {
         // VCF remains sound when capture counts are low.
 
         // 5. Alpha-Beta search handles ALL strategy
-        let result = self.searcher.search_timed(board, color, self.max_depth, self.time_limit_ms);
+        // Adaptive time: allocate more time for critical mid-game, less for
+        // opening (simple) and late-game (narrow trees).
+        let adaptive_time = self.compute_time_limit(board);
+        let result = self.searcher.search_timed(board, color, self.max_depth, adaptive_time);
         let tt_usage = self.searcher.tt_stats().usage_percent;
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -562,6 +643,25 @@ impl AIEngine {
         ));
 
         MoveResult::from_alphabeta(result, elapsed, tt_usage)
+    }
+
+    /// Compute adaptive time limit based on game phase.
+    ///
+    /// Only reduces time in the opening where positions are simple and
+    /// deep search isn't critical. Mid-game and beyond get full time
+    /// to maintain search depth and playing strength.
+    fn compute_time_limit(&self, board: &Board) -> u64 {
+        let stones = board.stone_count();
+
+        // Only reduce time in opening — mid-game needs full depth
+        let pct = match stones {
+            0..=2 => 30,      // Very early: center/adjacent, trivial
+            3..=4 => 60,      // Opening: still simple positions
+            _ => 100,         // Mid-game+: full time for deep search
+        };
+
+        // Apply percentage with minimum floor of 300ms
+        (self.time_limit_ms * pct / 100).max(300)
     }
 
     /// Find ALL positions where `color` can win immediately.
@@ -631,9 +731,14 @@ impl AIEngine {
 
                 // Check five-in-a-row (fast, O(4 directions))
                 if has_five_at_pos(&test_board, pos, color) {
-                    // Verify opponent can't break it by capture
                     if let Some(five) = find_five_positions(&test_board, color) {
                         if !can_break_five_by_capture(&test_board, &five, color) {
+                            // Unbreakable five → immediate win
+                            return Some(pos);
+                        }
+                        // Five is STATICALLY breakable. Check if all breaks are illusory
+                        // (break captures a bracket stone, so replay creates unbreakable five).
+                        if Self::is_illusory_break(&test_board, &five, color) {
                             return Some(pos);
                         }
                     }
@@ -650,6 +755,75 @@ impl AIEngine {
             }
         }
         None
+    }
+
+    /// Check if all break captures on a five are illusory.
+    ///
+    /// A break is "illusory" when:
+    /// 1. The break capture removes a five-stone AND a bracket stone
+    /// 2. The five-holder replays the captured five-stone
+    /// 3. The recreated five is unbreakable (bracket stone gone)
+    ///
+    /// If ALL break moves are illusory, the five is effectively unbreakable
+    /// and counts as an immediate win (forced 3-ply sequence).
+    fn is_illusory_break(board: &Board, five_positions: &[Pos], five_color: Stone) -> bool {
+        let opponent = five_color.opponent();
+        let break_moves = find_five_break_moves(board, five_positions, five_color);
+
+        if break_moves.is_empty() {
+            return false;
+        }
+
+        for &break_pos in &break_moves {
+            // Simulate opponent's break capture
+            let mut sim = board.clone();
+            sim.place_stone(break_pos, opponent);
+            let cap_info = execute_captures_fast(&mut sim, break_pos, opponent);
+
+            // Find which five stones were captured
+            let mut captured_five_stone = None;
+            let mut captured_five_count = 0;
+            for i in 0..cap_info.count as usize {
+                if five_positions.contains(&cap_info.positions[i]) {
+                    captured_five_stone = Some(cap_info.positions[i]);
+                    captured_five_count += 1;
+                }
+            }
+
+            // If two or more five stones captured, can't recreate with one replay
+            if captured_five_count >= 2 {
+                return false;
+            }
+
+            let replay_pos = match captured_five_stone {
+                Some(p) => p,
+                None => return false, // Break doesn't hit five stones (shouldn't happen)
+            };
+
+            // Position must be empty after capture (it was just captured)
+            if !sim.is_empty(replay_pos) {
+                return false;
+            }
+
+            // Simulate replay
+            sim.place_stone(replay_pos, five_color);
+
+            // Check if five is recreated at replay position
+            if !has_five_at_pos(&sim, replay_pos, five_color) {
+                return false;
+            }
+
+            // Check if recreated five is now unbreakable
+            if let Some(new_five) = find_five_line_at_pos(&sim, replay_pos, five_color) {
+                if can_break_five_by_capture(&sim, &new_five, five_color) {
+                    return false; // Recreated five is still breakable → genuine break
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true // All breaks are illusory → effectively unbreakable
     }
 
     /// Set the maximum search depth for alpha-beta.
@@ -1325,11 +1499,13 @@ mod tests {
             caps.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>()
         );
 
-        // Should be detected as a defense move
-        assert_eq!(
-            result.search_type,
-            SearchType::Defense,
-            "Should be classified as defense, got {:?}",
+        // Should be classified as defense or alpha-beta (when all breaks allow
+        // opponent to recreate the five, the engine falls through to alpha-beta
+        // which still correctly chooses a break move)
+        assert!(
+            result.search_type == SearchType::Defense
+                || result.search_type == SearchType::AlphaBeta,
+            "Should be classified as Defense or AlphaBeta, got {:?}",
             result.search_type
         );
     }
@@ -1367,6 +1543,286 @@ mod tests {
             result.depth >= 8 || found_forced,
             "Depth collapse regression: expected depth 8+, got depth {} score {} ({:?})",
             result.depth, result.score, result.search_type
+        );
+    }
+
+    /// Regression test: Game 5 loss pattern - find_winning_moves must detect open four
+    /// Board state before move 14: Black has K10-L10-M10-N10 (4 consecutive on row 10)
+    /// J10 and O10 should both be detected as winning moves for Black
+    #[test]
+    fn test_game5_open_four_detection() {
+        let mut board = Board::new();
+
+        // Black stones (7): K10, L10, M10, N10, M12, M9, G9
+        board.place_stone(Pos::new(9, 9), Stone::Black); // K10
+        board.place_stone(Pos::new(9, 10), Stone::Black); // L10
+        board.place_stone(Pos::new(9, 11), Stone::Black); // M10
+        board.place_stone(Pos::new(9, 12), Stone::Black); // N10
+        board.place_stone(Pos::new(11, 11), Stone::Black); // M12
+        board.place_stone(Pos::new(8, 11), Stone::Black); // M9
+        board.place_stone(Pos::new(8, 6), Stone::Black); // G9
+
+        // White stones (6): J9, L9, K9, M11, H9, N8
+        board.place_stone(Pos::new(8, 8), Stone::White); // J9
+        board.place_stone(Pos::new(8, 10), Stone::White); // L9
+        board.place_stone(Pos::new(8, 9), Stone::White); // K9
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(8, 7), Stone::White); // H9
+        board.place_stone(Pos::new(7, 12), Stone::White); // N8
+
+        // Verify board state
+        assert_eq!(board.get(Pos::new(9, 9)), Stone::Black, "K10 should be Black");
+        assert_eq!(board.get(Pos::new(9, 10)), Stone::Black, "L10 should be Black");
+        assert_eq!(board.get(Pos::new(9, 11)), Stone::Black, "M10 should be Black");
+        assert_eq!(board.get(Pos::new(9, 12)), Stone::Black, "N10 should be Black");
+        assert!(board.is_empty(Pos::new(9, 8)), "J10 should be empty");
+        assert!(board.is_empty(Pos::new(9, 13)), "O10 should be empty");
+
+        // Test sub-functions individually
+        let j10 = Pos::new(9, 8);
+        let o10 = Pos::new(9, 13);
+
+        // 1. is_valid_move should allow both
+        assert!(is_valid_move(&board, j10, Stone::Black), "J10 should be valid for Black");
+        assert!(is_valid_move(&board, o10, Stone::Black), "O10 should be valid for Black");
+
+        // 2. has_five_at_pos should detect five after placing
+        let mut test_board = board.clone();
+        test_board.place_stone(j10, Stone::Black);
+        assert!(
+            has_five_at_pos(&test_board, j10, Stone::Black),
+            "J10 should create five-in-a-row"
+        );
+        test_board.remove_stone(j10);
+
+        test_board.place_stone(o10, Stone::Black);
+        assert!(
+            has_five_at_pos(&test_board, o10, Stone::Black),
+            "O10 should create five-in-a-row"
+        );
+        test_board.remove_stone(o10);
+
+        // 3. find_winning_moves: the fives ARE breakable (M9 at 8,11 allows capture of M10)
+        // This is CORRECT behavior — not a bug in find_winning_moves
+        let engine = AIEngine::new();
+        let threats = engine.find_winning_moves(&board, Stone::Black);
+        eprintln!("Game5 threats (breakable fives): {:?}", threats.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>());
+        // Both fives are breakable via M11-M10-M9 capture, so 0 threats is correct
+        assert_eq!(threats.len(), 0, "Fives are breakable due to M9 — should be 0 threats");
+
+        // 4. After K11 captures L10+M9, Black replays L10 → unbreakable open four
+        // This is the real bug: AI doesn't see this sequence
+        let mut post_capture = board.clone();
+        // Simulate K11 capture
+        post_capture.place_stone(Pos::new(10, 9), Stone::White); // K11
+        post_capture.remove_stone(Pos::new(9, 10)); // capture L10
+        post_capture.remove_stone(Pos::new(8, 11)); // capture M9
+        post_capture.add_captures(Stone::White, 1);
+
+        // Black replays L10
+        post_capture.place_stone(Pos::new(9, 10), Stone::Black); // L10 replay
+
+        // Now M9 is gone — fives should be UNBREAKABLE
+        let threats_after = engine.find_winning_moves(&post_capture, Stone::Black);
+        eprintln!(
+            "After K11+L10 replay threats: {:?}",
+            threats_after.iter().map(|p| pos_to_notation(*p)).collect::<Vec<_>>()
+        );
+        assert!(
+            threats_after.len() >= 2,
+            "After M9 removed, open four should have 2 unbreakable threats, got {}",
+            threats_after.len()
+        );
+    }
+
+    /// Test: AI should not play K11 in game5 position (removes defensive M9)
+    #[test]
+    fn test_game5_k11_is_good_capture() {
+        let mut board = Board::new();
+
+        // Black stones (7): K10, L10, M10, N10, M12, M9, G9
+        board.place_stone(Pos::new(9, 9), Stone::Black); // K10
+        board.place_stone(Pos::new(9, 10), Stone::Black); // L10
+        board.place_stone(Pos::new(9, 11), Stone::Black); // M10
+        board.place_stone(Pos::new(9, 12), Stone::Black); // N10
+        board.place_stone(Pos::new(11, 11), Stone::Black); // M12
+        board.place_stone(Pos::new(8, 11), Stone::Black); // M9
+        board.place_stone(Pos::new(8, 6), Stone::Black); // G9
+
+        // White stones (6): J9, L9, K9, M11, H9, N8
+        board.place_stone(Pos::new(8, 8), Stone::White); // J9
+        board.place_stone(Pos::new(8, 10), Stone::White); // L9
+        board.place_stone(Pos::new(8, 9), Stone::White); // K9
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(8, 7), Stone::White); // H9
+        board.place_stone(Pos::new(7, 12), Stone::White); // N8
+
+        let mut engine = AIEngine::with_config(20, 10, 2000);
+        let result = engine.get_move_with_stats(&board, Stone::White);
+
+        // K11 captures L10+M9, setting up M9 five threat.
+        // After K11, Black must block M9 or White wins with an unbreakable five
+        // (the five's break via O7 is illusory — recreation produces unbreakable five).
+        // AI should evaluate this position positively.
+        assert!(
+            result.score > 0,
+            "White should see winning position (K11 sets up M9 five threat), got score={}",
+            result.score
+        );
+    }
+
+    /// Test: at move 16 position, White DOES have immediate win at M9.
+    /// The M9 five's break via O7 is illusory: after O7 captures N8+M9,
+    /// White replays M9 and the recreated five is unbreakable (N8 is gone).
+    #[test]
+    fn test_game5_move16_white_immediate_win() {
+        let mut board = Board::new();
+
+        // Move 16 board state (after K11 captures L10+M9, then Black replays L10)
+        // Black (6): K10, L10, M10, N10, M12, G9
+        board.place_stone(Pos::new(9, 9), Stone::Black); // K10
+        board.place_stone(Pos::new(9, 10), Stone::Black); // L10
+        board.place_stone(Pos::new(9, 11), Stone::Black); // M10
+        board.place_stone(Pos::new(9, 12), Stone::Black); // N10
+        board.place_stone(Pos::new(11, 11), Stone::Black); // M12
+        board.place_stone(Pos::new(8, 6), Stone::Black); // G9
+        // White (7): J9, L9, K9, M11, H9, N8, K11
+        board.place_stone(Pos::new(8, 8), Stone::White); // J9
+        board.place_stone(Pos::new(8, 10), Stone::White); // L9
+        board.place_stone(Pos::new(8, 9), Stone::White); // K9
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(8, 7), Stone::White); // H9
+        board.place_stone(Pos::new(7, 12), Stone::White); // N8
+        board.place_stone(Pos::new(10, 9), Stone::White); // K11
+        board.add_captures(Stone::White, 1);
+
+        // Verify White's row 8: H9-J9-K9-L9 = 4 consecutive, M9 empty
+        assert_eq!(board.get(Pos::new(8, 7)), Stone::White, "H9");
+        assert_eq!(board.get(Pos::new(8, 8)), Stone::White, "J9");
+        assert_eq!(board.get(Pos::new(8, 9)), Stone::White, "K9");
+        assert_eq!(board.get(Pos::new(8, 10)), Stone::White, "L9");
+        assert!(board.is_empty(Pos::new(8, 11)), "M9 should be empty");
+
+        // Verify M9 creates a five
+        let m9 = Pos::new(8, 11);
+        let mut test = board.clone();
+        test.place_stone(m9, Stone::White);
+        assert!(has_five_at_pos(&test, m9, Stone::White), "M9 should create five");
+
+        // STATIC check: the five IS breakable (O7 captures N8+M9)
+        let five = find_five_positions(&test, Stone::White).unwrap();
+        assert!(
+            can_break_five_by_capture(&test, &five, Stone::White),
+            "M9 five should be STATICALLY breakable (O7 captures N8+M9)"
+        );
+        // But the break is illusory: after O7 captures, White replays M9 → unbreakable
+        assert!(
+            AIEngine::is_illusory_break(&test, &five, Stone::White),
+            "M9 five break via O7 should be illusory (recreation = unbreakable)"
+        );
+
+        // find_immediate_win should now return M9
+        let engine = AIEngine::new();
+        let win = engine.find_immediate_win(&board, Stone::White);
+        assert_eq!(
+            win,
+            Some(m9),
+            "White should have immediate win at M9 (illusory break)"
+        );
+    }
+
+    /// Test: search on post-K11-capture position — Black should see forced win
+    #[test]
+    fn test_game5_post_capture_search() {
+        let mut board = Board::new();
+
+        // Board after K11 capture (L10+M9 removed), Black's turn
+        // Black (5): K10, M10, N10, M12, G9
+        board.place_stone(Pos::new(9, 9), Stone::Black); // K10
+        board.place_stone(Pos::new(9, 11), Stone::Black); // M10
+        board.place_stone(Pos::new(9, 12), Stone::Black); // N10
+        board.place_stone(Pos::new(11, 11), Stone::Black); // M12
+        board.place_stone(Pos::new(8, 6), Stone::Black); // G9
+        // White (7): J9, L9, K9, M11, H9, N8, K11
+        board.place_stone(Pos::new(8, 8), Stone::White); // J9
+        board.place_stone(Pos::new(8, 10), Stone::White); // L9
+        board.place_stone(Pos::new(8, 9), Stone::White); // K9
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(8, 7), Stone::White); // H9
+        board.place_stone(Pos::new(7, 12), Stone::White); // N8
+        board.place_stone(Pos::new(10, 9), Stone::White); // K11
+        board.add_captures(Stone::White, 1);
+
+        // Run search for Black
+        let mut engine = AIEngine::with_config(20, 10, 2000);
+        let result = engine.get_move_with_stats(&board, Stone::Black);
+
+        eprintln!(
+            "Post-K11 Black: move={} score={} depth={} type={:?}",
+            pos_to_notation(result.best_move.unwrap()),
+            result.score,
+            result.depth,
+            result.search_type
+        );
+
+        // After K11 capture, White has 4-in-a-row on row 8 threatening M9
+        // Black's M9 block is Stage 2 defense
+        // But after M9 block, Black still has K10+M10+N10 on row 9
+        // The key question: can Black force a win from here?
+
+        // Run search for White too (to compare)
+        let mut engine2 = AIEngine::with_config(20, 10, 2000);
+        let result_w = engine2.get_move_with_stats(&board, Stone::White);
+        eprintln!(
+            "Post-K11 White: move={} score={} depth={} type={:?}",
+            pos_to_notation(result_w.best_move.unwrap()),
+            result_w.score,
+            result_w.depth,
+            result_w.search_type
+        );
+    }
+
+    /// Debug test: K11→L10 position — White's perspective at depth 8
+    /// After K11 captures L10+M9, Black replays L10. White to move.
+    /// White has M9 as immediate win (illusory break via O7).
+    /// Alpha-beta should find M9 with winning score.
+    #[test]
+    fn test_game5_k11_l10_white_perspective() {
+        let mut board = Board::new();
+
+        // Board after K11 capture + L10 replay
+        // Black (6): K10, L10, M10, N10, M12, G9
+        board.place_stone(Pos::new(9, 9), Stone::Black); // K10
+        board.place_stone(Pos::new(9, 10), Stone::Black); // L10
+        board.place_stone(Pos::new(9, 11), Stone::Black); // M10
+        board.place_stone(Pos::new(9, 12), Stone::Black); // N10
+        board.place_stone(Pos::new(11, 11), Stone::Black); // M12
+        board.place_stone(Pos::new(8, 6), Stone::Black); // G9
+        // White (7): J9, L9, K9, M11, H9, N8, K11
+        board.place_stone(Pos::new(8, 8), Stone::White); // J9
+        board.place_stone(Pos::new(8, 10), Stone::White); // L9
+        board.place_stone(Pos::new(8, 9), Stone::White); // K9
+        board.place_stone(Pos::new(10, 11), Stone::White); // M11
+        board.place_stone(Pos::new(8, 7), Stone::White); // H9
+        board.place_stone(Pos::new(7, 12), Stone::White); // N8
+        board.place_stone(Pos::new(10, 9), Stone::White); // K11
+        board.add_captures(Stone::White, 1);
+
+        // Alpha-beta should find M9 as a winning move
+        use crate::search::Searcher;
+        let mut searcher = Searcher::new(16);
+        let result = searcher.search(&board, Stone::White, 8);
+
+        let m9 = Pos::new(8, 11);
+        assert_eq!(
+            result.best_move,
+            Some(m9),
+            "Alpha-beta should find M9 as winning move"
+        );
+        assert!(
+            result.score > 900_000,
+            "M9 should be evaluated as terminal win, got score={}",
+            result.score
         );
     }
 }
