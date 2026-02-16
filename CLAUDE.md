@@ -55,7 +55,8 @@ Gomoku/
 │       ├── tt.rs           # Transposition Table
 │       └── zobrist.rs      # Zobrist hashing
 └── docs/
-    └── ARCHITECTURE.md     # Design decisions document
+    ├── CODEBASE_GUIDE.md   # Complete codebase documentation
+    └── DEFENSE.md          # Defense session preparation
 ```
 
 ## Core Architecture
@@ -244,7 +245,7 @@ make test-release         # All tests pass
 
 ## Key Design Decisions
 
-For detailed rationale and trade-offs, see `docs/ARCHITECTURE.md`:
+For detailed rationale and trade-offs, see `docs/CODEBASE_GUIDE.md`:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -335,7 +336,8 @@ cargo test --lib --release -- --test-threads=1
 | Document | Purpose |
 |----------|---------|
 | [README.md](README.md) | Project overview and quick start |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale |
+| [CODEBASE_GUIDE.md](docs/CODEBASE_GUIDE.md) | Complete codebase documentation |
+| [DEFENSE.md](docs/DEFENSE.md) | Defense session preparation |
 | [CLAUDE.md](CLAUDE.md) | Claude Code instructions (this file) |
 
 ---

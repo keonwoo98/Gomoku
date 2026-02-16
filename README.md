@@ -136,7 +136,8 @@ Gomoku/
 │       └── game_state.rs   # Game state management
 │
 └── docs/
-    └── ARCHITECTURE.md     # Design decisions document
+    ├── CODEBASE_GUIDE.md   # Complete codebase documentation
+    └── DEFENSE.md          # Defense session preparation
 ```
 
 ## Architecture Overview
@@ -285,7 +286,8 @@ cargo test --lib -- --nocapture
 |----------|-------------|
 | [README.md](README.md) | Project overview (this file) |
 | [CLAUDE.md](CLAUDE.md) | Instructions for Claude Code AI assistant |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale |
+| [CODEBASE_GUIDE.md](docs/CODEBASE_GUIDE.md) | Complete codebase documentation |
+| [DEFENSE.md](docs/DEFENSE.md) | Defense session preparation |
 
 ## Development
 
