@@ -39,7 +39,7 @@ impl PatternScore {
     /// Can capture opponent's pair next move
     pub const CAPTURE_THREAT: i32 = 8_000;
     /// Value per captured pair
-    pub const CAPTURE_PAIR: i32 = 2_000;
+    pub const CAPTURE_PAIR: i32 = 5_000;
     /// 4 pairs captured (one more = win) - must be >> OPEN_FOUR
     pub const NEAR_CAPTURE_WIN: i32 = 80_000;
 
@@ -65,7 +65,7 @@ pub fn capture_score(my_captures: u8, opp_captures: u8) -> i32 {
     // to ensure the AI treats capture accumulation as a serious strategic factor.
     const CAP_WEIGHTS: [i32; 6] = [
         0,
-        2_000,     // 1 capture: minor advantage
+        5_000,     // 1 capture: significant (> CLOSED_THREE, forces AI to avoid giving first capture)
         7_000,     // 2 captures: moderate (> CLOSED_THREE)
         20_000,    // 3 captures: serious threat (> OPEN_THREE)
         PatternScore::NEAR_CAPTURE_WIN, // 4 captures: 80K, near-winning
