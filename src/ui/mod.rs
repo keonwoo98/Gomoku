@@ -8,4 +8,4 @@ mod game_state;
 mod theme;
 
 pub use app::GomokuApp;
-pub use game_state::{GameMode, GameState};
+pub use game_state::{GameMode, GameState, OpeningRule};

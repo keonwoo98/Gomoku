@@ -5,7 +5,7 @@ use egui::{CentralPanel, Context, CornerRadius, Frame, RichText, ScrollArea, Sid
 
 use crate::Stone;
 use super::board_view::BoardView;
-use super::game_state::{GameMode, GameState, WinType};
+use super::game_state::{GameMode, GameState, OpeningRule, WinType};
 use super::theme::*;
 
 /// Main Gomoku application
@@ -13,8 +13,6 @@ pub struct GomokuApp {
     state: GameState,
     board_view: BoardView,
     show_debug: bool,
-    #[allow(dead_code)]
-    show_menu: bool,
     new_game_requested: bool,
 }
 
@@ -24,7 +22,6 @@ impl Default for GomokuApp {
             state: GameState::new(GameMode::default()),
             board_view: BoardView::default(),
             show_debug: true,
-            show_menu: false,
             new_game_requested: false,
         }
     }
@@ -41,18 +38,33 @@ impl GomokuApp {
         TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Game", |ui| {
-                    if ui.button("New Game (PvE - Black)").clicked() {
-                        self.state = GameState::new(GameMode::PvE { human_color: Stone::Black });
-                        ui.close_menu();
-                    }
-                    if ui.button("New Game (PvE - White)").clicked() {
-                        self.state = GameState::new(GameMode::PvE { human_color: Stone::White });
-                        ui.close_menu();
-                    }
-                    if ui.button("New Game (PvP)").clicked() {
-                        self.state = GameState::new(GameMode::PvP { show_suggestions: false });
-                        ui.close_menu();
-                    }
+                    ui.menu_button("New Game (PvE - Black)", |ui| {
+                        for (label, rule) in [("Standard", OpeningRule::Standard), ("Pro", OpeningRule::Pro), ("Swap", OpeningRule::Swap)] {
+                            if ui.button(label).clicked() {
+                                self.state = GameState::with_opening_rule(
+                                    GameMode::PvE { human_color: Stone::Black }, rule);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button("New Game (PvE - White)", |ui| {
+                        for (label, rule) in [("Standard", OpeningRule::Standard), ("Pro", OpeningRule::Pro), ("Swap", OpeningRule::Swap)] {
+                            if ui.button(label).clicked() {
+                                self.state = GameState::with_opening_rule(
+                                    GameMode::PvE { human_color: Stone::White }, rule);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button("New Game (PvP)", |ui| {
+                        for (label, rule) in [("Standard", OpeningRule::Standard), ("Pro", OpeningRule::Pro), ("Swap", OpeningRule::Swap)] {
+                            if ui.button(label).clicked() {
+                                self.state = GameState::with_opening_rule(
+                                    GameMode::PvP { show_suggestions: false }, rule);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("Undo").clicked() {
                         self.state.undo();
@@ -65,12 +77,17 @@ impl GomokuApp {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Show current mode
+                    // Show current mode + opening rule
+                    let rule_str = match self.state.opening_rule {
+                        OpeningRule::Standard => "",
+                        OpeningRule::Pro => " [Pro]",
+                        OpeningRule::Swap => " [Swap]",
+                    };
                     let mode_text = match self.state.mode {
                         GameMode::PvE { human_color } => {
-                            format!("PvE - You: {}", if human_color == Stone::Black { "Black" } else { "White" })
+                            format!("PvE - You: {}{}", if human_color == Stone::Black { "Black" } else { "White" }, rule_str)
                         }
-                        GameMode::PvP { .. } => "PvP - Hotseat".to_string(),
+                        GameMode::PvP { .. } => format!("PvP - Hotseat{}", rule_str),
                     };
                     ui.label(mode_text);
                 });
@@ -338,10 +355,9 @@ impl GomokuApp {
                         });
 
                     if let Some(pos) = result.best_move {
-                        let col = (b'A' + pos.col) as char;
-                        let row = 19 - pos.row;
+                        let notation = crate::engine::pos_to_notation(pos);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{}{}", col, row)).size(13.0).strong().color(TEXT_PRIMARY));
+                            ui.label(RichText::new(notation).size(13.0).strong().color(TEXT_PRIMARY));
                         });
                     }
                 });
@@ -370,49 +386,59 @@ impl GomokuApp {
                     .show(ui, |ui| {
                         Self::grid_row(ui, "Score", &score_text, score_color);
 
-                        // Time
-                        let time_str = if result.time_ms >= 1000 {
-                            format!("{:.2}s", result.time_ms as f64 / 1000.0)
-                        } else {
-                            format!("{}ms", result.time_ms)
-                        };
-                        let time_color = if result.time_ms > 500 {
-                            TIMER_CRITICAL
-                        } else if result.time_ms > 200 {
-                            TIMER_WARNING
-                        } else {
-                            TIMER_NORMAL
-                        };
-                        Self::grid_row(ui, "Time", &time_str, time_color);
+                        if result.depth > 0 {
+                            // Alpha-Beta search: show full stats
+                            let time_str = if result.time_ms >= 1000 {
+                                format!("{:.2}s", result.time_ms as f64 / 1000.0)
+                            } else {
+                                format!("{}ms", result.time_ms)
+                            };
+                            let time_color = if result.time_ms > 500 {
+                                TIMER_CRITICAL
+                            } else if result.time_ms > 200 {
+                                TIMER_WARNING
+                            } else {
+                                TIMER_NORMAL
+                            };
+                            Self::grid_row(ui, "Time", &time_str, time_color);
 
-                        // Depth
-                        let depth_color = if result.depth >= 10 {
-                            TIMER_NORMAL
-                        } else if result.depth >= 6 {
-                            TIMER_WARNING
+                            let depth_color = if result.depth >= 10 {
+                                TIMER_NORMAL
+                            } else if result.depth >= 6 {
+                                TIMER_WARNING
+                            } else {
+                                TEXT_SECONDARY
+                            };
+                            Self::grid_row(ui, "Depth", &format!("{}", result.depth), depth_color);
+
+                            let nodes_str = if result.nodes >= 1_000_000 {
+                                format!("{:.1}M", result.nodes as f64 / 1_000_000.0)
+                            } else if result.nodes >= 1_000 {
+                                format!("{:.1}K", result.nodes as f64 / 1_000.0)
+                            } else {
+                                format!("{}", result.nodes)
+                            };
+                            Self::grid_row(ui, "Nodes", &nodes_str, TEXT_SECONDARY);
+
+                            if result.nps > 0 {
+                                Self::grid_row(ui, "Speed", &format!("{} kN/s", result.nps), TEXT_SECONDARY);
+                            }
+                            if result.tt_usage > 0 {
+                                Self::grid_row(ui, "TT Hit", &format!("{}%", result.tt_usage), TEXT_SECONDARY);
+                            }
                         } else {
-                            TEXT_SECONDARY
-                        };
-                        Self::grid_row(ui, "Depth", &format!("{}", result.depth), depth_color);
+                            // Non-search move (Immediate Win, VCF, Defense): show context
+                            Self::grid_row(ui, "Detection", "Instant", TIMER_NORMAL);
 
-                        // Nodes
-                        let nodes_str = if result.nodes >= 1_000_000 {
-                            format!("{:.1}M", result.nodes as f64 / 1_000_000.0)
-                        } else if result.nodes >= 1_000 {
-                            format!("{:.1}K", result.nodes as f64 / 1_000.0)
-                        } else {
-                            format!("{}", result.nodes)
-                        };
-                        Self::grid_row(ui, "Nodes", &nodes_str, TEXT_SECONDARY);
-
-                        // Speed
-                        if result.nps > 0 {
-                            Self::grid_row(ui, "Speed", &format!("{} kN/s", result.nps), TEXT_SECONDARY);
-                        }
-
-                        // TT usage
-                        if result.tt_usage > 0 {
-                            Self::grid_row(ui, "TT Hit", &format!("{}%", result.tt_usage), TEXT_SECONDARY);
+                            // Show last alpha-beta search stats for context
+                            let stats = &self.state.ai_stats;
+                            let last_search = stats.move_depths.iter().zip(stats.move_times.iter())
+                                .rev()
+                                .find(|(&d, _)| d > 0);
+                            if let Some((&depth, &time)) = last_search {
+                                let prev_str = format!("d{}, {}ms", depth, time);
+                                Self::grid_row(ui, "Prev Search", &prev_str, TEXT_MUTED);
+                            }
                         }
                     });
             } else {
@@ -430,7 +456,8 @@ impl GomokuApp {
                     .min_col_width(ui.available_width() / 2.0 - 8.0)
                     .spacing([8.0, 2.0])
                     .show(ui, |ui| {
-                        Self::grid_row(ui, "AI Moves", &format!("{}", stats.move_count), TEXT_PRIMARY);
+                        let search_count = stats.move_depths.iter().filter(|&&d| d > 0).count();
+                        Self::grid_row(ui, "AI Moves", &format!("{} ({} search)", stats.move_count, search_count), TEXT_PRIMARY);
 
                         // Average time
                         let avg = stats.avg_time_ms();
@@ -449,7 +476,8 @@ impl GomokuApp {
                         Self::grid_row(ui, "Avg Time", &avg_str, avg_color);
 
                         // Min/Max time
-                        Self::grid_row(ui, "Time Range", &format!("{} - {}ms", stats.min_time_ms, stats.max_time_ms), TEXT_SECONDARY);
+                        let (search_min, search_max) = stats.search_time_range();
+                        Self::grid_row(ui, "Time Range", &format!("{} - {}ms", search_min, search_max), TEXT_SECONDARY);
 
                         // Average depth
                         Self::grid_row(ui, "Avg Depth", &format!("{:.1}", stats.avg_depth()), TEXT_SECONDARY);
@@ -497,23 +525,20 @@ impl GomokuApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
-                // Winner info + New Game button
+                // Winner info + New Game button (separate rows to avoid overlap)
                 ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), egui::Sense::hover());
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), egui::Sense::hover());
                     let center = rect.center();
                     let stone_color = if is_black {
                         egui::Color32::from_rgb(30, 30, 35)
                     } else {
                         egui::Color32::from_rgb(245, 245, 248)
                     };
-                    ui.painter().circle_filled(center, 11.0, stone_color);
-                    ui.painter().circle_stroke(center, 11.0, egui::Stroke::new(1.5, WIN_HIGHLIGHT));
+                    ui.painter().circle_filled(center, 9.0, stone_color);
+                    ui.painter().circle_stroke(center, 9.0, egui::Stroke::new(1.5, WIN_HIGHLIGHT));
 
                     ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(format!("{} WINS!", winner)).size(14.0).strong().color(TEXT_PRIMARY));
-                        ui.label(RichText::new(format!("by {}", win_type)).size(10.0).color(TEXT_SECONDARY));
-                    });
+                    ui.label(RichText::new(format!("{} WINS!", winner)).size(14.0).strong().color(TEXT_PRIMARY));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("New Game").clicked() {
@@ -521,6 +546,15 @@ impl GomokuApp {
                         }
                     });
                 });
+                // Win details on separate line
+                let move_count = self.state.move_history.len();
+                let last_info = if let Some(pos) = self.state.last_move {
+                    let notation = crate::engine::pos_to_notation(pos);
+                    format!("by {} at {} (move #{})", win_type, notation, move_count)
+                } else {
+                    format!("by {}", win_type)
+                };
+                ui.label(RichText::new(last_info).size(10.0).color(TEXT_SECONDARY));
 
                 // Review navigation - compact inline
                 let total = self.state.move_history.len();
@@ -593,8 +627,8 @@ impl GomokuApp {
                 self.state.capture_animation.as_ref(),
             );
 
-            // Handle click (only when not reviewing)
-            if !self.state.is_reviewing() {
+            // Handle click (only when not reviewing and no swap pending)
+            if !self.state.is_reviewing() && !self.state.swap_pending {
                 if let Some(pos) = clicked {
                     if let Err(msg) = self.state.try_place_stone(pos) {
                         self.state.message = Some(msg);
@@ -602,6 +636,36 @@ impl GomokuApp {
                 }
             }
         });
+    }
+
+    /// Render swap rule dialog overlay
+    fn render_swap_dialog(&mut self, ctx: &Context) {
+        egui::Area::new(egui::Id::new("swap_dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(egui::Color32::from_rgb(35, 40, 50))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(24, 18))
+                    .stroke(egui::Stroke::new(2.0, ACCENT_BLUE))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Swap Rule").size(16.0).strong().color(ACCENT_BLUE));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Do you want to swap colors?").size(13.0).color(TEXT_PRIMARY));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if ui.button(RichText::new("  Yes, Swap  ").size(13.0)).clicked() {
+                                    self.state.execute_swap();
+                                }
+                                ui.add_space(12.0);
+                                if ui.button(RichText::new("  No, Continue  ").size(13.0)).clicked() {
+                                    self.state.decline_swap();
+                                }
+                            });
+                        });
+                    });
+            });
     }
 
     /// Handle keyboard shortcuts
@@ -671,9 +735,19 @@ impl eframe::App for GomokuApp {
             }
         }
 
-        // Start AI thinking if needed
-        if self.state.is_ai_turn() && !self.state.is_ai_thinking() && self.state.game_over.is_none() {
+        // Start AI thinking if needed (not during swap decision)
+        if self.state.is_ai_turn() && !self.state.is_ai_thinking() && self.state.game_over.is_none() && !self.state.swap_pending {
             self.state.start_ai_thinking();
+        }
+
+        // Auto-decide swap for AI in PvE mode
+        if self.state.swap_pending {
+            if let GameMode::PvE { human_color } = self.state.mode {
+                if self.state.current_turn != human_color {
+                    // AI decides: always swap (takes initiative)
+                    self.state.execute_swap();
+                }
+            }
         }
 
         // Render UI
@@ -681,8 +755,13 @@ impl eframe::App for GomokuApp {
         self.render_side_panel(ctx);
         self.render_board(ctx);
 
-        // Request repaint if animation is playing, AI is thinking, or message shown
-        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() || self.state.message.is_some() {
+        // Swap dialog overlay (only for human decision)
+        if self.state.swap_pending {
+            self.render_swap_dialog(ctx);
+        }
+
+        // Request repaint if animation is playing, AI is thinking, swap pending, or message shown
+        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() || self.state.message.is_some() || self.state.swap_pending {
             ctx.request_repaint();
         }
     }

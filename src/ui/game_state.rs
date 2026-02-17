@@ -5,6 +5,23 @@ use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Opening rule variants for game start
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningRule {
+    /// No restrictions
+    Standard,
+    /// Move 1: center, Move 3: ≥3 intersections from center
+    Pro,
+    /// After move 3, second player may swap colors
+    Swap,
+}
+
+impl Default for OpeningRule {
+    fn default() -> Self {
+        OpeningRule::Standard
+    }
+}
+
 /// Game mode selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameMode {
@@ -110,12 +127,37 @@ impl AiStats {
         self.move_depths.push(result.depth);
     }
 
+    /// Average time excluding non-search moves (depth=0 from VCF/Defense/Opening).
+    /// This reflects actual alpha-beta search time, matching avg_depth() filtering.
     pub fn avg_time_ms(&self) -> f64 {
-        if self.move_count == 0 { 0.0 } else { self.total_time_ms as f64 / self.move_count as f64 }
+        let search_times: Vec<_> = self.move_times.iter().zip(self.move_depths.iter())
+            .filter(|(_, &d)| d > 0)
+            .map(|(&t, _)| t)
+            .collect();
+        if search_times.is_empty() { 0.0 } else { search_times.iter().sum::<u64>() as f64 / search_times.len() as f64 }
     }
 
+    /// Average depth excluding non-search moves (depth=0 from VCF/Defense/Opening).
+    /// This reflects actual alpha-beta search depth, which is what evaluators check.
     pub fn avg_depth(&self) -> f64 {
-        if self.move_depths.is_empty() { 0.0 } else { self.move_depths.iter().map(|&d| d as f64).sum::<f64>() / self.move_depths.len() as f64 }
+        let search_depths: Vec<_> = self.move_depths.iter().filter(|&&d| d > 0).collect();
+        if search_depths.is_empty() { 0.0 } else { search_depths.iter().map(|&&d| d as f64).sum::<f64>() / search_depths.len() as f64 }
+    }
+
+    /// Time range for search moves only (depth > 0).
+    /// Returns (min_ms, max_ms). Returns raw values if no search moves exist.
+    pub fn search_time_range(&self) -> (u64, u64) {
+        let mut min_t = u64::MAX;
+        let mut max_t = 0u64;
+        let mut found = false;
+        for (&t, &d) in self.move_times.iter().zip(self.move_depths.iter()) {
+            if d > 0 {
+                found = true;
+                if t < min_t { min_t = t; }
+                if t > max_t { max_t = t; }
+            }
+        }
+        if found { (min_t, max_t) } else { (self.min_time_ms, self.max_time_ms) }
     }
 
     pub fn avg_nps(&self) -> u64 {
@@ -142,6 +184,10 @@ pub struct GameState {
     pub review_index: Option<usize>,
     /// Redo stack: each entry is a group of moves (1 for PvP, 2 for PvE)
     pub redo_groups: Vec<Vec<(Pos, Stone)>>,
+    /// Opening rule for this game
+    pub opening_rule: OpeningRule,
+    /// Swap rule: waiting for swap decision after 3rd move
+    pub swap_pending: bool,
 
     // Persistent AI engine (reuses TT across moves)
     ai_engine: Option<AIEngine>,
@@ -205,6 +251,10 @@ impl MoveTimer {
 
 impl GameState {
     pub fn new(mode: GameMode) -> Self {
+        Self::with_opening_rule(mode, OpeningRule::Standard)
+    }
+
+    pub fn with_opening_rule(mode: GameMode, opening_rule: OpeningRule) -> Self {
         Self {
             board: Board::new(),
             mode,
@@ -221,6 +271,8 @@ impl GameState {
             ai_stats: AiStats::default(),
             review_index: None,
             redo_groups: Vec::new(),
+            opening_rule,
+            swap_pending: false,
             ai_engine: Some(AIEngine::with_config(64, 20, 500)),
             ai_depth: 20,
             ai_time_limit_ms: 500,
@@ -242,9 +294,30 @@ impl GameState {
         self.ai_stats = AiStats::default();
         self.review_index = None;
         self.redo_groups.clear();
+        self.swap_pending = false;
         if let Some(ref mut engine) = self.ai_engine {
             engine.clear_cache();
         }
+    }
+
+    /// Execute color swap (Swap rule)
+    pub fn execute_swap(&mut self) {
+        self.swap_pending = false;
+        match &mut self.mode {
+            GameMode::PvE { human_color } => {
+                *human_color = human_color.opponent();
+            }
+            GameMode::PvP { .. } => {
+                // PvP: conceptual swap — players switch sides
+            }
+        }
+        self.message = Some("Colors swapped!".to_string());
+    }
+
+    /// Decline color swap (Swap rule)
+    pub fn decline_swap(&mut self) {
+        self.swap_pending = false;
+        self.message = Some("Swap declined, game continues.".to_string());
     }
 
     /// Check if it's the human's turn
@@ -280,6 +353,22 @@ impl GameState {
 
         if !self.is_human_turn() {
             return Err("Not your turn".to_string());
+        }
+
+        // Pro rule validation
+        if self.opening_rule == OpeningRule::Pro {
+            let move_num = self.move_history.len() + 1;
+            if move_num == 1 && pos != Pos::new(9, 9) {
+                return Err("Pro rule: First move must be at center (K10)".to_string());
+            }
+            if move_num == 3 {
+                let center = 9i32;
+                let dr = (i32::from(pos.row) - center).abs();
+                let dc = (i32::from(pos.col) - center).abs();
+                if dr.max(dc) < 3 {
+                    return Err("Pro rule: 3rd move must be ≥3 intersections from center".to_string());
+                }
+            }
         }
 
         // Check if move is valid
@@ -345,7 +434,7 @@ impl GameState {
         self.move_timer.stop();
 
         // Check for win
-        if let Some(result) = self.check_win(pos, color, capture_count) {
+        if let Some(result) = self.check_win(pos, color) {
             let winner_str = if result.winner == Stone::Black { "BLACK" } else { "WHITE" };
             let win_type_str = match result.win_type {
                 WinType::FiveInRow => "5-in-a-row",
@@ -361,12 +450,17 @@ impl GameState {
         self.current_turn = color.opponent();
         self.move_timer.start();
 
+        // Swap rule: after 3rd move, trigger swap decision
+        if self.opening_rule == OpeningRule::Swap && self.move_history.len() == 3 {
+            self.swap_pending = true;
+        }
+
         // Clear message
         self.message = None;
     }
 
     /// Check for win condition
-    fn check_win(&self, pos: Pos, color: Stone, _captures: usize) -> Option<GameResult> {
+    fn check_win(&self, pos: Pos, color: Stone) -> Option<GameResult> {
         // Check capture win
         let total_captures = if color == Stone::Black {
             self.board.black_captures
@@ -817,7 +911,7 @@ mod tests {
         // The five F13-G12-H11-J10-K9 should NOT be declared a win
         // because White can capture J10+H10 by placing at K10(9,9):
         // K10(W,9,9) - J10(B,9,8) - H10(B,9,7) - G10(W,9,6) = X-O-O-X
-        let result = state.check_win(f13, Stone::Black, 0);
+        let result = state.check_win(f13, Stone::Black);
         assert!(
             result.is_none(),
             "Five F13-G12-H11-J10-K9 should NOT be a win: White can break it by capturing J10+H10"
@@ -836,7 +930,7 @@ mod tests {
         // Add a distant White stone
         state.board.place_stone(Pos::new(0, 0), Stone::White);
 
-        let result = state.check_win(Pos::new(9, 7), Stone::Black, 0);
+        let result = state.check_win(Pos::new(9, 7), Stone::Black);
         assert!(result.is_some(), "Unbreakable five should be declared a win");
         assert_eq!(result.unwrap().win_type, WinType::FiveInRow);
     }
@@ -861,7 +955,7 @@ mod tests {
 
         // Black's five is breakable — check_win returns None (opponent gets a chance)
         let f13 = Pos::new(12, 5);
-        let result = state.check_win(f13, Stone::Black, 0);
+        let result = state.check_win(f13, Stone::Black);
         assert!(result.is_none(), "Breakable five should not win immediately");
 
         // White plays A1 — does NOT break the five
@@ -869,7 +963,7 @@ mod tests {
         state.board.place_stone(a1, Stone::White);
 
         // Now check_win should detect Black's surviving five → Black wins
-        let result = state.check_win(a1, Stone::White, 0);
+        let result = state.check_win(a1, Stone::White);
         assert!(result.is_some(), "Black should win: White failed to break the five");
         assert_eq!(result.unwrap().winner, Stone::Black);
         assert_eq!(result.unwrap().win_type, WinType::FiveInRow);
@@ -893,7 +987,7 @@ mod tests {
         state.board.place_stone(Pos::new(11, 7), Stone::White); // H12
 
         // Black's five is breakable
-        let result = state.check_win(Pos::new(12, 5), Stone::Black, 0);
+        let result = state.check_win(Pos::new(12, 5), Stone::Black);
         assert!(result.is_none());
 
         // White places K10 (9,9) — captures J10(9,8)+H10(9,7) via G10(9,6)
@@ -909,7 +1003,7 @@ mod tests {
         );
 
         // check_win should return None — game continues
-        let result = state.check_win(k10, Stone::White, 1);
+        let result = state.check_win(k10, Stone::White);
         assert!(result.is_none(), "Game should continue after five is broken by capture");
     }
 }

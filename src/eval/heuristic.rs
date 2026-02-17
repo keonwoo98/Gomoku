@@ -28,6 +28,34 @@ const MAX_CENTER_DIST: i32 = 18;
 /// At weight 8: center stone gets 144pts, corner gets 0 — significant vs CLOSED_TWO (50).
 const POSITION_WEIGHT: i32 = 8;
 
+/// Game phase for dynamic heuristic weighting.
+/// Different phases emphasize different evaluation aspects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GamePhase {
+    Opening,  // 0-10 total stones+captures: position matters most
+    Midgame,  // 11-40: balanced evaluation
+    Endgame,  // 41+: captures and vulnerability matter most
+}
+
+/// Detect game phase from board state (color-independent for negamax symmetry).
+fn detect_phase(board: &Board) -> GamePhase {
+    let total = board.stone_count()
+        + (board.captures(Stone::Black) as u32 + board.captures(Stone::White) as u32) * 2;
+    match total {
+        0..=10 => GamePhase::Opening,
+        11..=40 => GamePhase::Midgame,
+        _ => GamePhase::Endgame,
+    }
+}
+
+/// Phase-dependent weight multipliers: (position, vulnerability, capture_score).
+/// 100 = 1.0x baseline. Uses integer math to avoid float overhead.
+const PHASE_WEIGHTS: [(i32, i32, i32); 3] = [
+    (150, 50, 80),   // Opening: position emphasis, low vuln/capture weight
+    (100, 100, 100),  // Midgame: balanced (baseline)
+    (60, 150, 130),   // Endgame: position de-emphasized, vuln/capture critical
+];
+
 /// Evaluate the board from the perspective of the given color.
 ///
 /// Returns a score where:
@@ -57,16 +85,22 @@ pub fn evaluate(board: &Board, color: Stone) -> i32 {
         return -PatternScore::FIVE;
     }
 
+    let phase = detect_phase(board);
+    let (pos_mul, vuln_mul, cap_mul) = PHASE_WEIGHTS[phase as usize];
+
     let cap_score = capture_score(board.captures(color), board.captures(opponent));
+    let cap_score = cap_score * cap_mul / 100;
 
     // Single-pass evaluation per color: patterns + position + vulnerability combined.
     // SYMMETRIC for negamax: evaluate(board, Black) == -evaluate(board, White).
-    let (my_score, my_vuln) = evaluate_color(board, color);
-    let (opp_score, opp_vuln) = evaluate_color(board, opponent);
+    // pos_mul applied identically to both sides → factors out of (my - opp).
+    let (my_score, my_vuln) = evaluate_color(board, color, pos_mul);
+    let (opp_score, opp_vuln) = evaluate_color(board, opponent, pos_mul);
 
     let my_caps = board.captures(color);
     let opp_caps = board.captures(opponent);
-    let vuln_penalty = my_vuln * vuln_weight(opp_caps) - opp_vuln * vuln_weight(my_caps);
+    let vuln_penalty =
+        (my_vuln * vuln_weight(opp_caps) - opp_vuln * vuln_weight(my_caps)) * vuln_mul / 100;
 
     cap_score + (my_score - opp_score) - vuln_penalty
 }
@@ -99,7 +133,7 @@ fn vuln_weight(opp_captures: u8) -> i32 {
 ///
 /// Returns (total_score, vulnerable_pair_count).
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
+fn evaluate_color(board: &Board, color: Stone, pos_mul: i32) -> (i32, i32) {
     let Some(my_bb) = board.stones(color) else {
         return (0, 0);
     };
@@ -148,9 +182,9 @@ fn evaluate_color(board: &Board, color: Stone) -> (i32, i32) {
             }
         }
 
-        // --- Position bonus (center control) ---
+        // --- Position bonus (center control, phase-adjusted) ---
         let dist = (i32::from(pos.row) - center).abs() + (i32::from(pos.col) - center).abs();
-        score += (MAX_CENTER_DIST - dist) * POSITION_WEIGHT;
+        score += (MAX_CENTER_DIST - dist) * POSITION_WEIGHT * pos_mul / 100;
 
         // --- Connectivity bonus: unidirectional (positive only) ---
         // Each adjacent pair counted once from the stone with lower dir offset.
@@ -574,6 +608,12 @@ mod tests {
     fn test_evaluate_near_capture_win() {
         let mut board = Board::new();
         board.add_captures(Stone::Black, 4);
+        // Add stones to make the position realistic (midgame/endgame phase)
+        // so phase-dependent capture scoring doesn't reduce the value
+        for i in 0..10 {
+            board.place_stone(Pos::new(i, 0), Stone::Black);
+            board.place_stone(Pos::new(i, 18), Stone::White);
+        }
 
         let score = evaluate(&board, Stone::Black);
         assert!(

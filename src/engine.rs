@@ -1,11 +1,14 @@
 //! Main AI Engine integrating all search components
 //!
 //! This module provides the main AI engine that orchestrates all search algorithms
-//! to find the best move in any given position. The search follows a priority system:
+//! to find the best move in any given position. The search follows a priority pipeline:
 //!
-//! 1. **Immediate win**: Check for any move that wins instantly
-//! 2. **VCF (Victory by Continuous Fours)**: Search for forced wins using four-threats
-//! 3. **Alpha-Beta**: Full search with move ordering that prioritizes blocking threats
+//! 0. **Opening book**: Fast early-game responses (center on empty board)
+//! 0.5. **Break five**: Break opponent's breakable five via capture
+//! 1. **Immediate win**: Check for any move that wins instantly (5-in-a-row or capture)
+//! 2. **Block opponent**: Block opponent's immediate winning move
+//! 3-4. **VCF**: Victory by Continuous Fours (both sides)
+//! 5. **Alpha-Beta**: Full search with iterative deepening and time management
 //!
 //! # Example
 //!
@@ -376,11 +379,20 @@ impl AIEngine {
         let move_num = board.stone_count() + total_captured + 1;
         let color_str = if color == Stone::Black { "Black" } else { "White" };
 
+        // Dynamic heuristic phase detection
+        let phase_total = board.stone_count()
+            + (board.captures(Stone::Black) as u32 + board.captures(Stone::White) as u32) * 2;
+        let phase_str = match phase_total {
+            0..=10 => "Opening",
+            11..=40 => "Midgame",
+            _ => "Endgame",
+        };
+
         let separator = "=".repeat(60);
         ai_log(&format!(
-            "\n{}\n[Move #{} | AI: {} | Stones: {} | B-cap: {} W-cap: {}]",
+            "\n{}\n[Move #{} | AI: {} | Stones: {} | B-cap: {} W-cap: {} | Phase: {}]",
             separator, move_num, color_str, board.stone_count(),
-            board.captures(Stone::Black), board.captures(Stone::White)
+            board.captures(Stone::Black), board.captures(Stone::White), phase_str
         ));
 
         // 0. Opening book for fast early game response
@@ -838,10 +850,8 @@ impl AIEngine {
         self.max_depth = depth;
     }
 
-    /// Set the time limit for search.
-    ///
-    /// Note: Time management is not yet fully implemented.
-    /// This sets the target time limit for future use.
+    /// Set the time limit for alpha-beta search (milliseconds).
+    /// The search uses iterative deepening with soft/hard limits derived from this value.
     ///
     /// # Arguments
     ///

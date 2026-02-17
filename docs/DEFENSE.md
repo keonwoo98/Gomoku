@@ -627,6 +627,28 @@ for &(dr, dc) in &DIRECTIONS {  // 4 positive half-directions
 
 **한국어 설명**: 중앙 돌은 +144점, 코너 돌은 0점. POSITION_WEIGHT=8로 산발적 배치를 방지. 인접 동색 돌 쌍마다 +160점 (단방향 카운트로 중복 없음).
 
+### 2.7 Dynamic Heuristic (Game Phase Detection)
+
+The evaluation function dynamically adjusts weights based on game phase:
+
+```rust
+enum GamePhase { Opening, Midgame, Endgame }
+fn detect_phase(board: &Board) -> GamePhase {
+    let total = stone_count + captured_stones * 2;
+    match total { 0..=10 => Opening, 11..=40 => Midgame, _ => Endgame }
+}
+```
+
+| Phase | Position Weight | Vulnerability Weight | Capture Weight |
+|-------|----------------|---------------------|----------------|
+| Opening | 1.5x | 0.5x | 0.8x |
+| Midgame | 1.0x (baseline) | 1.0x | 1.0x |
+| Endgame | 0.6x | 1.5x | 1.3x |
+
+**Negamax symmetry**: `detect_phase(board)` is color-independent. All weights apply symmetrically to both sides.
+
+**한국어 설명**: Opening에서는 중앙 위치 선점이 중요하고, Endgame에서는 캡처 위협과 취약성이 결정적입니다. 모든 가중치가 양쪽에 동일하게 적용되어 Negamax 대칭성이 보장됩니다.
+
 ---
 
 ## 3. Game Rules Implementation
@@ -716,7 +738,17 @@ pub fn is_double_three(board, pos, stone) -> bool {
 
 **한국어 설명**: 쌍삼 금지 — 한 수로 2개 이상의 프리 쓰리를 만드는 것은 금지. 캡처를 수행하는 수는 예외.
 
-### 3.4 Test Coverage
+### 3.4 Opening Rules (Starting Conditions)
+
+The game supports three opening rules selectable at game start:
+
+- **Standard**: No restrictions, free placement
+- **Pro**: Move 1 must be at center (K10), Move 3 must be ≥3 intersections from center
+- **Swap**: After 3 moves, White player can choose to swap colors
+
+**한국어 설명**: Standard는 제한 없음, Pro는 첫 수 중앙/3수째 중앙 3칸 이상, Swap은 3수 후 색상 교환 선택.
+
+### 3.5 Test Coverage
 
 **196 tests** covering all rules:
 

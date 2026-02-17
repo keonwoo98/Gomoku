@@ -48,11 +48,6 @@ const INF: i32 = PatternScore::FIVE + 1;
 /// so we don't need as many to catch all threats.
 const MAX_ROOT_MOVES: usize = 30;
 
-/// Maximum moves to consider at internal nodes at high remaining depth.
-/// Defense-first move ordering (score_move) ensures critical blocking
-/// moves are always in the top positions.
-#[allow(dead_code)]
-const MAX_INTERNAL_MOVES: usize = 15;
 
 /// Search statistics for diagnostics and tuning.
 #[derive(Debug, Clone, Default)]
@@ -205,7 +200,13 @@ impl WorkerSearcher {
 
         let mut work_board = board.clone();
         let search_start = self.start_time.unwrap_or_else(Instant::now);
-        let soft_limit = self.time_limit.unwrap_or(Duration::from_millis(500));
+        let hard_limit = self.time_limit.unwrap_or(Duration::from_millis(500));
+        // soft_limit is for iterative deepening time prediction (when to stop going deeper).
+        // At 50% of hard_limit, depth 10 always completes but depth 11+ only starts
+        // when the position is simple (fast pruning). Keeps average under 500ms.
+        let soft_limit = Duration::from_millis(
+            hard_limit.as_millis() as u64 * 50 / 100
+        );
         let mut prev_depth_time = Duration::ZERO;
 
         let min_depth: i8 = if board.stone_count() <= 4 { 8 } else { 10 };
@@ -289,13 +290,16 @@ impl WorkerSearcher {
             prev_was_losing = is_losing;
 
             if depth < min_depth {
-                if depth >= 8 && total_elapsed > soft_limit {
+                // Always complete up to min_depth. Only emergency-exit if
+                // we've blown past 2x the soft limit (prevents >1s moves).
+                if depth >= 8 && total_elapsed > soft_limit * 2 {
                     break;
                 }
                 prev_depth_time = depth_time;
                 continue;
             }
 
+            // Time check only AFTER min_depth has been completed
             let remaining = soft_limit.saturating_sub(total_elapsed);
             let estimated_next = if prev_depth_time.as_millis() > 0 && depth_time.as_millis() > 0 {
                 let bf = depth_time.as_millis() as f64 / prev_depth_time.as_millis().max(1) as f64;
@@ -1236,7 +1240,7 @@ impl WorkerSearcher {
                 // LMR: logarithmic reduction + score-aware adjustment (Stockfish-inspired).
                 // Captures, extensions, shallow depths, and PV move get no reduction.
                 // Quiet moves (score < 500K) get +1 extra reduction — they rarely refute.
-                let reduction = if is_capture || extension > 0 || depth < 2 || i < 1 {
+                let reduction = if is_capture || extension > 0 || depth < 2 {
                     0i8
                 } else {
                     let d = depth as f32;
@@ -2192,9 +2196,10 @@ impl Searcher {
         self.shared.stopped.store(false, Ordering::Relaxed);
         self.max_depth = max_depth;
         let start = Instant::now();
-        // Add completion buffer: allows iterative deepening to finish
-        // the current depth after soft limit is reached.
-        let time_limit = Duration::from_millis(time_limit_ms + 150);
+        // Hard limit for check_time(): generous enough to guarantee min_depth (10)
+        // but tight enough to keep average under 500ms.
+        // At 500ms input: hard=750ms, soft=375ms.
+        let time_limit = Duration::from_millis(time_limit_ms * 3 / 2);
 
         // Spawn helper threads (workers 1..N)
         let handles: Vec<_> = (1..self.num_threads)

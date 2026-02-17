@@ -15,6 +15,7 @@
 - **VCF threat search** for forced win detection via continuous fours
 - **Transposition Table** with Zobrist hashing (incremental O(1) updates)
 - **Move ordering** with killer moves, history heuristic, and countermove heuristic
+- **Dynamic heuristic** with game-phase detection (Opening/Midgame/Endgame weight adjustment)
 
 ### Search Optimizations
 - **Null Move Pruning (NMP)** — skip turn + reduced search, 80% node reduction
@@ -36,6 +37,7 @@
 - **Illusory break detection** (break that leads to unbreakable recreation = forced win)
 - **Double-three forbidden** (creating two open-threes simultaneously is illegal)
 - **Capture exception** (double-three via capture is allowed)
+- **Opening rules** support (Standard, Pro, Swap)
 
 ### Performance
 - **< 0.5 seconds** average response time per move
@@ -133,7 +135,10 @@ Gomoku/
 │   │
 │   └── ui/                 # GUI application
 │       ├── mod.rs          # Module exports
-│       └── game_state.rs   # Game state management
+│       ├── app.rs          # Main application and side panel
+│       ├── board_view.rs   # Board rendering and interaction
+│       ├── game_state.rs   # Game state management
+│       └── theme.rs        # Color constants and theming
 │
 └── docs/
     ├── CODEBASE_GUIDE.md   # Complete codebase documentation
@@ -175,7 +180,7 @@ FIVE:         1,000,000  // Winning position
 OPEN_FOUR:      100,000  // Unstoppable threat
 CLOSED_FOUR:     50,000  // Forcing move
 OPEN_THREE:      10,000  // Strong threat
-CLOSED_THREE:     1,000  // Moderate threat
+CLOSED_THREE:     1,500  // Moderate threat
 OPEN_TWO:           500  // Development
 CLOSED_TWO:          50  // Minor development
 ```
@@ -261,7 +266,7 @@ cargo test --lib -- --nocapture
 
 | Metric | Target | Actual |
 |--------|--------|--------|
-| Response time | < 0.5s | ~0.1-0.3s |
+| Response time | < 0.5s | ~0.3-0.5s |
 | Search depth | >= 10 | 10-17 |
 | Nodes/second | High | ~1,000K+ NPS |
 
@@ -279,6 +284,7 @@ cargo test --lib -- --nocapture
 10. **Zobrist Hashing**: O(1) incremental hash updates
 11. **Make/Unmake Pattern**: No board cloning per search node
 12. **Allocation-free Captures**: Fixed-size arrays for capture info
+13. **Dynamic Heuristic**: Game-phase-aware evaluation weights (Opening/Midgame/Endgame)
 
 ## Documentation
 
