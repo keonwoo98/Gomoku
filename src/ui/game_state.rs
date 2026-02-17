@@ -33,6 +33,8 @@ pub enum GameMode {
     PvP {
         show_suggestions: bool,
     },
+    /// AI vs AI (spectator mode)
+    AiVsAi,
 }
 
 impl Default for GameMode {
@@ -307,8 +309,8 @@ impl GameState {
             GameMode::PvE { human_color } => {
                 *human_color = human_color.opponent();
             }
-            GameMode::PvP { .. } => {
-                // PvP: conceptual swap — players switch sides
+            GameMode::PvP { .. } | GameMode::AiVsAi => {
+                // PvP/AiVsAi: conceptual swap
             }
         }
         self.message = Some("Colors swapped!".to_string());
@@ -325,6 +327,7 @@ impl GameState {
         match self.mode {
             GameMode::PvE { human_color } => self.current_turn == human_color,
             GameMode::PvP { .. } => true,
+            GameMode::AiVsAi => false,
         }
     }
 
@@ -333,6 +336,7 @@ impl GameState {
         match self.mode {
             GameMode::PvE { human_color } => self.current_turn != human_color,
             GameMode::PvP { .. } => false,
+            GameMode::AiVsAi => true,
         }
     }
 
@@ -775,7 +779,7 @@ impl GameState {
         // Exit review mode if active
         self.review_index = None;
 
-        // For PvE, undo two moves (human + AI)
+        // For PvE, undo two moves (human + AI); AiVsAi undo one move
         let undo_count = match self.mode {
             GameMode::PvE { .. } if self.move_history.len() >= 2 => 2,
             _ => 1,

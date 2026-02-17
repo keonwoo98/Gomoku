@@ -65,6 +65,15 @@ impl GomokuApp {
                             }
                         }
                     });
+                    ui.menu_button("New Game (AI vs AI)", |ui| {
+                        for (label, rule) in [("Standard", OpeningRule::Standard), ("Pro", OpeningRule::Pro), ("Swap", OpeningRule::Swap)] {
+                            if ui.button(label).clicked() {
+                                self.state = GameState::with_opening_rule(
+                                    GameMode::AiVsAi, rule);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("Undo").clicked() {
                         self.state.undo();
@@ -88,6 +97,7 @@ impl GomokuApp {
                             format!("PvE - You: {}{}", if human_color == Stone::Black { "Black" } else { "White" }, rule_str)
                         }
                         GameMode::PvP { .. } => format!("PvP - Hotseat{}", rule_str),
+                        GameMode::AiVsAi => format!("AI vs AI - Spectator{}", rule_str),
                     };
                     ui.label(mode_text);
                 });
@@ -740,13 +750,20 @@ impl eframe::App for GomokuApp {
             self.state.start_ai_thinking();
         }
 
-        // Auto-decide swap for AI in PvE mode
+        // Auto-decide swap for AI in PvE/AiVsAi mode
         if self.state.swap_pending {
-            if let GameMode::PvE { human_color } = self.state.mode {
-                if self.state.current_turn != human_color {
-                    // AI decides: always swap (takes initiative)
-                    self.state.execute_swap();
+            match self.state.mode {
+                GameMode::PvE { human_color } => {
+                    if self.state.current_turn != human_color {
+                        // AI decides: always swap (takes initiative)
+                        self.state.execute_swap();
+                    }
                 }
+                GameMode::AiVsAi => {
+                    // AI auto-decides: always decline swap
+                    self.state.decline_swap();
+                }
+                _ => {}
             }
         }
 
@@ -760,8 +777,9 @@ impl eframe::App for GomokuApp {
             self.render_swap_dialog(ctx);
         }
 
-        // Request repaint if animation is playing, AI is thinking, swap pending, or message shown
-        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() || self.state.message.is_some() || self.state.swap_pending {
+        // Request repaint if animation is playing, AI is thinking, swap pending, message shown, or AI vs AI mode
+        let ai_vs_ai_running = matches!(self.state.mode, GameMode::AiVsAi) && self.state.game_over.is_none();
+        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() || self.state.message.is_some() || self.state.swap_pending || ai_vs_ai_running {
             ctx.request_repaint();
         }
     }
