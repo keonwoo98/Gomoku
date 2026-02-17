@@ -38,6 +38,7 @@
 - **Double-three forbidden** (creating two open-threes simultaneously is illegal)
 - **Capture exception** (double-three via capture is allowed)
 - **Opening rules** support (Standard, Pro, Swap)
+- **AI vs AI** spectator mode with full debug panel
 
 ### Performance
 - **< 0.5 seconds** average response time per move

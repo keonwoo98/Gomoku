@@ -748,7 +748,13 @@ The game supports three opening rules selectable at game start:
 
 **한국어 설명**: Standard는 제한 없음, Pro는 첫 수 중앙/3수째 중앙 3칸 이상, Swap은 3수 후 색상 교환 선택.
 
-### 3.5 Test Coverage
+### 3.5 AI vs AI Spectator Mode
+
+`GameMode::AiVsAi` — two AIs play against each other while the user spectates. The debug panel shows real-time search statistics for both sides (depth, nodes, time, score). Supports all three opening rules (Standard, Pro, Swap).
+
+**한국어 설명**: 두 AI가 대전하는 관전 모드. 디버그 패널로 양측 탐색 통계를 실시간 확인 가능.
+
+### 3.6 Test Coverage
 
 **196 tests** covering all rules:
 
