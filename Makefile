@@ -1,8 +1,8 @@
 NAME = Gomoku
 
-# Use rustup's cargo/rustc to avoid homebrew version conflicts
-CARGO = $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo
-RUSTC = $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc
+# Prefer rustup toolchain, fall back to PATH
+CARGO ?= $(shell rustup which cargo 2>/dev/null || which cargo 2>/dev/null)
+RUSTC ?= $(shell rustup which rustc 2>/dev/null || which rustc 2>/dev/null)
 
 all: $(NAME)
 

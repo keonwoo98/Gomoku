@@ -5,7 +5,7 @@
 //! - 5-in-a-row to win (overlines allowed)
 //! - Capture win: 10 captured stones (5 pairs)
 //! - Pair capture rule: X-O-O-X pattern captures the O-O pair
-//! - Double-three forbidden for Black
+//! - Double-three forbidden move rule (both colors)
 //!
 //! # Architecture
 //!
@@ -39,10 +39,9 @@
 //!
 //! The AI engine follows this search priority:
 //! 1. Immediate winning move (instant)
-//! 2. VCF - Victory by Continuous Fours
-//! 3. VCT - Victory by Continuous Threats
-//! 4. Defense against opponent's threats
-//! 5. Alpha-Beta search with transposition table
+//! 2. Defense against opponent's immediate threats
+//! 3. VCF - Victory by Continuous Fours (both sides)
+//! 4. Alpha-Beta search with transposition table
 //!
 //! # Performance
 //!

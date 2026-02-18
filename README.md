@@ -108,7 +108,7 @@ Gomoku/
 │
 ├── src/
 │   ├── lib.rs              # Library entry point, module exports
-│   ├── main.rs             # CLI binary entry point
+│   ├── main.rs             # GUI binary entry point
 │   ├── engine.rs           # AI engine integration layer
 │   │
 │   ├── board/              # Board representation

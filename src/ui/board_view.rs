@@ -24,7 +24,8 @@ impl Default for BoardView {
 }
 
 impl BoardView {
-    /// Render the board and return click position if any
+    /// Render the board and return click position if any.
+    /// `extra_invalid` optionally rejects positions beyond normal rules (e.g. Pro opening).
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -35,6 +36,7 @@ impl BoardView {
         winning_line: Option<[Pos; 5]>,
         game_over: bool,
         capture_animation: Option<&CaptureAnimation>,
+        extra_invalid: Option<&dyn Fn(Pos) -> bool>,
     ) -> Option<Pos> {
         let available_size = ui.available_size();
 
@@ -97,7 +99,8 @@ impl BoardView {
             if let Some(pointer_pos) = response.hover_pos() {
                 if let Some(board_pos) = self.screen_to_board(pointer_pos) {
                     let is_valid = board.get(board_pos) == Stone::Empty
-                        && crate::rules::is_valid_move(board, board_pos, current_turn);
+                        && crate::rules::is_valid_move(board, board_pos, current_turn)
+                        && !extra_invalid.is_some_and(|f| f(board_pos));
 
                     // Draw hover preview
                     let hover_color = if is_valid {
@@ -145,13 +148,18 @@ impl BoardView {
         }
     }
 
-    /// Draw coordinate labels (A-S, 1-19)
+    /// Draw coordinate labels (A-T skipping I, 1-19)
     fn draw_coordinates(&self, painter: &Painter) {
         let font = egui::FontId::proportional(12.0);
 
-        // Column labels (A-S)
+        // Column labels (A-T, skipping I to match standard notation)
         for col in 0..BOARD_SIZE {
-            let letter = (b'A' + col as u8) as char;
+            let col_byte = col as u8;
+            let letter = if col_byte < 8 {
+                (b'A' + col_byte) as char
+            } else {
+                (b'A' + col_byte + 1) as char // skip 'I'
+            };
             let x = self.board_rect.min.x + BOARD_MARGIN + col as f32 * self.cell_size;
 
             // Top

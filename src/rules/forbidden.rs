@@ -24,7 +24,10 @@ const DIRECTIONS: [(i32, i32); 4] = [
 #[derive(Debug, Clone)]
 struct LinePattern {
     /// Stones of the player in this line (relative positions from center)
-    stones: Vec<i32>,
+    /// Max 11 elements: center + 5 positive + 5 negative direction
+    stones: [i32; 12],
+    /// Number of stones in the array
+    stone_count: u8,
     /// Number of open ends (0, 1, or 2)
     open_ends: u8,
     /// Total span of the pattern
@@ -38,7 +41,8 @@ struct LinePattern {
 /// patterns like `_OO_O_` (free-three with gap)
 fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePattern {
     let opponent = stone.opponent();
-    let mut stones = vec![0i32]; // The placed stone at position 0
+    let mut stones = [0i32; 12];
+    let mut stone_count: u8 = 1; // stones[0] = 0 (the placed stone)
     let mut open_ends = 0u8;
 
     // Scan positive direction - collect stones and track open end
@@ -58,7 +62,8 @@ fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePat
         let cell = board.get(check_pos);
 
         if cell == stone {
-            stones.push(i);
+            stones[stone_count as usize] = i;
+            stone_count += 1;
         } else if cell == opponent {
             // Blocked by opponent
             break;
@@ -103,7 +108,8 @@ fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePat
         let cell = board.get(check_pos);
 
         if cell == stone {
-            stones.push(-i);
+            stones[stone_count as usize] = -i;
+            stone_count += 1;
         } else if cell == opponent {
             // Blocked by opponent
             break;
@@ -131,15 +137,17 @@ fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePat
         open_ends += 1;
     }
 
-    stones.sort();
-    let span = if stones.is_empty() {
+    stones[..stone_count as usize].sort();
+    let sc = stone_count as usize;
+    let span = if sc == 0 {
         0
     } else {
-        (stones[stones.len() - 1] - stones[0] + 1) as u8
+        (stones[sc - 1] - stones[0] + 1) as u8
     };
 
     LinePattern {
         stones,
+        stone_count,
         open_ends,
         span,
     }
@@ -154,7 +162,7 @@ fn scan_line(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePat
 /// it becomes an open-four that cannot be blocked.
 fn is_free_three(pattern: &LinePattern) -> bool {
     // Must have exactly 3 stones
-    if pattern.stones.len() != 3 {
+    if pattern.stone_count != 3 {
         return false;
     }
 
@@ -197,7 +205,8 @@ fn is_free_three(pattern: &LinePattern) -> bool {
 /// Only collects consecutive friendly stones in each direction.
 fn scan_line_consecutive(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32) -> LinePattern {
     let opponent = stone.opponent();
-    let mut stones = vec![0i32]; // The placed stone at position 0
+    let mut stones = [0i32; 12];
+    let mut stone_count: u8 = 1; // stones[0] = 0 (the placed stone)
     let mut open_ends = 0u8;
 
     // Scan positive direction - consecutive only
@@ -211,7 +220,8 @@ fn scan_line_consecutive(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32
         let check_pos = Pos::new(r as u8, c as u8);
         let cell = board.get(check_pos);
         if cell == stone {
-            stones.push(i);
+            stones[stone_count as usize] = i;
+            stone_count += 1;
         } else if cell == opponent {
             break;
         } else {
@@ -234,7 +244,8 @@ fn scan_line_consecutive(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32
         let check_pos = Pos::new(r as u8, c as u8);
         let cell = board.get(check_pos);
         if cell == stone {
-            stones.push(-i);
+            stones[stone_count as usize] = -i;
+            stone_count += 1;
         } else if cell == opponent {
             break;
         } else {
@@ -246,15 +257,17 @@ fn scan_line_consecutive(board: &Board, pos: Pos, stone: Stone, dr: i32, dc: i32
         open_ends += 1;
     }
 
-    stones.sort();
-    let span = if stones.is_empty() {
+    stones[..stone_count as usize].sort();
+    let sc = stone_count as usize;
+    let span = if sc == 0 {
         0
     } else {
-        (stones[stones.len() - 1] - stones[0] + 1) as u8
+        (stones[sc - 1] - stones[0] + 1) as u8
     };
 
     LinePattern {
         stones,
+        stone_count,
         open_ends,
         span,
     }
@@ -279,7 +292,7 @@ fn creates_free_three_in_direction(
     // When gap-inclusive scan finds >3 stones, a consecutive subset might form
     // a free-three that gets hidden by the extra stone(s). Fallback to
     // consecutive-only scan to catch patterns like _BBB_ alongside a gap-connected 4th.
-    if pattern.stones.len() > 3 {
+    if pattern.stone_count > 3 {
         let consec = scan_line_consecutive(board, pos, stone, dr, dc);
         if is_free_three(&consec) {
             return true;
@@ -613,7 +626,7 @@ mod tests {
 
         // Debug: pattern should be stones at [-1, 0, 1] (cols 1, 2, 3)
         // Open ends: col 0 (empty) and col 4 (empty)
-        assert_eq!(pattern.stones.len(), 3, "Should have 3 stones");
+        assert_eq!(pattern.stone_count as usize, 3, "Should have 3 stones");
         assert_eq!(pattern.open_ends, 2, "Should have 2 open ends (col 0 and col 4)");
         assert_eq!(pattern.span, 3, "Span should be 3");
 
@@ -643,51 +656,45 @@ mod tests {
         };
         let pattern = scan_line(&temp_board, Pos::new(9, 7), Stone::Black, 0, 1);
 
-        assert_eq!(pattern.stones.len(), 3, "Should have 3 stones");
+        assert_eq!(pattern.stone_count as usize, 3, "Should have 3 stones");
         assert_eq!(pattern.open_ends, 2, "Should have 2 open ends");
         assert_eq!(pattern.span, 3, "Span should be 3 for consecutive");
+    }
+
+    /// Helper to create LinePattern from a slice for tests
+    fn make_pattern(s: &[i32], open_ends: u8, span: u8) -> LinePattern {
+        let mut stones = [0i32; 12];
+        for (i, &v) in s.iter().enumerate() {
+            stones[i] = v;
+        }
+        LinePattern {
+            stones,
+            stone_count: s.len() as u8,
+            open_ends,
+            span,
+        }
     }
 
     #[test]
     fn test_is_free_three_logic() {
         // Test consecutive pattern
-        let consecutive = LinePattern {
-            stones: vec![-1, 0, 1],
-            open_ends: 2,
-            span: 3,
-        };
+        let consecutive = make_pattern(&[-1, 0, 1], 2, 3);
         assert!(is_free_three(&consecutive), "Consecutive 3 open should be free-three");
 
         // Test gapped pattern
-        let gapped = LinePattern {
-            stones: vec![-1, 0, 2],
-            open_ends: 2,
-            span: 4,
-        };
+        let gapped = make_pattern(&[-1, 0, 2], 2, 4);
         assert!(is_free_three(&gapped), "Gapped 3 with span 4 should be free-three");
 
         // Test blocked pattern
-        let blocked = LinePattern {
-            stones: vec![-1, 0, 1],
-            open_ends: 1,
-            span: 3,
-        };
+        let blocked = make_pattern(&[-1, 0, 1], 1, 3);
         assert!(!is_free_three(&blocked), "Blocked should not be free-three");
 
         // Test 4 stones (not free-three)
-        let four = LinePattern {
-            stones: vec![-1, 0, 1, 2],
-            open_ends: 2,
-            span: 4,
-        };
+        let four = make_pattern(&[-1, 0, 1, 2], 2, 4);
         assert!(!is_free_three(&four), "4 stones should not be free-three");
 
         // Test too spread pattern
-        let spread = LinePattern {
-            stones: vec![-2, 0, 3],
-            open_ends: 2,
-            span: 6,
-        };
+        let spread = make_pattern(&[-2, 0, 3], 2, 6);
         assert!(!is_free_three(&spread), "Too spread should not be free-three");
     }
 

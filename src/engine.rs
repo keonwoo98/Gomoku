@@ -73,8 +73,6 @@ pub enum SearchType {
     ImmediateWin,
     /// Found forced win via Victory by Continuous Fours
     VCF,
-    /// Found forced win via Victory by Continuous Threats
-    VCT,
     /// Defensive move to block opponent's threat
     Defense,
     /// Regular alpha-beta search result
@@ -136,22 +134,6 @@ impl MoveResult {
             best_move: Some(pos),
             score: 900_000,
             search_type: SearchType::VCF,
-            time_ms,
-            nodes,
-            depth: 0,
-            tt_usage: 0,
-            nps: Self::compute_nps(nodes, time_ms),
-        }
-    }
-
-    /// Create a result for a VCT win
-    #[inline]
-    #[cfg(test)]
-    fn vct_win(pos: Pos, time_ms: u64, nodes: u64) -> Self {
-        Self {
-            best_move: Some(pos),
-            score: 800_000,
-            search_type: SearchType::VCT,
             time_ms,
             nodes,
             depth: 0,
@@ -225,7 +207,7 @@ impl MoveResult {
 ///
 /// The engine integrates multiple search algorithms with a priority-based
 /// approach to find the best move efficiently. It uses:
-/// - VCF/VCT threat search for forced wins
+/// - VCF threat search for forced wins
 /// - Alpha-beta search with transposition table for general positions
 /// - Immediate win/loss detection for quick responses
 ///
@@ -254,7 +236,7 @@ impl MoveResult {
 pub struct AIEngine {
     /// Alpha-beta searcher with transposition table
     searcher: Searcher,
-    /// VCF/VCT threat searcher
+    /// VCF threat searcher
     threat_searcher: ThreatSearcher,
     /// Maximum search depth for alpha-beta
     max_depth: i8,
@@ -1218,10 +1200,6 @@ mod tests {
         assert_eq!(vcf.search_type, SearchType::VCF);
         assert_eq!(vcf.score, 900_000);
 
-        let vct = MoveResult::vct_win(pos, 30, 200);
-        assert_eq!(vct.search_type, SearchType::VCT);
-        assert_eq!(vct.score, 800_000);
-
         let defense = MoveResult::defense(pos, -100_000, 40, 50);
         assert_eq!(defense.search_type, SearchType::Defense);
 
@@ -1288,7 +1266,7 @@ mod tests {
     fn test_search_type_equality() {
         assert_eq!(SearchType::ImmediateWin, SearchType::ImmediateWin);
         assert_ne!(SearchType::ImmediateWin, SearchType::VCF);
-        assert_ne!(SearchType::VCF, SearchType::VCT);
+        assert_ne!(SearchType::VCF, SearchType::Defense);
         assert_ne!(SearchType::Defense, SearchType::AlphaBeta);
     }
 

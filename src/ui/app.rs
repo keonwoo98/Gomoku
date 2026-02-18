@@ -3,7 +3,7 @@
 use eframe::egui;
 use egui::{CentralPanel, Context, CornerRadius, Frame, RichText, ScrollArea, SidePanel, TopBottomPanel, Vec2};
 
-use crate::Stone;
+use crate::{Pos, Stone};
 use super::board_view::BoardView;
 use super::game_state::{GameMode, GameState, OpeningRule, WinType};
 use super::theme::*;
@@ -184,61 +184,18 @@ impl GomokuApp {
             });
     }
 
-    /// Render turn indicator with integrated timer and actions
+    /// Render turn indicator showing both sides, with active turn highlighted
     fn render_turn_section(&mut self, ui: &mut egui::Ui) {
-        let is_black = self.state.current_turn == Stone::Black;
-        let color_name = if is_black { "BLACK" } else { "WHITE" };
+        let active_black = self.state.current_turn == Stone::Black;
 
         Self::render_card(ui, None, |ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(32.0, 32.0), egui::Sense::hover());
-                let center = rect.center();
+            // Black row
+            Self::render_turn_row(ui, true, active_black, &self.state);
+            ui.add_space(3.0);
+            // White row
+            Self::render_turn_row(ui, false, !active_black, &self.state);
 
-                if is_black {
-                    ui.painter().circle_filled(center + Vec2::new(1.0, 1.0), 13.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 50));
-                    ui.painter().circle_filled(center, 13.0, egui::Color32::from_rgb(30, 30, 35));
-                    ui.painter().circle_stroke(center, 13.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(60, 60, 65)));
-                } else {
-                    ui.painter().circle_filled(center + Vec2::new(1.0, 1.0), 13.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30));
-                    ui.painter().circle_filled(center, 13.0, egui::Color32::from_rgb(245, 245, 248));
-                    ui.painter().circle_stroke(center, 13.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 180, 185)));
-                }
-
-                ui.add_space(4.0);
-
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(color_name).size(15.0).strong().color(TEXT_PRIMARY));
-                    let (status_text, status_color) = if self.state.is_ai_thinking() {
-                        ("AI thinking...", TIMER_WARNING)
-                    } else if self.state.game_over.is_some() {
-                        ("Game Over", WIN_HIGHLIGHT)
-                    } else {
-                        ("to move", TIMER_NORMAL)
-                    };
-                    ui.label(RichText::new(status_text).size(10.0).color(status_color));
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.state.is_ai_thinking() {
-                        if let Some(elapsed) = self.state.ai_thinking_elapsed() {
-                            let secs = elapsed.as_secs_f32();
-                            let color = if secs < 0.3 {
-                                TIMER_NORMAL
-                            } else if secs < 0.5 {
-                                TIMER_WARNING
-                            } else {
-                                TIMER_CRITICAL
-                            };
-                            ui.label(RichText::new(format!("{:.2}s", secs)).size(20.0).strong().color(color));
-                        }
-                    } else {
-                        let elapsed = self.state.move_timer.elapsed();
-                        ui.label(RichText::new(format!("{:.1}s", elapsed.as_secs_f32())).size(17.0).color(TEXT_SECONDARY));
-                    }
-                });
-            });
-
-            ui.add_space(2.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("#{}", self.state.move_history.len())).size(10.0).color(TEXT_MUTED));
                 ui.add_space(3.0);
@@ -256,10 +213,92 @@ impl GomokuApp {
                     }
                 }
 
-                if let Some(ai_time) = self.state.move_timer.ai_thinking_time {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("AI: {:.0}ms", ai_time.as_secs_f32() * 1000.0)).size(9.0).color(TEXT_MUTED));
-                    });
+            });
+        });
+    }
+
+    /// Render a single turn row (Black or White)
+    fn render_turn_row(ui: &mut egui::Ui, is_black: bool, is_active: bool, state: &GameState) {
+        let color_name = if is_black { "BLACK" } else { "WHITE" };
+        let dimmed = !is_active;
+        let name_color = if dimmed { TEXT_MUTED } else { TEXT_PRIMARY };
+
+        ui.horizontal(|ui| {
+            // Stone icon
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), egui::Sense::hover());
+            let center = rect.center();
+            let alpha = if dimmed { 80u8 } else { 255 };
+
+            if is_black {
+                ui.painter().circle_filled(center + Vec2::new(0.8, 0.8), 10.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha / 5));
+                ui.painter().circle_filled(center, 10.0, egui::Color32::from_rgba_unmultiplied(30, 30, 35, alpha));
+                let ring_a = if dimmed { 40 } else { 255 };
+                ui.painter().circle_stroke(center, 10.0, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(60, 60, 65, ring_a)));
+            } else {
+                ui.painter().circle_filled(center + Vec2::new(0.8, 0.8), 10.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha / 8));
+                ui.painter().circle_filled(center, 10.0, egui::Color32::from_rgba_unmultiplied(245, 245, 248, alpha));
+                let ring_a = if dimmed { 60 } else { 255 };
+                ui.painter().circle_stroke(center, 10.0, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(180, 180, 185, ring_a)));
+            }
+
+            ui.add_space(2.0);
+
+            // Name + status
+            ui.vertical(|ui| {
+                ui.label(RichText::new(color_name).size(13.0).strong().color(name_color));
+                if is_active {
+                    let (status_text, status_color) = if state.is_ai_thinking() {
+                        ("AI thinking...", TIMER_WARNING)
+                    } else if state.game_over.is_some() {
+                        ("Game Over", WIN_HIGHLIGHT)
+                    } else {
+                        ("to move", TIMER_NORMAL)
+                    };
+                    ui.label(RichText::new(status_text).size(9.0).color(status_color));
+                }
+            });
+
+            // Timer (right-aligned)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if is_active {
+                    // Active side: live timer
+                    if state.is_ai_thinking() {
+                        if let Some(elapsed) = state.ai_thinking_elapsed() {
+                            let secs = elapsed.as_secs_f32();
+                            let color = if secs < 0.3 {
+                                TIMER_NORMAL
+                            } else if secs < 0.5 {
+                                TIMER_WARNING
+                            } else {
+                                TIMER_CRITICAL
+                            };
+                            ui.label(RichText::new(format!("{:.2}s", secs)).size(18.0).strong().color(color));
+                        }
+                    } else {
+                        let elapsed = state.move_timer.elapsed();
+                        ui.label(RichText::new(format!("{:.1}s", elapsed.as_secs_f32())).size(15.0).color(TEXT_SECONDARY));
+                    }
+                } else {
+                    // Inactive side: show engine time from last move
+                    let idx = if is_black { 0 } else { 1 };
+                    if let Some(result) = &state.last_ai_result[idx] {
+                        let ms = result.time_ms;
+                        let text = if ms >= 1000 {
+                            format!("{:.1}s", ms as f64 / 1000.0)
+                        } else {
+                            format!("{}ms", ms)
+                        };
+                        ui.label(RichText::new(text).size(13.0).color(TEXT_MUTED));
+                    } else if let Some(dur) = state.last_move_time[idx] {
+                        // Human move (PvP): show wallclock
+                        let ms = dur.as_millis();
+                        let text = if ms >= 1000 {
+                            format!("{:.1}s", dur.as_secs_f32())
+                        } else {
+                            format!("{}ms", ms)
+                        };
+                        ui.label(RichText::new(text).size(13.0).color(TEXT_MUTED));
+                    }
                 }
             });
         });
@@ -341,177 +380,179 @@ impl GomokuApp {
         ui.end_row();
     }
 
-    /// Render debug section with detailed AI search statistics
+    /// Render debug section with detailed AI search statistics for both sides
     fn render_debug_section(&self, ui: &mut egui::Ui) {
-        // Last move debug card
-        Self::render_card(ui, Some(("LAST MOVE", ACCENT_BLUE)), |ui| {
-            if let Some(result) = &self.state.last_ai_result {
-                // Search type badge
-                let (type_str, type_color) = match result.search_type {
-                    crate::engine::SearchType::ImmediateWin => ("Immediate Win", WIN_HIGHLIGHT),
-                    crate::engine::SearchType::VCF => ("VCF", WIN_HIGHLIGHT),
-                    crate::engine::SearchType::VCT => ("VCT", TIMER_WARNING),
-                    crate::engine::SearchType::Defense => ("Defense", TIMER_CRITICAL),
-                    crate::engine::SearchType::AlphaBeta => ("Alpha-Beta", TIMER_NORMAL),
-                };
+        for (idx, color_name) in [(0usize, "BLACK"), (1, "WHITE")] {
+            let result = &self.state.last_ai_result[idx];
+            let stats = &self.state.ai_stats[idx];
 
-                ui.horizontal(|ui| {
-                    Frame::new()
-                        .fill(PANEL_CARD_ACCENT)
-                        .corner_radius(CornerRadius::same(3))
-                        .inner_margin(egui::Margin::symmetric(7, 3))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(type_str).size(11.0).strong().color(type_color));
-                        });
-
-                    if let Some(pos) = result.best_move {
-                        let notation = crate::engine::pos_to_notation(pos);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(notation).size(13.0).strong().color(TEXT_PRIMARY));
-                        });
-                    }
-                });
-
-                ui.add_space(2.0);
-
-                // Score
-                let (score_text, score_color) = if result.score >= 999_900 {
-                    ("+WIN".to_string(), WIN_HIGHLIGHT)
-                } else if result.score <= -999_900 {
-                    ("-LOSE".to_string(), TIMER_CRITICAL)
-                } else if result.score > 50_000 {
-                    (format!("+{}", result.score), WIN_HIGHLIGHT)
-                } else if result.score < -50_000 {
-                    (format!("{}", result.score), TIMER_CRITICAL)
-                } else if result.score > 0 {
-                    (format!("+{}", result.score), TIMER_NORMAL)
-                } else {
-                    (format!("{}", result.score), TEXT_SECONDARY)
-                };
-
-                egui::Grid::new("last_move_grid")
-                    .num_columns(2)
-                    .min_col_width(ui.available_width() / 2.0 - 8.0)
-                    .spacing([8.0, 2.0])
-                    .show(ui, |ui| {
-                        Self::grid_row(ui, "Score", &score_text, score_color);
-
-                        if result.depth > 0 {
-                            // Alpha-Beta search: show full stats
-                            let time_str = if result.time_ms >= 1000 {
-                                format!("{:.2}s", result.time_ms as f64 / 1000.0)
-                            } else {
-                                format!("{}ms", result.time_ms)
-                            };
-                            let time_color = if result.time_ms > 500 {
-                                TIMER_CRITICAL
-                            } else if result.time_ms > 200 {
-                                TIMER_WARNING
-                            } else {
-                                TIMER_NORMAL
-                            };
-                            Self::grid_row(ui, "Time", &time_str, time_color);
-
-                            let depth_color = if result.depth >= 10 {
-                                TIMER_NORMAL
-                            } else if result.depth >= 6 {
-                                TIMER_WARNING
-                            } else {
-                                TEXT_SECONDARY
-                            };
-                            Self::grid_row(ui, "Depth", &format!("{}", result.depth), depth_color);
-
-                            let nodes_str = if result.nodes >= 1_000_000 {
-                                format!("{:.1}M", result.nodes as f64 / 1_000_000.0)
-                            } else if result.nodes >= 1_000 {
-                                format!("{:.1}K", result.nodes as f64 / 1_000.0)
-                            } else {
-                                format!("{}", result.nodes)
-                            };
-                            Self::grid_row(ui, "Nodes", &nodes_str, TEXT_SECONDARY);
-
-                            if result.nps > 0 {
-                                Self::grid_row(ui, "Speed", &format!("{} kN/s", result.nps), TEXT_SECONDARY);
-                            }
-                            if result.tt_usage > 0 {
-                                Self::grid_row(ui, "TT Hit", &format!("{}%", result.tt_usage), TEXT_SECONDARY);
-                            }
-                        } else {
-                            // Non-search move (Immediate Win, VCF, Defense): show context
-                            Self::grid_row(ui, "Detection", "Instant", TIMER_NORMAL);
-
-                            // Show last alpha-beta search stats for context
-                            let stats = &self.state.ai_stats;
-                            let last_search = stats.move_depths.iter().zip(stats.move_times.iter())
-                                .rev()
-                                .find(|(&d, _)| d > 0);
-                            if let Some((&depth, &time)) = last_search {
-                                let prev_str = format!("d{}, {}ms", depth, time);
-                                Self::grid_row(ui, "Prev Search", &prev_str, TEXT_MUTED);
-                            }
-                        }
-                    });
-            } else {
-                ui.label(RichText::new("No AI data yet").size(11.0).color(TEXT_MUTED));
+            // Skip sides with no data
+            if result.is_none() && stats.move_count == 0 {
+                continue;
             }
-        });
 
-        // Cumulative AI stats card
-        let stats = &self.state.ai_stats;
-        if stats.move_count > 0 {
-            ui.add_space(4.0);
-            Self::render_card(ui, Some(("GAME STATS", ACCENT_BLUE)), |ui| {
-                egui::Grid::new("ai_stats_grid")
-                    .num_columns(2)
-                    .min_col_width(ui.available_width() / 2.0 - 8.0)
-                    .spacing([8.0, 2.0])
-                    .show(ui, |ui| {
-                        let search_count = stats.move_depths.iter().filter(|&&d| d > 0).count();
-                        Self::grid_row(ui, "AI Moves", &format!("{} ({} search)", stats.move_count, search_count), TEXT_PRIMARY);
+            // Last move card per side
+            let header = format!("{} LAST MOVE", color_name);
+            Self::render_card(ui, Some((&header, ACCENT_BLUE)), |ui| {
+                if let Some(result) = result {
+                    let (type_str, type_color) = match result.search_type {
+                        crate::engine::SearchType::ImmediateWin => ("Immediate Win", WIN_HIGHLIGHT),
+                        crate::engine::SearchType::VCF => ("VCF", WIN_HIGHLIGHT),
+                        crate::engine::SearchType::Defense => ("Defense", TIMER_CRITICAL),
+                        crate::engine::SearchType::AlphaBeta => ("Alpha-Beta", TIMER_NORMAL),
+                    };
 
-                        // Average time
-                        let avg = stats.avg_time_ms();
-                        let avg_str = if avg >= 1000.0 {
-                            format!("{:.2}s", avg / 1000.0)
-                        } else {
-                            format!("{:.0}ms", avg)
-                        };
-                        let avg_color = if avg > 500.0 {
-                            TIMER_CRITICAL
-                        } else if avg > 200.0 {
-                            TIMER_WARNING
-                        } else {
-                            TIMER_NORMAL
-                        };
-                        Self::grid_row(ui, "Avg Time", &avg_str, avg_color);
+                    ui.horizontal(|ui| {
+                        Frame::new()
+                            .fill(PANEL_CARD_ACCENT)
+                            .corner_radius(CornerRadius::same(3))
+                            .inner_margin(egui::Margin::symmetric(7, 3))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(type_str).size(11.0).strong().color(type_color));
+                            });
 
-                        // Min/Max time
-                        let (search_min, search_max) = stats.search_time_range();
-                        Self::grid_row(ui, "Time Range", &format!("{} - {}ms", search_min, search_max), TEXT_SECONDARY);
-
-                        // Average depth
-                        Self::grid_row(ui, "Avg Depth", &format!("{:.1}", stats.avg_depth()), TEXT_SECONDARY);
-
-                        // Max depth
-                        let max_depth_color = if stats.max_depth >= 10 { TIMER_NORMAL } else { TEXT_SECONDARY };
-                        Self::grid_row(ui, "Max Depth", &format!("{}", stats.max_depth), max_depth_color);
-
-                        // Total nodes
-                        let total_str = if stats.total_nodes >= 1_000_000 {
-                            format!("{:.1}M", stats.total_nodes as f64 / 1_000_000.0)
-                        } else if stats.total_nodes >= 1_000 {
-                            format!("{:.1}K", stats.total_nodes as f64 / 1_000.0)
-                        } else {
-                            format!("{}", stats.total_nodes)
-                        };
-                        Self::grid_row(ui, "Total Nodes", &total_str, TEXT_SECONDARY);
-
-                        // Average NPS
-                        if stats.avg_nps() > 0 {
-                            Self::grid_row(ui, "Avg Speed", &format!("{} kN/s", stats.avg_nps()), TEXT_SECONDARY);
+                        if let Some(pos) = result.best_move {
+                            let notation = crate::engine::pos_to_notation(pos);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(notation).size(13.0).strong().color(TEXT_PRIMARY));
+                            });
                         }
                     });
+
+                    ui.add_space(2.0);
+
+                    let (score_text, score_color) = if result.score >= 999_900 {
+                        ("+WIN".to_string(), WIN_HIGHLIGHT)
+                    } else if result.score <= -999_900 {
+                        ("-LOSE".to_string(), TIMER_CRITICAL)
+                    } else if result.score > 50_000 {
+                        (format!("+{}", result.score), WIN_HIGHLIGHT)
+                    } else if result.score < -50_000 {
+                        (format!("{}", result.score), TIMER_CRITICAL)
+                    } else if result.score > 0 {
+                        (format!("+{}", result.score), TIMER_NORMAL)
+                    } else {
+                        (format!("{}", result.score), TEXT_SECONDARY)
+                    };
+
+                    let grid_id = format!("last_move_grid_{}", idx);
+                    egui::Grid::new(grid_id)
+                        .num_columns(2)
+                        .min_col_width(ui.available_width() / 2.0 - 8.0)
+                        .spacing([8.0, 2.0])
+                        .show(ui, |ui| {
+                            Self::grid_row(ui, "Score", &score_text, score_color);
+
+                            if result.depth > 0 {
+                                let time_str = if result.time_ms >= 1000 {
+                                    format!("{:.2}s", result.time_ms as f64 / 1000.0)
+                                } else {
+                                    format!("{}ms", result.time_ms)
+                                };
+                                let time_color = if result.time_ms > 500 {
+                                    TIMER_CRITICAL
+                                } else if result.time_ms > 200 {
+                                    TIMER_WARNING
+                                } else {
+                                    TIMER_NORMAL
+                                };
+                                Self::grid_row(ui, "Time", &time_str, time_color);
+
+                                let depth_color = if result.depth >= 10 {
+                                    TIMER_NORMAL
+                                } else if result.depth >= 6 {
+                                    TIMER_WARNING
+                                } else {
+                                    TEXT_SECONDARY
+                                };
+                                Self::grid_row(ui, "Depth", &format!("{}", result.depth), depth_color);
+
+                                let nodes_str = if result.nodes >= 1_000_000 {
+                                    format!("{:.1}M", result.nodes as f64 / 1_000_000.0)
+                                } else if result.nodes >= 1_000 {
+                                    format!("{:.1}K", result.nodes as f64 / 1_000.0)
+                                } else {
+                                    format!("{}", result.nodes)
+                                };
+                                Self::grid_row(ui, "Nodes", &nodes_str, TEXT_SECONDARY);
+
+                                if result.nps > 0 {
+                                    Self::grid_row(ui, "Speed", &format!("{} kN/s", result.nps), TEXT_SECONDARY);
+                                }
+                                if result.tt_usage > 0 {
+                                    Self::grid_row(ui, "TT Hit", &format!("{}%", result.tt_usage), TEXT_SECONDARY);
+                                }
+                            } else {
+                                Self::grid_row(ui, "Detection", "Instant", TIMER_NORMAL);
+
+                                let last_search = stats.move_depths.iter().zip(stats.move_times.iter())
+                                    .rev()
+                                    .find(|(&d, _)| d > 0);
+                                if let Some((&depth, &time)) = last_search {
+                                    let prev_str = format!("d{}, {}ms", depth, time);
+                                    Self::grid_row(ui, "Prev Search", &prev_str, TEXT_MUTED);
+                                }
+                            }
+                        });
+                } else {
+                    ui.label(RichText::new("No data yet").size(11.0).color(TEXT_MUTED));
+                }
             });
+
+            // Stats card per side
+            if stats.move_count > 0 {
+                ui.add_space(4.0);
+                let stats_header = format!("{} STATS", color_name);
+                Self::render_card(ui, Some((&stats_header, ACCENT_BLUE)), |ui| {
+                    let grid_id = format!("ai_stats_grid_{}", idx);
+                    egui::Grid::new(grid_id)
+                        .num_columns(2)
+                        .min_col_width(ui.available_width() / 2.0 - 8.0)
+                        .spacing([8.0, 2.0])
+                        .show(ui, |ui| {
+                            let search_count = stats.move_depths.iter().filter(|&&d| d > 0).count();
+                            Self::grid_row(ui, "AI Moves", &format!("{} ({} search)", stats.move_count, search_count), TEXT_PRIMARY);
+
+                            let avg = stats.avg_time_ms();
+                            let avg_str = if avg >= 1000.0 {
+                                format!("{:.2}s", avg / 1000.0)
+                            } else {
+                                format!("{:.0}ms", avg)
+                            };
+                            let avg_color = if avg > 500.0 {
+                                TIMER_CRITICAL
+                            } else if avg > 200.0 {
+                                TIMER_WARNING
+                            } else {
+                                TIMER_NORMAL
+                            };
+                            Self::grid_row(ui, "Avg Time", &avg_str, avg_color);
+
+                            let (search_min, search_max) = stats.search_time_range();
+                            Self::grid_row(ui, "Time Range", &format!("{} - {}ms", search_min, search_max), TEXT_SECONDARY);
+
+                            Self::grid_row(ui, "Avg Depth", &format!("{:.1}", stats.avg_depth()), TEXT_SECONDARY);
+
+                            let max_depth_color = if stats.max_depth >= 10 { TIMER_NORMAL } else { TEXT_SECONDARY };
+                            Self::grid_row(ui, "Max Depth", &format!("{}", stats.max_depth), max_depth_color);
+
+                            let total_str = if stats.total_nodes >= 1_000_000 {
+                                format!("{:.1}M", stats.total_nodes as f64 / 1_000_000.0)
+                            } else if stats.total_nodes >= 1_000 {
+                                format!("{:.1}K", stats.total_nodes as f64 / 1_000.0)
+                            } else {
+                                format!("{}", stats.total_nodes)
+                            };
+                            Self::grid_row(ui, "Total Nodes", &total_str, TEXT_SECONDARY);
+
+                            if stats.avg_nps() > 0 {
+                                Self::grid_row(ui, "Avg Speed", &format!("{} kN/s", stats.avg_nps()), TEXT_SECONDARY);
+                            }
+                        });
+                });
+            }
+
+            ui.add_space(4.0);
         }
     }
 
@@ -626,6 +667,29 @@ impl GomokuApp {
             let pad_y = (available.y - board_size).max(0.0) / 2.0;
             ui.add_space(pad_y);
 
+            // Pro rule restriction closure for hover validation
+            let opening_rule = self.state.opening_rule;
+            let move_count = self.state.move_history.len();
+            let pro_invalid: Option<Box<dyn Fn(Pos) -> bool>> = if opening_rule == OpeningRule::Pro {
+                Some(Box::new(move |pos: Pos| {
+                    let move_num = move_count + 1;
+                    if move_num == 1 && pos != Pos::new(9, 9) {
+                        return true;
+                    }
+                    if move_num == 3 {
+                        let center = 9i32;
+                        let dr = (i32::from(pos.row) - center).abs();
+                        let dc = (i32::from(pos.col) - center).abs();
+                        if dr.max(dc) < 3 {
+                            return true;
+                        }
+                    }
+                    false
+                }))
+            } else {
+                None
+            };
+
             let clicked = self.board_view.show(
                 ui,
                 &board_ref,
@@ -635,6 +699,7 @@ impl GomokuApp {
                 winning_line,
                 self.state.game_over.is_some() && !self.state.is_reviewing(),
                 self.state.capture_animation.as_ref(),
+                pro_invalid.as_ref().map(|f| f.as_ref()),
             );
 
             // Handle click (only when not reviewing and no swap pending)
@@ -777,9 +842,9 @@ impl eframe::App for GomokuApp {
             self.render_swap_dialog(ctx);
         }
 
-        // Request repaint if animation is playing, AI is thinking, swap pending, message shown, or AI vs AI mode
-        let ai_vs_ai_running = matches!(self.state.mode, GameMode::AiVsAi) && self.state.game_over.is_none();
-        if self.state.is_ai_thinking() || self.state.capture_animation.is_some() || self.state.message.is_some() || self.state.swap_pending || ai_vs_ai_running {
+        // Always repaint while game is in progress (live timer), plus animations/messages
+        let game_in_progress = self.state.game_over.is_none();
+        if game_in_progress || self.state.capture_animation.is_some() || self.state.message.is_some() {
             ctx.request_repaint();
         }
     }

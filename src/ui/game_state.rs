@@ -175,13 +175,13 @@ pub struct GameState {
     pub game_over: Option<GameResult>,
     pub last_move: Option<Pos>,
     pub move_history: Vec<(Pos, Stone)>,
-    pub last_ai_result: Option<MoveResult>,
+    pub last_ai_result: [Option<MoveResult>; 2],
     pub ai_state: AiState,
     pub move_timer: MoveTimer,
     pub suggested_move: Option<Pos>,
     pub message: Option<String>,
     pub capture_animation: Option<CaptureAnimation>,
-    pub ai_stats: AiStats,
+    pub ai_stats: [AiStats; 2],
     /// Review mode: when Some(index), shows board at move #index
     pub review_index: Option<usize>,
     /// Redo stack: each entry is a group of moves (1 for PvP, 2 for PvE)
@@ -190,6 +190,8 @@ pub struct GameState {
     pub opening_rule: OpeningRule,
     /// Swap rule: waiting for swap decision after 3rd move
     pub swap_pending: bool,
+    /// Per-color last move duration [Black, White]
+    pub last_move_time: [Option<std::time::Duration>; 2],
 
     // Persistent AI engine (reuses TT across moves)
     ai_engine: Option<AIEngine>,
@@ -264,17 +266,18 @@ impl GameState {
             game_over: None,
             last_move: None,
             move_history: Vec::new(),
-            last_ai_result: None,
+            last_ai_result: [None, None],
             ai_state: AiState::Idle,
             move_timer: MoveTimer::default(),
             suggested_move: None,
             message: None,
             capture_animation: None,
-            ai_stats: AiStats::default(),
+            ai_stats: [AiStats::default(), AiStats::default()],
             review_index: None,
             redo_groups: Vec::new(),
             opening_rule,
             swap_pending: false,
+            last_move_time: [None, None],
             ai_engine: Some(AIEngine::with_config(64, 20, 500)),
             ai_depth: 20,
             ai_time_limit_ms: 500,
@@ -287,16 +290,17 @@ impl GameState {
         self.game_over = None;
         self.last_move = None;
         self.move_history.clear();
-        self.last_ai_result = None;
+        self.last_ai_result = [None, None];
         self.ai_state = AiState::Idle;
         self.move_timer = MoveTimer::default();
         self.suggested_move = None;
         self.message = None;
         self.capture_animation = None;
-        self.ai_stats = AiStats::default();
+        self.ai_stats = [AiStats::default(), AiStats::default()];
         self.review_index = None;
         self.redo_groups.clear();
         self.swap_pending = false;
+        self.last_move_time = [None, None];
         if let Some(ref mut engine) = self.ai_engine {
             engine.clear_cache();
         }
@@ -434,8 +438,10 @@ impl GameState {
         self.last_move = Some(pos);
         self.suggested_move = None;
 
-        // Stop timer
-        self.move_timer.stop();
+        // Stop timer and record per-color duration
+        let duration = self.move_timer.stop();
+        let idx = if color == Stone::Black { 0 } else { 1 };
+        self.last_move_time[idx] = Some(duration);
 
         // Check for win
         if let Some(result) = self.check_win(pos, color) {
@@ -617,6 +623,7 @@ impl GameState {
             self.message = Some("AI timeout - quick move".to_string());
 
             if let Some(fallback) = self.find_fallback_move() {
+                let fallback = self.validate_pro_rule_ai_move(fallback);
                 self.execute_move(fallback);
             }
             return;
@@ -640,16 +647,66 @@ impl GameState {
         if let Some((move_result, engine, elapsed)) = result {
             self.ai_state = AiState::Idle;
             self.ai_engine = Some(engine); // Return engine for reuse
-            self.ai_stats.record(&move_result);
-            self.last_ai_result = Some(move_result.clone());
+            let idx = if self.current_turn == Stone::Black { 0 } else { 1 };
+            self.ai_stats[idx].record(&move_result);
+            self.last_ai_result[idx] = Some(move_result.clone());
             self.move_timer.set_ai_time(elapsed);
 
             if let Some(pos) = move_result.best_move {
+                // Validate AI move against Pro rule
+                let pos = self.validate_pro_rule_ai_move(pos);
                 self.execute_move(pos);
             } else {
                 self.message = Some("AI could not find a move".to_string());
             }
         }
+    }
+
+    /// Validate AI move against Pro rule constraints.
+    /// Returns the original move if valid, or a corrected move if not.
+    fn validate_pro_rule_ai_move(&self, pos: Pos) -> Pos {
+        if self.opening_rule != OpeningRule::Pro {
+            return pos;
+        }
+        let move_num = self.move_history.len() + 1;
+        if move_num == 1 {
+            // First move must be center
+            return Pos::new(9, 9);
+        }
+        if move_num == 3 {
+            let center = 9i32;
+            let dr = (i32::from(pos.row) - center).abs();
+            let dc = (i32::from(pos.col) - center).abs();
+            if dr.max(dc) < 3 {
+                // AI chose a position too close to center — find best valid alternative
+                let mut best: Option<Pos> = None;
+                let mut best_dist = i32::MAX;
+                for r in 0..19u8 {
+                    for c in 0..19u8 {
+                        let p = Pos::new(r, c);
+                        if !self.board.is_empty(p) {
+                            continue;
+                        }
+                        let pr = (i32::from(r) - center).abs();
+                        let pc = (i32::from(c) - center).abs();
+                        if pr.max(pc) < 3 {
+                            continue;
+                        }
+                        // Pick the closest valid position to AI's original choice
+                        let dist = (i32::from(r) - i32::from(pos.row)).abs()
+                            + (i32::from(c) - i32::from(pos.col)).abs();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best = Some(p);
+                        }
+                    }
+                }
+                if let Some(alt) = best {
+                    return alt;
+                }
+            }
+        }
+        pos
     }
 
     /// Try to reclaim the AI engine from a timed-out search thread.
@@ -767,7 +824,8 @@ impl GameState {
         let result = engine.get_move_with_stats(&board, color);
 
         self.suggested_move = result.best_move;
-        self.last_ai_result = Some(result);
+        let idx = if color == Stone::Black { 0 } else { 1 };
+        self.last_ai_result[idx] = Some(result);
     }
 
     /// Undo last move
