@@ -140,10 +140,6 @@ Gomoku/
 │       ├── board_view.rs   # Board rendering and interaction
 │       ├── game_state.rs   # Game state management
 │       └── theme.rs        # Color constants and theming
-│
-└── docs/
-    ├── CODEBASE_GUIDE.md   # Complete codebase documentation
-    └── DEFENSE.md          # Defense session preparation
 ```
 
 ## Architecture Overview
@@ -293,8 +289,6 @@ cargo test --lib -- --nocapture
 |----------|-------------|
 | [README.md](README.md) | Project overview (this file) |
 | [CLAUDE.md](CLAUDE.md) | Instructions for Claude Code AI assistant |
-| [CODEBASE_GUIDE.md](docs/CODEBASE_GUIDE.md) | Complete codebase documentation |
-| [DEFENSE.md](docs/DEFENSE.md) | Defense session preparation |
 
 ## Development
 
